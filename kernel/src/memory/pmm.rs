@@ -34,6 +34,7 @@ pub enum PmmError {
     InvalidBitmapSize,
     NullMemoryMap,
     InvalidEntryCount,
+    UnsupportedMemoryMapRevision,
     NullMemoryMapEntry,
     InvalidMemoryRegion,
     InvalidKernelRange,
@@ -87,6 +88,9 @@ impl<'a> Pmm<'a> {
 
         // SAFETY: The caller guarantees the response pointer is readable.
         let response = unsafe { &*response };
+        if response.revision != 0 {
+            return Err(PmmError::UnsupportedMemoryMapRevision);
+        }
         if response.entry_count == 0 || response.entry_count > MAX_MEMORY_MAP_ENTRIES {
             return Err(PmmError::InvalidEntryCount);
         }
