@@ -19,6 +19,7 @@ pub struct CpuHardening {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CpuHardeningError {
     NxUnsupported,
+    FeatureEnableFailed,
 }
 
 /// Detects supported CPU features and enables NXE, UMIP, SMEP and SMAP.
@@ -79,6 +80,23 @@ pub fn enable_boot_hardening() -> Result<CpuHardening, CpuHardeningError> {
             options(nomem, nostack, preserves_flags)
         );
     }
+    let verified_efer_low: u32;
+    let verified_efer_high: u32;
+    // SAFETY: Read back the same privileged MSR to verify NXE became active.
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") IA32_EFER,
+            out("eax") verified_efer_low,
+            out("edx") verified_efer_high,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    let verified_efer = (u64::from(verified_efer_high) << 32)
+        | u64::from(verified_efer_low);
+    if verified_efer & EFER_NXE == 0 {
+        return Err(CpuHardeningError::FeatureEnableFailed);
+    }
 
     let mut cr4: u64;
     // SAFETY: Reading CR4 is a privileged operation in ring 0.
@@ -103,12 +121,27 @@ pub fn enable_boot_hardening() -> Result<CpuHardening, CpuHardeningError> {
     unsafe {
         core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
     }
+    let verified_cr4: u64;
+    // SAFETY: Read back CR4 to confirm all advertised hardening bits were set.
+    unsafe {
+        core::arch::asm!(
+            "mov {}, cr4",
+            out(reg) verified_cr4,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    let verified_umip = umip && verified_cr4 & CR4_UMIP != 0;
+    let verified_smep = smep && verified_cr4 & CR4_SMEP != 0;
+    let verified_smap = smap && verified_cr4 & CR4_SMAP != 0;
+    if (umip && !verified_umip) || (smep && !verified_smep) || (smap && !verified_smap) {
+        return Err(CpuHardeningError::FeatureEnableFailed);
+    }
 
     Ok(CpuHardening {
         nx: true,
-        umip,
-        smep,
-        smap,
+        umip: verified_umip,
+        smep: verified_smep,
+        smap: verified_smap,
     })
 }
 
