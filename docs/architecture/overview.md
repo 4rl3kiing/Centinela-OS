@@ -87,28 +87,22 @@ The official Rust target documentation specifies that `x86_64-unknown-none` is f
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs
-│       ├── arch/
-│       │   └── x86_64/
+│       ├── arch/x86_64/
 │       ├── boot/
-│       ├── memory/
-│       ├── scheduler/
-│       ├── process/
-│       ├── interrupt/
-│       ├── sync/
-│       ├── drivers/
-│       ├── fs/
-│       ├── ipc/
-│       ├── syscall/
-│       └── diagnostics/
-├── crates/
-│   ├── kernel-abi/
-│   ├── boot-info/
-│   └── core-types/
-├── user/
-│   ├── init/
-│   └── utilities/
-├── tools/
-│   └── image-builder/
+│       └── memory/
+├── hal/
+│   ├── Cargo.toml
+│   └── src/
+│       ├── cpu.rs
+│       └── serial.rs
+├── security/
+│   ├── Cargo.toml
+│   └── src/
+│       ├── capabilities.rs
+│       └── permissions.rs
+├── crates/                 # Add only when stable shared interfaces exist
+├── user/                   # Introduce after ring-3 execution is designed
+└── tools/                  # Host-side build and test tools
 ├── tests/
 │   ├── integration/
 │   └── boot/
@@ -118,7 +112,7 @@ The official Rust target documentation specifies that `x86_64-unknown-none` is f
     └── testing/
 ```
 
-Create crates only when ownership, build requirements, or testing boundaries justify them. Avoid premature fragmentation.
+The workspace currently has three real crates: `kernel` owns privileged kernel orchestration and memory management; `hal` encapsulates architecture-specific CPU and device operations; `security` contains architecture-independent, safe policy primitives. The `security` types are not enforcement by themselves: paging, task creation and syscall code must consume them before they provide runtime isolation. Create further crates only when ownership, build requirements or testing boundaries justify them. Avoid premature fragmentation.
 
 ## 6. Core subsystem contracts
 
