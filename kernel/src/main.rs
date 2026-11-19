@@ -168,6 +168,7 @@ fn initialize_memory() -> bool {
         serial_write("Centinela-OS: unsupported Limine base revision.\r\n");
         return false;
     }
+    serial_write("Limine base revision 5 accepted.\r\n");
 
     // Read bootloader-populated response pointers without creating references
     // to the mutable request structure.
