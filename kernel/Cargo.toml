@@ -6,3 +6,5 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+centinela-hal = { path = "../hal" }
+centinela-security = { path = "../security" }
