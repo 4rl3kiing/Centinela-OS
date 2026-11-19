@@ -106,6 +106,7 @@ Requires a working VMM and heap. Add guard pages, randomized freelists, metadata
 - VMM groundwork provides checked 48-bit canonical virtual addresses, bounded physical addresses, HHDM conversion, four-level page-table indices and NX/W^X page-entry encoding. It does not yet install or own active page tables.
 - Bootstrap now captures the active CR3 physical root and computes its checked HHDM alias before PMM initialization. This is a metadata snapshot only: it does not dereference the root, verify that the HHDM mapping is present, clone tables, or switch CR3.
 - VMM now includes a read-only four-level page-table walker that combines effective RW/US/NX permissions and translates 4 KiB, 2 MiB, and 1 GiB mappings. The HHDM reader is an explicitly unsafe capability: callers must establish that every traversed page-table frame is mapped and readable through the HHDM. The walker is not yet invoked during bootstrap and no mappings are changed.
+- The walker rejects reserved high-order entry bits and illegal page-size flags at the PML4 level. Its translation tests cover these malformed-entry cases in addition to the supported leaf sizes.
 - PMM allocator is being optimized to scan bitmap words rather than every frame.
 - W^X permission policy, fixed-capacity typed generation-tagged capability handles, and monotonic syscall allow-list primitives exist; they are not yet wired into process creation or a syscall dispatcher.
 
