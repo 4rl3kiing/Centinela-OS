@@ -445,6 +445,9 @@ impl<'a, M: PageTableMemory> PageTableWalker<'a, M> {
     }
 
     pub fn translate(&self, virtual_address: VirtAddr) -> Result<Translation, WalkError> {
+        if self.root.get() == 0 {
+            return Err(WalkError::InvalidPhysicalAddress);
+        }
         let indices = virtual_address.page_table_indices();
         let mut table = self.root;
         let mut writable = true;
@@ -503,6 +506,9 @@ impl<'a, M: PageTableMemory> PageTableWalker<'a, M> {
             }
 
             let next = raw & PHYSICAL_ADDRESS_MASK;
+            if next == 0 {
+                return Err(WalkError::InvalidPhysicalAddress);
+            }
             table = PhysAddr::new(next).map_err(|_| WalkError::InvalidPhysicalAddress)?;
         }
 
