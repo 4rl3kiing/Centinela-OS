@@ -110,10 +110,7 @@ impl HhdmOffset {
 }
 
 impl PageTableEntry {
-    pub const fn new(
-        physical: PhysAddr,
-        permissions: PagePermissions,
-    ) -> Result<Self, EntryError> {
+    pub const fn new(physical: PhysAddr, permissions: PagePermissions) -> Result<Self, EntryError> {
         if !permissions.readable {
             return Err(EntryError::UnreadablePageUnsupported);
         }
