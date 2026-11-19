@@ -27,6 +27,7 @@ A milestone may only be called complete when all required states for that milest
 Implemented in the bootstrap path:
 - Detect NX support before enabling IA32_EFER.NXE.
 - Detect UMIP, SMEP and SMAP through CPUID leaf 7.
+- Expose bounded, feature-detected RDRAND/RDSEED sampling through HAL; samples are raw inputs, not a complete entropy pool.
 - Enable CR0.WP so supervisor writes obey read-only page permissions.
 - Set only supported CR4 bits and preserve unrelated CR4 state.
 - Read back EFER, CR0 and CR4 to verify activation.
@@ -100,6 +101,7 @@ Requires a working VMM and heap. Add guard pages, randomized freelists, metadata
 - Workspace split into kernel/HAL/security crates.
 - Initial single-core PMM with Limine memory-map parsing and allocation/free tests.
 - CPU boot hardening detects and enables NXE, CR0.WP, UMIP, SMEP and SMAP when supported, with register readback.
+- HAL exposes bounded RDRAND/RDSEED reads after CPUID feature detection; these are not yet mixed into a kernel CSPRNG or used for KASLR.
 - VMM groundwork provides checked 48-bit canonical virtual addresses, bounded physical addresses, HHDM conversion, four-level page-table indices and NX/W^X page-entry encoding. It does not yet install or own active page tables.
 - PMM allocator is being optimized to scan bitmap words rather than every frame.
 - W^X and capability-set primitives exist but are not yet enforced by VMM, tasks or syscalls.
