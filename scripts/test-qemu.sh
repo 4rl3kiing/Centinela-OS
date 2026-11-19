@@ -17,6 +17,7 @@ run_and_check() {
     set -e
     if [[ "$status" -ne 124 && "$status" -ne 0 ]]; then cat "build/logs/qemu-$mode.stderr" >&2; echo "QEMU $mode exited with status $status" >&2; exit 1; fi
     grep -Fq "Centinela-OS: Rust kernel entry reached." "$log" || { cat "$log" >&2 || true; cat "build/logs/qemu-$mode.stderr" >&2 || true; echo "Kernel entry not found for $mode boot" >&2; exit 1; }
+    grep -Fq "CPU hardening: NXE enabled." "$log" || { cat "$log" >&2; echo "NXE hardening was not enabled for $mode boot" >&2; exit 1; }
     grep -Fq "Limine base revision 5 accepted." "$log"
     grep -Fq "PMM initialized: 4 KiB frames, 64 GiB address ceiling." "$log" || { cat "$log" >&2; echo "PMM initialization not found for $mode boot" >&2; exit 1; }
     grep -Fq "PMM allocation/free self-test passed." "$log" || { cat "$log" >&2; echo "PMM self-test not found for $mode boot" >&2; exit 1; }
