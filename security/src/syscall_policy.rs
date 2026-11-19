@@ -110,3 +110,21 @@ mod tests {
         assert_eq!(set.bits(), SyscallSet::ALL.bits());
     }
 }
+
+#[cfg(kani)]
+mod verification {
+    use super::{SyscallPolicy, SyscallSet};
+
+    #[kani::proof]
+    fn restricting_policy_never_adds_syscall_permissions() {
+        let initial_bits: u64 = kani::any();
+        let restriction_bits: u64 = kani::any();
+        let mut policy = SyscallPolicy::new(SyscallSet::from_bits(initial_bits));
+        let before = policy.allowed().bits();
+
+        policy.restrict_to(SyscallSet::from_bits(restriction_bits));
+        let after = policy.allowed().bits();
+
+        assert_eq!(after & !before, 0);
+    }
+}
