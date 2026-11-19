@@ -8,7 +8,8 @@ use centinela_security::permissions::PagePermissions;
 
 pub const PAGE_SIZE: u64 = 4096;
 const ADDRESS_BITS: u32 = 48;
-const PHYSICAL_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;\nconst CR3_ADDRESS_MASK: u64 = PHYSICAL_ADDRESS_MASK;
+const PHYSICAL_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
+const CR3_ADDRESS_MASK: u64 = PHYSICAL_ADDRESS_MASK;
 
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
@@ -23,6 +24,14 @@ pub struct PhysAddr(u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HhdmOffset(u64);
+
+/// Snapshot of the bootloader's active paging root and its HHDM alias.
+/// This records the existing address space; it does not own or modify it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BootPagingInfo {
+    root_physical: PhysAddr,
+    root_virtual: VirtAddr,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PageTableIndices {
@@ -42,6 +51,7 @@ pub enum AddressError {
     Unaligned,
     PhysicalAddressOutOfRange,
     HhdmOverflow,
+    InvalidPageTableRoot,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,7 +137,10 @@ impl BootPagingInfo {
             Ok(address) => address,
             Err(error) => return Err(error),
         };
-        Ok(Self { root_physical, root_virtual })
+        Ok(Self {
+            root_physical,
+            root_virtual,
+        })
     }
 
     pub const fn root_physical(self) -> PhysAddr {
