@@ -127,7 +127,7 @@ impl<T, const N: usize> CapabilityTable<T, N> {
 
     pub fn get(&self, handle: CapabilityHandle<T>, required: Rights) -> Result<&T, TableError> {
         let slot = self.validated_slot(handle)?;
-        if !slot.rights.contains(required) {
+        if required.is_empty() || !slot.rights.contains(required) {
             return Err(TableError::PermissionDenied);
         }
         slot.value.as_ref().ok_or(TableError::InvalidHandle)
@@ -139,6 +139,7 @@ impl<T, const N: usize> CapabilityTable<T, N> {
         required: Rights,
     ) -> Result<&mut T, TableError> {
         let slot = self.validated_slot_mut(handle)?;
+        let required = required.union(Rights::WRITE);
         if !slot.rights.contains(required) {
             return Err(TableError::PermissionDenied);
         }
@@ -147,6 +148,9 @@ impl<T, const N: usize> CapabilityTable<T, N> {
 
     pub fn remove(&mut self, handle: CapabilityHandle<T>) -> Result<T, TableError> {
         let slot = self.validated_slot_mut(handle)?;
+        if !slot.rights.contains(Rights::CONTROL) {
+            return Err(TableError::PermissionDenied);
+        }
         let value = slot.value.take().ok_or(TableError::InvalidHandle)?;
         slot.rights = Rights::NONE;
         match slot.generation.checked_add(1) {
@@ -201,6 +205,10 @@ mod tests {
             table.get(handle, Rights::CONTROL),
             Err(TableError::PermissionDenied)
         );
+        assert_eq!(
+            table.get_mut(handle, Rights::READ),
+            Err(TableError::PermissionDenied)
+        );
         *table.get_mut(handle, Rights::WRITE).expect("write allowed") = 0xbeef;
         assert_eq!(
             *table.get(handle, Rights::READ).expect("read allowed"),
@@ -211,7 +219,9 @@ mod tests {
     #[test]
     fn removed_handles_cannot_access_reused_slots() {
         let mut table = CapabilityTable::<u32, 1>::new().expect("valid capacity");
-        let stale = table.insert(7, Rights::READ).expect("slot available");
+        let stale = table
+            .insert(7, Rights::READ.union(Rights::CONTROL))
+            .expect("slot available");
         assert_eq!(table.remove(stale), Ok(7));
 
         let fresh = table
