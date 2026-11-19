@@ -563,7 +563,7 @@ mod walker_tests {
     #[test]
     fn hhdm_reader_only_accepts_bootloader_reclaimable_frames() {
         use super::super::pmm::{LimineMemoryMapEntry, LimineMemoryMapResponse};
-        use super::super::{HhdmOffset, HhdmPageTableMemory, WalkError};
+        use super::{HhdmOffset, HhdmPageTableMemory, WalkError};
 
         let reclaimable = LimineMemoryMapEntry {
             base: 0x1000,
