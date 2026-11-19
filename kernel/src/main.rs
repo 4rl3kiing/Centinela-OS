@@ -147,7 +147,7 @@ fn initialize_memory() -> bool {
     let paging_info = match BootPagingInfo::new(current_page_table_root(), hhdm_offset) {
         Ok(info) => info,
         Err(_) => {
-            serial_write("Centinela-OS: active CR3 root is invalid or not HHDM-addressable.\\r\\n");
+            serial_write("Centinela-OS: active CR3 root is invalid or not HHDM-addressable.\r\n");
             return false;
         }
     };
