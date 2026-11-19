@@ -18,7 +18,9 @@ run_and_check() {
     if [[ "$status" -ne 124 && "$status" -ne 0 ]]; then cat "build/logs/qemu-$mode.stderr" >&2; echo "QEMU $mode exited with status $status" >&2; exit 1; fi
     grep -Fq "Centinela-OS: Rust kernel entry reached." "$log" || { cat "$log" >&2 || true; cat "build/logs/qemu-$mode.stderr" >&2 || true; echo "Kernel entry not found for $mode boot" >&2; exit 1; }
     grep -Fq "Limine base revision 5 accepted." "$log"
-    echo "PASS: $mode boot reached Rust kernel entry"
+    grep -Fq "PMM initialized: 4 KiB frames, 64 GiB address ceiling." "$log" || { cat "$log" >&2; echo "PMM initialization not found for $mode boot" >&2; exit 1; }
+    grep -Fq "PMM allocation/free self-test passed." "$log" || { cat "$log" >&2; echo "PMM self-test not found for $mode boot" >&2; exit 1; }
+    echo "PASS: $mode boot reached Rust kernel and initialized PMM"
 }
 run_and_check bios -cdrom "$ISO" -boot d
 OVMF_CODE="${OVMF_CODE:-}"
