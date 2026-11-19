@@ -6,9 +6,9 @@ use core::mem::MaybeUninit;
 use core::panic::PanicInfo;
 use core::ptr::{addr_of, addr_of_mut};
 
-use centinela_hal::cpu::{CpuHardeningError, enable_boot_hardening, halt_forever};
+use centinela_hal::cpu::{CpuHardeningError, current_page_table_root, enable_boot_hardening, halt_forever};
 use centinela_hal::serial::{init as serial_init, write as serial_write};
-use centinela_kernel::memory::pmm::{BITMAP_WORDS, LimineMemoryMapResponse, Pmm};
+use centinela_kernel::memory::pmm::{BITMAP_WORDS, LimineMemoryMapResponse, Pmm};\nuse centinela_kernel::memory::vmm::{BootPagingInfo, HhdmOffset};
 
 const LIMINE_COMMON_MAGIC: [u64; 2] = [0xc7b1_dd30_df4c_8b88, 0x0a82_e883_a194_f07b];
 
@@ -96,7 +96,7 @@ static mut LIMINE_REQUESTS: LimineRequests = LimineRequests {
 // The bitmap itself is reserved automatically as part of the kernel BSS.
 static mut FRAME_BITMAP: [u64; BITMAP_WORDS] = [0; BITMAP_WORDS];
 static mut ALLOCATED_BITMAP: [u64; BITMAP_WORDS] = [0; BITMAP_WORDS];
-static mut PMM_STATE: MaybeUninit<Pmm<'static>> = MaybeUninit::uninit();
+static mut PMM_STATE: MaybeUninit<Pmm<'static>> = MaybeUninit::uninit();\nstatic mut BOOT_PAGING_INFO: MaybeUninit<BootPagingInfo> = MaybeUninit::uninit();
 
 fn initialize_memory() -> bool {
     // Limine sets the third base-revision field to zero when the requested
@@ -133,6 +133,27 @@ fn initialize_memory() -> bool {
     if hhdm_revision != 0 || hhdm_offset & 0xfff != 0 {
         serial_write("Centinela-OS: unsupported or invalid HHDM response.\r\n");
         return false;
+    }
+
+    let hhdm_offset = match HhdmOffset::new(hhdm_offset) {
+        Ok(offset) => offset,
+        Err(_) => {
+            serial_write("Centinela-OS: HHDM offset is not canonical.\\r\\n");
+            return false;
+        }
+    };
+    let paging_info = match BootPagingInfo::new(current_page_table_root(), hhdm_offset) {
+        Ok(info) => info,
+        Err(_) => {
+            serial_write("Centinela-OS: active CR3 root is invalid or not HHDM-addressable.\\r\\n");
+            return false;
+        }
+    };
+    // Record the bootloader-owned paging root without switching CR3 or
+    // dereferencing page-table memory. Future VMM work must preserve its
+    // kernel, stack, HHDM, and boot-response mappings before any switch.
+    unsafe {
+        addr_of_mut!(BOOT_PAGING_INFO).write(MaybeUninit::new(paging_info));
     }
 
     // The linker exports physical load boundaries, including the PMM bitmap
