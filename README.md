@@ -2,7 +2,7 @@
 
 **Centinela-OS** is an experimental operating-system project built primarily in Rust. Its initial target is x86_64, with boot support for legacy BIOS and UEFI and intended use across desktop and server systems.
 
-The project is currently in the architecture and bring-up planning stage. It is not yet a bootable or production-ready operating system.
+The project has an initial Rust workspace and a minimal freestanding kernel entry point. The kernel has not yet been compiled or boot-tested in this repository, and the operating system is not production-ready.
 
 ## Initial technical decisions
 
@@ -24,6 +24,16 @@ The project is currently in the architecture and bring-up planning stage. It is 
 5. Add concurrency and SMP only after single-core correctness is established.
 6. Do not claim a feature is implemented until it builds and has test evidence.
 
+## Initial implementation
+
+- Rust workspace targeting `x86_64-unknown-none`.
+- Minimal `no_std`/`no_main` kernel entry point.
+- Early COM1 serial diagnostics and panic halt path.
+- Initial x86_64 ELF linker script and Limine boot configuration.
+- GitHub Actions checks for formatting, Clippy, and target compilation.
+
+These files establish the bootstrap structure only. BIOS/UEFI image generation and QEMU boot validation are still pending.
+
 ## Documentation
 
 - [Kernel architecture and implementation roadmap](docs/architecture/overview.md)
@@ -31,4 +41,4 @@ The project is currently in the architecture and bring-up planning stage. It is 
 
 ## Current status
 
-Architecture baseline only. Kernel initialization, memory management, scheduling, drivers, storage, networking, and user space remain to be implemented and validated.
+Bootstrap source skeleton committed. Compilation, ELF inspection, Limine image creation, BIOS/UEFI QEMU boot, and serial-log verification remain pending. Memory management, scheduling, drivers, storage, networking, and user space remain unimplemented.
