@@ -193,6 +193,9 @@ pub extern "C" fn _start() -> ! {
     match enable_boot_hardening() {
         Ok(features) => {
             serial_write("CPU hardening: NXE enabled.\r\n");
+            if features.write_protect {
+                serial_write("CPU hardening: CR0.WP enabled.\r\n");
+            }
             if features.umip {
                 serial_write("CPU hardening: UMIP enabled.\r\n");
             }
