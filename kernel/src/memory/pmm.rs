@@ -151,19 +151,14 @@ impl<'a> Pmm<'a> {
         }
 
         let frame_count = self.frame_count();
-        for offset in 0..frame_count {
-            let frame = (self.allocation_hint + offset) % frame_count;
-            if !self.is_free(frame) {
-                continue;
-            }
+        let frame = self
+            .find_free_frame(self.allocation_hint, frame_count)
+            .or_else(|| self.find_free_frame(0, self.allocation_hint))?;
 
-            self.set_allocated(frame);
-            self.free_frames -= 1;
-            self.allocation_hint = (frame + 1) % frame_count;
-            return Some((frame as u64) * PAGE_SIZE);
-        }
-
-        None
+        self.set_allocated(frame);
+        self.free_frames -= 1;
+        self.allocation_hint = (frame + 1) % frame_count;
+        Some((frame as u64) * PAGE_SIZE)
     }
 
     /// Releases a frame previously returned by allocate_frame.
@@ -202,6 +197,34 @@ impl<'a> Pmm<'a> {
 
     fn frame_count(&self) -> usize {
         self.bitmap.len() * u64::BITS as usize
+    }
+
+    /// Finds a free frame in [start, end) using word-level bitmap scans.
+    fn find_free_frame(&self, start: usize, end: usize) -> Option<usize> {
+        if start >= end {
+            return None;
+        }
+
+        let mut word_index = start / u64::BITS as usize;
+        let last_word = (end - 1) / u64::BITS as usize;
+        while word_index <= last_word {
+            let word_start = word_index * u64::BITS as usize;
+            let first_bit = start.saturating_sub(word_start);
+            let end_bit = (end - word_start).min(u64::BITS as usize);
+            let lower_mask = u64::MAX << first_bit;
+            let upper_mask = if end_bit == u64::BITS as usize {
+                u64::MAX
+            } else {
+                (1_u64 << end_bit) - 1
+            };
+            let candidates = !self.bitmap[word_index] & lower_mask & upper_mask;
+            if candidates != 0 {
+                return Some(word_start + candidates.trailing_zeros() as usize);
+            }
+            word_index += 1;
+        }
+
+        None
     }
 
     fn is_free(&self, frame: usize) -> bool {
