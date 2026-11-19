@@ -364,6 +364,19 @@ mod tests {
     }
 
     #[test]
+    fn allocation_scans_words_and_wraps_the_hint() {
+        let mut bitmap = [u64::MAX; 2];
+        let mut allocated = [0_u64; 2];
+        let mut pmm = Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
+        pmm.mark_free_range(1, 128);
+        pmm.allocation_hint = 127;
+
+        assert_eq!(pmm.allocate_frame(), Some(127 * PAGE_SIZE));
+        assert_eq!(pmm.allocate_frame(), Some(PAGE_SIZE));
+        assert_eq!(pmm.free_frames(), 125);
+    }
+
+    #[test]
     fn allocation_returns_none_when_no_frames_are_free() {
         let mut bitmap = [u64::MAX; 1];
         let mut allocated = [0_u64; 1];
