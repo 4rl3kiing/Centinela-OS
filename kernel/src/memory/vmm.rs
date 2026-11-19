@@ -349,3 +349,148 @@ mod verification {
         assert_eq!(entry.is_ok(), !(writable && executable));
     }
 }
+
+
+const HUGE_PAGE: u64 = 1 << 7;
+const PAGE_2M_MASK: u64 = 0x000f_ffff_ffe0_0000;
+const PAGE_1G_MASK: u64 = 0x000f_ffff_c000_0000;
+
+/// Errors produced while reading a four-level page-table hierarchy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WalkError {
+    MemoryReadFailed,
+    NotMapped,
+    InvalidHugePage,
+    InvalidPhysicalAddress,
+    AddressOverflow,
+}
+
+/// Result of a read-only page-table walk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Translation {
+    /// Exact translated physical address, including the page offset.
+    pub physical_address: u64,
+    /// Size of the leaf mapping: 4 KiB, 2 MiB, or 1 GiB.
+    pub page_size: u64,
+    /// Effective permissions after combining all paging levels.
+    pub writable: bool,
+    pub user_accessible: bool,
+    pub executable: bool,
+}
+
+/// Implementors must only read valid, mapped page-table memory.
+///
+/// # Safety
+/// For every aligned physical table address supplied by the walker,
+/// read_entry must either safely return the indexed 64-bit entry or return
+/// an error. It must never access arbitrary or unmapped physical memory.
+pub unsafe trait PageTableMemory {
+    fn read_entry(&self, table: PhysAddr, index: u16) -> Result<u64, WalkError>;
+}
+
+/// Read-only page-table memory accessor through the Limine HHDM.
+///
+/// Constructing this value does not prove that every page-table frame is
+/// mapped by the HHDM. Its PageTableMemory implementation is therefore
+/// unsafe and must only be used when that mapping property is established.
+#[derive(Clone, Copy)]
+pub struct HhdmPageTableMemory {
+    offset: HhdmOffset,
+}
+
+// SAFETY: Callers must establish that the supplied physical table pages are
+// present in the HHDM before invoking the walker. Address arithmetic and
+// canonicality are checked before the volatile load.
+unsafe impl PageTableMemory for HhdmPageTableMemory {
+    fn read_entry(&self, table: PhysAddr, index: u16) -> Result<u64, WalkError> {
+        if index >= 512 {
+            return Err(WalkError::MemoryReadFailed);
+        }
+        let virtual_table = self
+            .offset
+            .physical_to_virtual(table)
+            .map_err(|_| WalkError::AddressOverflow)?;
+        let entry_address = virtual_table
+            .get()
+            .checked_add(u64::from(index) * 8)
+            .ok_or(WalkError::AddressOverflow)?;
+        VirtAddr::new(entry_address).map_err(|_| WalkError::AddressOverflow)?;
+
+        // SAFETY: The unsafe PageTableMemory contract requires the table page
+        // to be mapped and readable at its HHDM alias.
+        Ok(unsafe { core::ptr::read_volatile(entry_address as *const u64) })
+    }
+}
+
+/// Walks the active four-level paging hierarchy without modifying it.
+pub struct PageTableWalker<'a, M: PageTableMemory> {
+    memory: &'a M,
+    root: PhysAddr,
+}
+
+impl<'a, M: PageTableMemory> PageTableWalker<'a, M> {
+    pub const fn new(memory: &'a M, root: PhysAddr) -> Self {
+        Self { memory, root }
+    }
+
+    pub fn translate(&self, virtual_address: VirtAddr) -> Result<Translation, WalkError> {
+        let indices = virtual_address.page_table_indices();
+        let mut table = self.root;
+        let mut writable = true;
+        let mut user_accessible = true;
+        let mut executable = true;
+
+        for (level, index) in [
+            (4_u8, indices.pml4),
+            (3_u8, indices.pdpt),
+            (2_u8, indices.pd),
+            (1_u8, indices.pt),
+        ] {
+            let raw = self.memory.read_entry(table, index)?;
+            if raw & PRESENT == 0 {
+                return Err(WalkError::NotMapped);
+            }
+
+            writable &= raw & WRITABLE != 0;
+            user_accessible &= raw & USER != 0;
+            executable &= raw & NO_EXECUTE == 0;
+
+            let huge = raw & HUGE_PAGE != 0;
+            if huge && level == 4 {
+                return Err(WalkError::InvalidHugePage);
+            }
+            if huge && (level == 3 || level == 2) {
+                let (page_size, base_mask, offset_mask) = if level == 3 {
+                    (1_u64 << 30, PAGE_1G_MASK, (1_u64 << 30) - 1)
+                } else {
+                    (1_u64 << 21, PAGE_2M_MASK, (1_u64 << 21) - 1)
+                };
+                let base = raw & base_mask;
+                let offset = virtual_address.get() & offset_mask;
+                return Ok(Translation {
+                    physical_address: base | offset,
+                    page_size,
+                    writable,
+                    user_accessible,
+                    executable,
+                });
+            }
+
+            if level == 1 {
+                let base = raw & PHYSICAL_ADDRESS_MASK;
+                return Ok(Translation {
+                    physical_address: base | u64::from(indices.offset),
+                    page_size: PAGE_SIZE,
+                    writable,
+                    user_accessible,
+                    executable,
+                });
+            }
+
+            let next = raw & PHYSICAL_ADDRESS_MASK;
+            table = PhysAddr::new(next).map_err(|_| WalkError::InvalidPhysicalAddress)?;
+        }
+
+        Err(WalkError::NotMapped)
+    }
+}
