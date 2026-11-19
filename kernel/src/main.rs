@@ -31,8 +31,27 @@ fn serial_init() {
     outb(COM1 + 4, 0x0B);
 }
 
+#[inline]
+fn inb(port: u16) -> u8 {
+    let value: u8;
+    // SAFETY: Reading the UART line-status register is a privileged,
+    // architecture-specific I/O operation in early kernel context.
+    unsafe {
+        asm!(
+            "in al, dx",
+            in("dx") port,
+            out("al") value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    value
+}
+
 fn serial_write(message: &str) {
     for byte in message.bytes() {
+        while inb(COM1 + 5) & 0x20 == 0 {
+            core::hint::spin_loop();
+        }
         outb(COM1, byte);
     }
 }
