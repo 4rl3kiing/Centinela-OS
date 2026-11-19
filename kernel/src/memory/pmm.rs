@@ -157,7 +157,12 @@ impl<'a> Pmm<'a> {
         None
     }
 
-    pub fn free_frame(&mut self, physical_address: u64) -> Result<(), PmmError> {
+    /// Releases a frame previously returned by allocate_frame.
+    ///
+    /// # Safety
+    /// The caller must own this frame and must ensure it is no longer used by
+    /// any CPU, page table, device, or other kernel subsystem.
+    pub unsafe fn free_frame(&mut self, physical_address: u64) -> Result<(), PmmError> {
         if physical_address % PAGE_SIZE != 0 {
             return Err(PmmError::FrameOutOfRange);
         }
@@ -250,7 +255,8 @@ mod tests {
         assert_eq!(first, PAGE_SIZE);
         assert_eq!(pmm.free_frames(), 126);
 
-        pmm.free_frame(first).expect("allocated frame should be releasable");
+        // SAFETY: The frame was just allocated and is not in use elsewhere.
+        unsafe { pmm.free_frame(first) }.expect("allocated frame should be releasable");
         assert_eq!(pmm.free_frames(), 127);
     }
 
@@ -260,8 +266,12 @@ mod tests {
         let mut pmm = Pmm::new(&mut bitmap).expect("bitmap should be accepted");
         pmm.mark_free_range(0, 64);
 
-        assert_eq!(pmm.free_frame(0), Err(PmmError::FrameOutOfRange));
-        assert_eq!(pmm.free_frame(PAGE_SIZE), Err(PmmError::FrameAlreadyFree));
+        // SAFETY: These test addresses are intentionally not owned.
+        assert_eq!(unsafe { pmm.free_frame(0) }, Err(PmmError::FrameOutOfRange));
+        assert_eq!(
+            unsafe { pmm.free_frame(PAGE_SIZE) },
+            Err(PmmError::FrameAlreadyFree)
+        );
     }
 
     #[test]
@@ -269,9 +279,10 @@ mod tests {
         let mut bitmap = [u64::MAX; 1];
         let mut pmm = Pmm::new(&mut bitmap).expect("bitmap should be accepted");
 
-        assert_eq!(pmm.free_frame(1), Err(PmmError::FrameOutOfRange));
+        // SAFETY: These test addresses are intentionally invalid.
+        assert_eq!(unsafe { pmm.free_frame(1) }, Err(PmmError::FrameOutOfRange));
         assert_eq!(
-            pmm.free_frame(64 * PAGE_SIZE),
+            unsafe { pmm.free_frame(64 * PAGE_SIZE) },
             Err(PmmError::FrameOutOfRange)
         );
     }
