@@ -399,15 +399,10 @@ pub unsafe trait PageTableMemory {
 /// mapped by the HHDM. Its PageTableMemory implementation is therefore
 /// unsafe and must only be used when that mapping property is established.
 const MAX_HHDM_MAP_ENTRIES: u64 = 4096;
-const MEMMAP_USABLE: u64 = 0;
-const MEMMAP_ACPI_RECLAIMABLE: u64 = 2;
-const MEMMAP_ACPI_NVS: u64 = 3;
 const MEMMAP_BOOTLOADER_RECLAIMABLE: u64 = 5;
-const MEMMAP_EXECUTABLE_AND_MODULES: u64 = 6;
-const MEMMAP_RESERVED_MAPPED: u64 = 8;
 
 /// Read-only page-table accessor through Limine's HHDM.
-/// Every table frame is checked against the base-revision-5 memory map.
+/// Every table frame must belong to Limine's bootloader-reclaimable region.
 #[derive(Clone, Copy)]
 pub struct HhdmPageTableMemory {
     offset: HhdmOffset,
@@ -432,25 +427,32 @@ impl HhdmPageTableMemory {
     fn table_frame_is_mapped(&self, table: PhysAddr) -> Result<bool, WalkError> {
         // SAFETY: The constructor contract keeps this response valid.
         let response = unsafe { &*self.memory_map };
+        let table_end = table
+            .get()
+            .checked_add(PAGE_SIZE)
+            .ok_or(WalkError::AddressOverflow)?;
         for index in 0..response.entry_count as usize {
             // SAFETY: The constructor contract covers the complete pointer array.
             let pointer = unsafe { response.entries.add(index).read() };
-            if pointer.is_null() { return Err(WalkError::InvalidMemoryMap); }
+            if pointer.is_null() {
+                return Err(WalkError::InvalidMemoryMap);
+            }
             // SAFETY: The constructor contract covers every entry pointer.
             let entry: &LimineMemoryMapEntry = unsafe { &*pointer };
-            if !matches!(entry.entry_type, MEMMAP_USABLE | MEMMAP_ACPI_RECLAIMABLE | MEMMAP_ACPI_NVS | MEMMAP_BOOTLOADER_RECLAIMABLE | MEMMAP_EXECUTABLE_AND_MODULES | MEMMAP_RESERVED_MAPPED) {
+            if entry.entry_type != MEMMAP_BOOTLOADER_RECLAIMABLE {
                 continue;
             }
-            let region_end = entry.base.checked_add(entry.length).ok_or(WalkError::InvalidMemoryMap)?;
-            // Limine rounds HHDM mappings outward to 4 KiB page boundaries.
-            let mapped_start = entry.base & !(PAGE_SIZE - 1);
-            let mapped_end = region_end.checked_add(PAGE_SIZE - 1).ok_or(WalkError::InvalidMemoryMap)? & !(PAGE_SIZE - 1);
-            let table_end = table.get().checked_add(PAGE_SIZE).ok_or(WalkError::AddressOverflow)?;
-            if table.get() >= mapped_start && table_end <= mapped_end { return Ok(true); }
+            let region_end = entry
+                .base
+                .checked_add(entry.length)
+                .ok_or(WalkError::InvalidMemoryMap)?;
+            // Limine guarantees bootloader-reclaimable regions are 4 KiB aligned.
+            if entry.base <= table.get() && table_end <= region_end {
+                return Ok(true);
+            }
         }
         Ok(false)
-    }
-}
+    }}
 
 // SAFETY: Before each read, the complete page-table frame is verified to be
 // in a Limine base-revision-5 memory class guaranteed to be HHDM-mapped.
