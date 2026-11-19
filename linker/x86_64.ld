@@ -14,6 +14,7 @@ PHDRS
 
 SECTIONS
 {
+    __kernel_phys_start = KERNEL_LMA;
     . = KERNEL_VMA;
 
     .text ALIGN(4K) : AT(KERNEL_LMA)
@@ -38,6 +39,8 @@ SECTIONS
         *(COMMON)
         *(.bss .bss.*)
     } :data
+
+    __kernel_phys_end = LOADADDR(.bss) + SIZEOF(.bss);
 
     /DISCARD/ :
     {
