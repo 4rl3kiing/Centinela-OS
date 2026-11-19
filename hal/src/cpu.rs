@@ -33,11 +33,13 @@ pub enum CpuHardeningError {
 pub fn enable_boot_hardening() -> Result<CpuHardening, CpuHardeningError> {
     // SAFETY: CPUID is available on all x86_64 processors.
     let basic = unsafe { core::arch::x86_64::__cpuid(0) };
-    let leaf7 = if basic.eax >= 7 {
+    let leaf7_supported = basic.eax >= 7;
+    let leaf7 = if leaf7_supported {
         // SAFETY: The maximum basic leaf advertises leaf 7.
         unsafe { core::arch::x86_64::__cpuid_count(7, 0) }
     } else {
-        core::arch::x86_64::__cpuid(0)
+        // No feature bits are advertised when the leaf is unavailable.
+        unsafe { core::arch::x86_64::__cpuid(0) }
     };
 
     // SAFETY: Query the maximum supported extended CPUID leaf first.
@@ -84,9 +86,9 @@ pub fn enable_boot_hardening() -> Result<CpuHardening, CpuHardeningError> {
         core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
     }
 
-    let umip = (leaf7.ecx & (1 << 2)) != 0;
-    let smep = (leaf7.ebx & (1 << 7)) != 0;
-    let smap = (leaf7.ebx & (1 << 20)) != 0;
+    let umip = leaf7_supported && (leaf7.ecx & (1 << 2)) != 0;
+    let smep = leaf7_supported && (leaf7.ebx & (1 << 7)) != 0;
+    let smap = leaf7_supported && (leaf7.ebx & (1 << 20)) != 0;
     if umip {
         cr4 |= CR4_UMIP;
     }
