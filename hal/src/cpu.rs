@@ -92,8 +92,7 @@ pub fn enable_boot_hardening() -> Result<CpuHardening, CpuHardeningError> {
             options(nomem, nostack, preserves_flags)
         );
     }
-    let verified_efer = (u64::from(verified_efer_high) << 32)
-        | u64::from(verified_efer_low);
+    let verified_efer = (u64::from(verified_efer_high) << 32) | u64::from(verified_efer_low);
     if verified_efer & EFER_NXE == 0 {
         return Err(CpuHardeningError::FeatureEnableFailed);
     }
