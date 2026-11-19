@@ -24,6 +24,7 @@ SECTIONS
 
     .rodata ALIGN(4K) : AT(LOADADDR(.text) + SIZEOF(.text))
     {
+        KEEP(*(.limine_requests))
         *(.rodata .rodata.*)
     } :rodata
 
@@ -32,7 +33,7 @@ SECTIONS
         *(.data .data.*)
     } :data
 
-    .bss ALIGN(4K) : AT(LOADADDR(.data) + SIZEOF(.data))
+    .bss ALIGN(4K) (NOLOAD) : AT(LOADADDR(.data) + SIZEOF(.data))
     {
         *(COMMON)
         *(.bss .bss.*)
