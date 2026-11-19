@@ -8,7 +8,7 @@ use centinela_security::permissions::PagePermissions;
 
 pub const PAGE_SIZE: u64 = 4096;
 const ADDRESS_BITS: u32 = 48;
-const PHYSICAL_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
+const PHYSICAL_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;\nconst CR3_ADDRESS_MASK: u64 = PHYSICAL_ADDRESS_MASK;
 
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
@@ -109,6 +109,36 @@ impl HhdmOffset {
     }
 }
 
+impl BootPagingInfo {
+    /// Captures CR3 and proves that its root address has a canonical HHDM alias.
+    ///
+    /// CR3's low PCID/cache-control bits are discarded. The caller must still
+    /// ensure the HHDM mapping is present before dereferencing root_virtual.
+    pub const fn new(cr3: u64, hhdm: HhdmOffset) -> Result<Self, AddressError> {
+        let root = cr3 & CR3_ADDRESS_MASK;
+        if root == 0 {
+            return Err(AddressError::InvalidPageTableRoot);
+        }
+        let root_physical = match PhysAddr::new(root) {
+            Ok(address) => address,
+            Err(error) => return Err(error),
+        };
+        let root_virtual = match hhdm.physical_to_virtual(root_physical) {
+            Ok(address) => address,
+            Err(error) => return Err(error),
+        };
+        Ok(Self { root_physical, root_virtual })
+    }
+
+    pub const fn root_physical(self) -> PhysAddr {
+        self.root_physical
+    }
+
+    pub const fn root_virtual(self) -> VirtAddr {
+        self.root_virtual
+    }
+}
+
 impl PageTableEntry {
     pub const fn new(physical: PhysAddr, permissions: PagePermissions) -> Result<Self, EntryError> {
         if !permissions.readable {
@@ -169,7 +199,7 @@ const fn is_canonical(value: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AddressError, EntryError, HhdmOffset, PAGE_SIZE, PageTableEntry, PhysAddr, VirtAddr,
+        AddressError, BootPagingInfo, EntryError, HhdmOffset, PAGE_SIZE, PageTableEntry, PhysAddr, VirtAddr,
     };
     use centinela_security::permissions::PagePermissions;
 
