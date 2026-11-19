@@ -53,6 +53,16 @@ impl<T> PartialEq for CapabilityHandle<T> {
 
 impl<T> Eq for CapabilityHandle<T> {}
 
+impl<T> core::fmt::Debug for CapabilityHandle<T> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("CapabilityHandle")
+            .field("slot", &self.slot)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
 struct Slot<T> {
     generation: u32,
     rights: Rights,
