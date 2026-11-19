@@ -8,5 +8,5 @@
 
 pub mod capabilities;
 pub mod handles;
-pub mod syscall_policy;
 pub mod permissions;
+pub mod syscall_policy;
