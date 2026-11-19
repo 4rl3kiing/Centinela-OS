@@ -2,14 +2,14 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use core::arch::asm;
 use core::mem::MaybeUninit;
 use core::panic::PanicInfo;
 use core::ptr::{addr_of, addr_of_mut};
 
+use centinela_hal::cpu::halt_forever;
+use centinela_hal::serial::{init as serial_init, write as serial_write};
 use centinela_kernel::memory::pmm::{BITMAP_WORDS, LimineMemoryMapResponse, Pmm};
 
-const COM1: u16 = 0x3F8;
 const LIMINE_COMMON_MAGIC: [u64; 2] = [0xc7b1_dd30_df4c_8b88, 0x0a82_e883_a194_f07b];
 
 #[repr(C)]
@@ -97,65 +97,6 @@ static mut LIMINE_REQUESTS: LimineRequests = LimineRequests {
 static mut FRAME_BITMAP: [u64; BITMAP_WORDS] = [0; BITMAP_WORDS];
 static mut ALLOCATED_BITMAP: [u64; BITMAP_WORDS] = [0; BITMAP_WORDS];
 static mut PMM_STATE: MaybeUninit<Pmm<'static>> = MaybeUninit::uninit();
-
-#[inline]
-fn outb(port: u16, value: u8) {
-    // SAFETY: Writing an I/O port is an architecture-specific privileged
-    // operation. This is only called during early kernel execution.
-    unsafe {
-        asm!(
-            "out dx, al",
-            in("dx") port,
-            in("al") value,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-}
-
-#[inline]
-fn inb(port: u16) -> u8 {
-    let value: u8;
-    // SAFETY: Reading the UART line-status register is a privileged,
-    // architecture-specific I/O operation in early kernel context.
-    unsafe {
-        asm!(
-            "in al, dx",
-            in("dx") port,
-            out("al") value,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-    value
-}
-
-fn serial_init() {
-    outb(COM1 + 1, 0x00);
-    outb(COM1 + 3, 0x80);
-    outb(COM1, 0x03);
-    outb(COM1 + 1, 0x00);
-    outb(COM1 + 3, 0x03);
-    outb(COM1 + 2, 0xC7);
-    outb(COM1 + 4, 0x0B);
-}
-
-fn serial_write(message: &str) {
-    for byte in message.bytes() {
-        while inb(COM1 + 5) & 0x20 == 0 {
-            core::hint::spin_loop();
-        }
-        outb(COM1, byte);
-    }
-}
-
-fn halt_forever() -> ! {
-    loop {
-        // SAFETY: HLT is valid in the privileged kernel context. Interrupts
-        // are disabled first, so this bootstrap kernel remains halted.
-        unsafe {
-            asm!("cli; hlt", options(nomem, nostack));
-        }
-    }
-}
 
 fn initialize_memory() -> bool {
     // Limine sets the third base-revision field to zero when the requested
