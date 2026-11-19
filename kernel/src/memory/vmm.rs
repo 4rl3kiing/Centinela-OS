@@ -269,7 +269,7 @@ mod tests {
 
 #[cfg(kani)]
 mod verification {
-    use super::{PageTableEntry, PhysAddr, VirtAddr, is_canonical, PAGE_SIZE};
+    use super::{PAGE_SIZE, PageTableEntry, PhysAddr, VirtAddr, is_canonical};
     use centinela_security::permissions::PagePermissions;
 
     #[kani::proof]
