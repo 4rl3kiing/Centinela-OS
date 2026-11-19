@@ -41,6 +41,7 @@ The project has a freestanding Rust kernel with a Limine BIOS/UEFI boot path and
 - Early CPU hardening for NXE, CR0.WP, SMEP, SMAP and UMIP when supported, including control-register readback.
 - Checked x86_64 virtual/physical address types, four-level page-table index extraction, HHDM conversion and NX/W^X page-entry encoding primitives with host unit tests; active page-table management is not yet implemented.
 - Feature-detected, bounded RDRAND/RDSEED hardware sampling interfaces in HAL; these samples are not yet mixed into a kernel entropy pool or used for KASLR.
+- Fixed-capacity typed capability handles with per-resource rights and generation checks, plus monotonic syscall allow-list policy primitives; process/syscall integration remains pending.
 - Word-level PMM bitmap allocation scanning to reduce the cost of searching for free frames.
 
 The PMM is an initial single-core implementation. It is not yet a complete virtual-memory manager and does not yet provide SMP-safe allocation.
@@ -53,4 +54,4 @@ The PMM is an initial single-core implementation. It is not yet a complete virtu
 
 ## Current status
 
-Bootstrap and initial PMM milestones passed: the kernel builds, produces a hybrid ISO, reaches its Rust entry point, validates the Limine memory map and exercises PMM allocation/free under BIOS and UEFI in QEMU. The hardening implementation branch passed formatting, Clippy, host unit tests, freestanding compilation, hybrid ISO generation, and BIOS/UEFI QEMU boot checks at commit `b5aecb41988dd9ca31e40c87eb1207534fa9de5b` (including bounded hardware entropy interfaces). VMM, enforced NX/W^X mappings, KASLR, KPTI, heap hardening, scheduling, user space, IPC, driver isolation and IOMMU remain unimplemented.
+Bootstrap and initial PMM milestones passed: the kernel builds, produces a hybrid ISO, reaches its Rust entry point, validates the Limine memory map and exercises PMM allocation/free under BIOS and UEFI in QEMU. The hardening implementation branch passed formatting, Clippy, host unit tests, freestanding compilation, hybrid ISO generation, and BIOS/UEFI QEMU boot checks at commit `7d245b1323c027bf3f62e385001e4c68fd46c83a` (including typed capability and syscall-policy primitives). VMM, enforced NX/W^X mappings, KASLR, KPTI, heap hardening, scheduling, user space, IPC, driver isolation and IOMMU remain unimplemented.
