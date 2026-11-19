@@ -8,7 +8,8 @@ use core::ptr::{addr_of, addr_of_mut};
 
 use centinela_hal::cpu::{CpuHardeningError, current_page_table_root, enable_boot_hardening, halt_forever};
 use centinela_hal::serial::{init as serial_init, write as serial_write};
-use centinela_kernel::memory::pmm::{BITMAP_WORDS, LimineMemoryMapResponse, Pmm};\nuse centinela_kernel::memory::vmm::{BootPagingInfo, HhdmOffset};
+use centinela_kernel::memory::pmm::{BITMAP_WORDS, LimineMemoryMapResponse, Pmm};
+use centinela_kernel::memory::vmm::{BootPagingInfo, HhdmOffset};
 
 const LIMINE_COMMON_MAGIC: [u64; 2] = [0xc7b1_dd30_df4c_8b88, 0x0a82_e883_a194_f07b];
 
@@ -96,7 +97,8 @@ static mut LIMINE_REQUESTS: LimineRequests = LimineRequests {
 // The bitmap itself is reserved automatically as part of the kernel BSS.
 static mut FRAME_BITMAP: [u64; BITMAP_WORDS] = [0; BITMAP_WORDS];
 static mut ALLOCATED_BITMAP: [u64; BITMAP_WORDS] = [0; BITMAP_WORDS];
-static mut PMM_STATE: MaybeUninit<Pmm<'static>> = MaybeUninit::uninit();\nstatic mut BOOT_PAGING_INFO: MaybeUninit<BootPagingInfo> = MaybeUninit::uninit();
+static mut PMM_STATE: MaybeUninit<Pmm<'static>> = MaybeUninit::uninit();
+static mut BOOT_PAGING_INFO: MaybeUninit<BootPagingInfo> = MaybeUninit::uninit();
 
 fn initialize_memory() -> bool {
     // Limine sets the third base-revision field to zero when the requested
@@ -138,7 +140,7 @@ fn initialize_memory() -> bool {
     let hhdm_offset = match HhdmOffset::new(hhdm_offset) {
         Ok(offset) => offset,
         Err(_) => {
-            serial_write("Centinela-OS: HHDM offset is not canonical.\\r\\n");
+            serial_write("Centinela-OS: HHDM offset is not canonical.\r\n");
             return false;
         }
     };
