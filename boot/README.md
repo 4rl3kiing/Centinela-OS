@@ -35,8 +35,10 @@ bash scripts/test-qemu.sh
 ```
 
 The test starts QEMU in legacy BIOS mode and UEFI mode, captures COM1 serial
-output, and requires the kernel-entry, Limine base-revision, PMM initialization,
-and PMM allocation/free self-test messages. Logs are written to `build/logs/`.
+output, and requires the kernel-entry, CPU hardening, Limine base-revision,
+HHDM page-table-frame validation, active CR3 root-alias verification, kernel RX
+mapping verification, PMM initialization, and PMM allocation/free self-test
+messages. Logs are written to `build/logs/`.
 
 ## Physical memory manager
 
