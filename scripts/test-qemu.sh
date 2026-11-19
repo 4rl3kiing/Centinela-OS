@@ -20,9 +20,11 @@ run_and_check() {
     grep -Fq "CPU hardening: NXE enabled." "$log" || { cat "$log" >&2; echo "NXE hardening was not enabled for $mode boot" >&2; exit 1; }
     grep -Fq "CPU hardening: CR0.WP enabled." "$log" || { cat "$log" >&2; echo "CR0.WP was not enabled for $mode boot" >&2; exit 1; }
     grep -Fq "Limine base revision 5 accepted." "$log"
+    grep -Fq "VMM bootstrap: Limine page-table frames validated through HHDM." "$log" || { cat "$log" >&2; echo "HHDM page-table frame validation not found for $mode boot" >&2; exit 1; }
+    grep -Fq "VMM bootstrap: HHDM root alias and kernel RX mapping verified." "$log" || { cat "$log" >&2; echo "Active paging-root or kernel RX mapping verification not found for $mode boot" >&2; exit 1; }
     grep -Fq "PMM initialized: 4 KiB frames, 64 GiB address ceiling." "$log" || { cat "$log" >&2; echo "PMM initialization not found for $mode boot" >&2; exit 1; }
     grep -Fq "PMM allocation/free self-test passed." "$log" || { cat "$log" >&2; echo "PMM self-test not found for $mode boot" >&2; exit 1; }
-    echo "PASS: $mode boot reached Rust kernel and initialized PMM"
+    echo "PASS: $mode boot verified HHDM, kernel RX mapping, and initialized PMM"
 }
 run_and_check bios -cdrom "$ISO" -boot d
 OVMF_CODE="${OVMF_CODE:-}"
