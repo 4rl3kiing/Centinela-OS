@@ -96,7 +96,7 @@ mod tests {
         assert!(policy.allows(Syscall::Read));
 
         policy.restrict_to(SyscallSet::from_bits(
-            (1 << Syscall::Read as u8) | (1 << Syscall::Exit as u8),
+            (1_u64 << (Syscall::Read as u8)) | (1_u64 << (Syscall::Exit as u8)),
         ));
         assert!(policy.allows(Syscall::Read));
         assert!(policy.allows(Syscall::Exit));
