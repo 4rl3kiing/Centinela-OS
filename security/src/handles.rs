@@ -206,7 +206,11 @@ mod tests {
             Err(TableError::PermissionDenied)
         );
         assert_eq!(
-            table.get_mut(handle, Rights::READ),
+            table.get(handle, Rights::NONE),
+            Err(TableError::PermissionDenied)
+        );
+        assert_eq!(
+            table.get_mut(handle, Rights::CONTROL),
             Err(TableError::PermissionDenied)
         );
         *table.get_mut(handle, Rights::WRITE).expect("write allowed") = 0xbeef;
