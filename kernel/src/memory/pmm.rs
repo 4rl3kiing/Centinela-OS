@@ -39,24 +39,31 @@ pub enum PmmError {
     InvalidKernelRange,
     FrameOutOfRange,
     FrameAlreadyFree,
+    FrameNotAllocated,
 }
 
 pub struct Pmm<'a> {
     bitmap: &'a mut [u64],
+    allocated: &'a mut [u64],
     free_frames: u64,
     allocation_hint: usize,
 }
 
 impl<'a> Pmm<'a> {
     /// Creates a manager with every frame reserved.
-    pub fn new(bitmap: &'a mut [u64]) -> Result<Self, PmmError> {
-        if bitmap.is_empty() {
+    pub fn new(
+        bitmap: &'a mut [u64],
+        allocated: &'a mut [u64],
+    ) -> Result<Self, PmmError> {
+        if bitmap.is_empty() || bitmap.len() != allocated.len() {
             return Err(PmmError::InvalidBitmapSize);
         }
 
         bitmap.fill(u64::MAX);
+        allocated.fill(0);
         Ok(Self {
             bitmap,
+            allocated,
             free_frames: 0,
             allocation_hint: 1,
         })
@@ -158,11 +165,7 @@ impl<'a> Pmm<'a> {
     }
 
     /// Releases a frame previously returned by allocate_frame.
-    ///
-    /// # Safety
-    /// The caller must own this frame and must ensure it is no longer used by
-    /// any CPU, page table, device, or other kernel subsystem.
-    pub unsafe fn free_frame(&mut self, physical_address: u64) -> Result<(), PmmError> {
+    pub fn free_frame(&mut self, physical_address: u64) -> Result<(), PmmError> {
         if physical_address % PAGE_SIZE != 0 {
             return Err(PmmError::FrameOutOfRange);
         }
@@ -171,8 +174,12 @@ impl<'a> Pmm<'a> {
         if frame == 0 || frame >= self.frame_count() {
             return Err(PmmError::FrameOutOfRange);
         }
-        if self.is_free(frame) {
-            return Err(PmmError::FrameAlreadyFree);
+        if !self.is_allocated(frame) {
+            return if self.is_free(frame) {
+                Err(PmmError::FrameAlreadyFree)
+            } else {
+                Err(PmmError::FrameNotAllocated)
+            };
         }
 
         self.set_free(frame);
@@ -201,16 +208,31 @@ impl<'a> Pmm<'a> {
         self.bitmap[word] & (1_u64 << bit) == 0
     }
 
+    fn is_allocated(&self, frame: usize) -> bool {
+        let word = frame / u64::BITS as usize;
+        let bit = frame % u64::BITS as usize;
+        self.allocated[word] & (1_u64 << bit) != 0
+    }
+
     fn set_allocated(&mut self, frame: usize) {
         let word = frame / u64::BITS as usize;
         let bit = frame % u64::BITS as usize;
         self.bitmap[word] |= 1_u64 << bit;
+        self.allocated[word] |= 1_u64 << bit;
+    }
+
+    fn set_reserved(&mut self, frame: usize) {
+        let word = frame / u64::BITS as usize;
+        let bit = frame % u64::BITS as usize;
+        self.bitmap[word] |= 1_u64 << bit;
+        self.allocated[word] &= !(1_u64 << bit);
     }
 
     fn set_free(&mut self, frame: usize) {
         let word = frame / u64::BITS as usize;
         let bit = frame % u64::BITS as usize;
         self.bitmap[word] &= !(1_u64 << bit);
+        self.allocated[word] &= !(1_u64 << bit);
     }
 
     fn mark_free_range(&mut self, start_frame: u64, end_frame: u64) {
@@ -229,7 +251,7 @@ impl<'a> Pmm<'a> {
         for frame in start_frame.min(end)..end {
             let frame = frame as usize;
             if self.is_free(frame) {
-                self.set_allocated(frame);
+                self.set_reserved(frame);
                 self.free_frames -= 1;
             }
         }
@@ -247,7 +269,9 @@ mod tests {
     #[test]
     fn allocation_and_free_are_accounted() {
         let mut bitmap = [u64::MAX; 2];
-        let mut pmm = Pmm::new(&mut bitmap).expect("bitmap should be accepted");
+        let mut allocated = [0_u64; 2];
+        let mut pmm =
+            Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
         pmm.mark_free_range(1, 128);
         assert_eq!(pmm.free_frames(), 127);
 
@@ -255,23 +279,20 @@ mod tests {
         assert_eq!(first, PAGE_SIZE);
         assert_eq!(pmm.free_frames(), 126);
 
-        // SAFETY: The frame was just allocated and is not in use elsewhere.
-        unsafe { pmm.free_frame(first) }.expect("allocated frame should be releasable");
+        pmm.free_frame(first).expect("allocated frame should be releasable");
         assert_eq!(pmm.free_frames(), 127);
     }
 
     #[test]
     fn frame_zero_and_double_free_are_rejected() {
         let mut bitmap = [u64::MAX; 1];
-        let mut pmm = Pmm::new(&mut bitmap).expect("bitmap should be accepted");
+        let mut allocated = [0_u64; 1];
+        let mut pmm =
+            Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
         pmm.mark_free_range(0, 64);
 
-        // SAFETY: These test addresses are intentionally not owned.
-        assert_eq!(unsafe { pmm.free_frame(0) }, Err(PmmError::FrameOutOfRange));
-        assert_eq!(
-            unsafe { pmm.free_frame(PAGE_SIZE) },
-            Err(PmmError::FrameAlreadyFree)
-        );
+        assert_eq!(pmm.free_frame(0), Err(PmmError::FrameOutOfRange));
+        assert_eq!(pmm.free_frame(PAGE_SIZE), Err(PmmError::FrameAlreadyFree));
     }
 
     #[test]
@@ -279,10 +300,9 @@ mod tests {
         let mut bitmap = [u64::MAX; 1];
         let mut pmm = Pmm::new(&mut bitmap).expect("bitmap should be accepted");
 
-        // SAFETY: These test addresses are intentionally invalid.
-        assert_eq!(unsafe { pmm.free_frame(1) }, Err(PmmError::FrameOutOfRange));
+        assert_eq!(pmm.free_frame(1), Err(PmmError::FrameOutOfRange));
         assert_eq!(
-            unsafe { pmm.free_frame(64 * PAGE_SIZE) },
+            pmm.free_frame(64 * PAGE_SIZE),
             Err(PmmError::FrameOutOfRange)
         );
     }
