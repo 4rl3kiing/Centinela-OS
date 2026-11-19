@@ -79,9 +79,9 @@ An IOMMU must not be represented as enabled merely because firmware tables exist
 - Keep stable Rust as the required reproducible build.
 - Evaluate nightly-only CFI and stack-protector support in a separate experimental CI job; do not pass unsupported `-Z` flags to the stable kernel build.
 - Treat stack protectors, stack probing and interrupt-stack guard pages as separate controls.
-- Run host-testable unsafe-sensitive code under Miri where supported.
-- Add Kani harnesses for bounded arithmetic, permission validation and allocator invariants where proofs are tractable.
-- Fuzz parsers, syscall argument decoders, IPC message validation and filesystem/network parsers in host builds using cargo-fuzz.
+- Run host-testable unsafe-sensitive code under Miri where supported; the current workspace host test suite passes under Miri.
+- Add Kani harnesses for bounded arithmetic, permission validation and allocator invariants where proofs are tractable; Kani is not configured yet.
+- Fuzz parsers, syscall argument decoders, IPC message validation and filesystem/network parsers in host builds using cargo-fuzz; the first PMM/Limine memory-map fuzz target and bounded CI smoke run pass.
 - Preserve seeds, regression cases and sanitizer findings.
 
 Miri and Kani results apply only to the harnessed code and assumptions; they are not a proof that the complete kernel is free of undefined behavior or vulnerabilities.
