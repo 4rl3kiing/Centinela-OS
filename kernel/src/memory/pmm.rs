@@ -309,7 +309,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn limine_map_initialization_reserves_kernel_and_frame_zero() {
         let mut bitmap = [u64::MAX; 4];
