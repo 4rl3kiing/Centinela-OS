@@ -55,8 +55,8 @@ pub fn enable_boot_hardening() -> Result<CpuHardening, CpuHardeningError> {
     }
 
     // Enable execute-disable support before any page table uses the NX bit.
-    let mut efer_low: u32;
-    let mut efer_high: u32;
+    let efer_low: u32;
+    let efer_high: u32;
     // SAFETY: Reading IA32_EFER is a privileged operation in ring 0.
     unsafe {
         core::arch::asm!(
