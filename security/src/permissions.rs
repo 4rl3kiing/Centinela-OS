@@ -57,3 +57,26 @@ mod tests {
         assert!(permissions.is_write_xor_execute());
     }
 }
+
+#[cfg(kani)]
+mod verification {
+    use super::{PagePermissions, PermissionError};
+
+    #[kani::proof]
+    fn page_permissions_never_accept_write_and_execute_together() {
+        let readable: bool = kani::any();
+        let writable: bool = kani::any();
+        let executable: bool = kani::any();
+        let user_accessible: bool = kani::any();
+
+        let result = PagePermissions::new(readable, writable, executable, user_accessible);
+        assert_eq!(
+            result.is_ok(),
+            !(writable && executable),
+        );
+        if let Err(error) = result {
+            assert_eq!(error, PermissionError::WriteExecuteViolation);
+            assert!(writable && executable);
+        }
+    }
+}
