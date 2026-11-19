@@ -60,6 +60,7 @@ Do not enable LA57 or switch paging depth until a tested transition path exists.
 - Add a single-core scheduler and context switching only after interrupt entry/exit invariants are tested.
 - Introduce Ring 3, per-process address spaces and validated user-memory copies.
 - Replace ambient privilege assumptions with typed object capabilities and opaque handles.
+- Enforce least-privilege access rights per resource and make syscall policy reduction monotonic.
 - Add syscall allow/deny policy with monotonic privilege dropping; a task may reduce its syscall set but cannot regain denied calls.
 - Add IPC primitives and shared-memory ownership rules before moving drivers out of Ring 0.
 
@@ -104,6 +105,6 @@ Requires a working VMM and heap. Add guard pages, randomized freelists, metadata
 - HAL exposes bounded RDRAND/RDSEED reads after CPUID feature detection; these are not yet mixed into a kernel CSPRNG or used for KASLR.
 - VMM groundwork provides checked 48-bit canonical virtual addresses, bounded physical addresses, HHDM conversion, four-level page-table indices and NX/W^X page-entry encoding. It does not yet install or own active page tables.
 - PMM allocator is being optimized to scan bitmap words rather than every frame.
-- W^X and capability-set primitives exist but are not yet enforced by VMM, tasks or syscalls.
+- W^X permission policy, fixed-capacity typed generation-tagged capability handles, and monotonic syscall allow-list primitives exist; they are not yet wired into process creation or a syscall dispatcher.
 
 Everything else above remains planned until integrated and validated by the relevant tests.
