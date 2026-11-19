@@ -22,11 +22,20 @@ run_and_check() {
 }
 run_and_check bios -cdrom "$ISO" -boot d
 OVMF_CODE="${OVMF_CODE:-}"
+OVMF_VARS="${OVMF_VARS:-}"
 if [[ -z "$OVMF_CODE" ]]; then
     for candidate in /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
         if [[ -f "$candidate" ]]; then OVMF_CODE="$candidate"; break; fi
     done
 fi
-if [[ -z "$OVMF_CODE" || ! -f "$OVMF_CODE" ]]; then echo "OVMF firmware not found. Set OVMF_CODE." >&2; exit 1; fi
-cp "$OVMF_CODE" build/OVMF_VARS.fd
+if [[ -z "$OVMF_VARS" ]]; then
+    for candidate in /usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/edk2/ovmf/OVMF_VARS.fd; do
+        if [[ -f "$candidate" ]]; then OVMF_VARS="$candidate"; break; fi
+    done
+fi
+if [[ -z "$OVMF_CODE" || ! -f "$OVMF_CODE" || -z "$OVMF_VARS" || ! -f "$OVMF_VARS" ]]; then
+    echo "OVMF CODE/VARS firmware pair not found. Set OVMF_CODE and OVMF_VARS." >&2
+    exit 1
+fi
+cp "$OVMF_VARS" build/OVMF_VARS.fd
 run_and_check uefi -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" -drive "if=pflash,format=raw,file=build/OVMF_VARS.fd" -cdrom "$ISO" -boot d
