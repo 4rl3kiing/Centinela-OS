@@ -187,9 +187,10 @@ fn initialize_memory() -> bool {
     }
 
     // SAFETY: Limine supplies a valid HHDM response for the lifetime of boot.
+    let hhdm_revision = unsafe { addr_of!((*hhdm).revision).read() };
     let hhdm_offset = unsafe { addr_of!((*hhdm).offset).read() };
-    if hhdm_offset & 0xfff != 0 {
-        serial_write("Centinela-OS: invalid HHDM offset alignment.\r\n");
+    if hhdm_revision != 0 || hhdm_offset & 0xfff != 0 {
+        serial_write("Centinela-OS: unsupported or invalid HHDM response.\r\n");
         return false;
     }
 
