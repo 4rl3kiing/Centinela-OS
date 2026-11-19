@@ -291,8 +291,7 @@ mod tests {
     fn frame_zero_and_double_free_are_rejected() {
         let mut bitmap = [u64::MAX; 1];
         let mut allocated = [0_u64; 1];
-        let mut pmm =
-            Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
+        let mut pmm = Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
         pmm.mark_free_range(0, 64);
 
         assert_eq!(pmm.free_frame(0), Err(PmmError::FrameOutOfRange));
@@ -303,8 +302,7 @@ mod tests {
     fn unaligned_and_out_of_range_addresses_are_rejected() {
         let mut bitmap = [u64::MAX; 1];
         let mut allocated = [0_u64; 1];
-        let mut pmm =
-            Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
+        let mut pmm = Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
 
         assert_eq!(pmm.free_frame(1), Err(PmmError::FrameOutOfRange));
         assert_eq!(
@@ -317,8 +315,7 @@ mod tests {
     fn limine_map_initialization_reserves_kernel_and_frame_zero() {
         let mut bitmap = [u64::MAX; 4];
         let mut allocated = [0_u64; 4];
-        let mut pmm =
-            Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
+        let mut pmm = Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
         let usable = LimineMemoryMapEntry {
             base: 0,
             length: 256 * PAGE_SIZE,
@@ -347,8 +344,7 @@ mod tests {
     fn allocation_returns_none_when_no_frames_are_free() {
         let mut bitmap = [u64::MAX; 1];
         let mut allocated = [0_u64; 1];
-        let mut pmm =
-            Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
+        let mut pmm = Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
         assert_eq!(pmm.allocate_frame(), None);
     }
 }
