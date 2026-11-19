@@ -70,10 +70,7 @@ mod verification {
         let user_accessible: bool = kani::any();
 
         let result = PagePermissions::new(readable, writable, executable, user_accessible);
-        assert_eq!(
-            result.is_ok(),
-            !(writable && executable),
-        );
+        assert_eq!(result.is_ok(), !(writable && executable),);
         if let Err(error) = result {
             assert_eq!(error, PermissionError::WriteExecuteViolation);
             assert!(writable && executable);
