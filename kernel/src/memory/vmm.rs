@@ -455,7 +455,7 @@ impl HhdmPageTableMemory {
     }}
 
 // SAFETY: Before each read, the complete page-table frame is verified to be
-// in a Limine base-revision-5 memory class guaranteed to be HHDM-mapped.
+// in Limine bootloader-reclaimable memory, which base revision 5 guarantees is HHDM-mapped.
 unsafe impl PageTableMemory for HhdmPageTableMemory {
     fn read_entry(&self, table: PhysAddr, index: u16) -> Result<u64, WalkError> {
         if index >= 512 { return Err(WalkError::MemoryReadFailed); }
@@ -559,6 +559,53 @@ mod walker_tests {
         HUGE_PAGE, NO_EXECUTE, PAGE_SIZE, PRESENT, PageTableMemory, PageTableWalker, PhysAddr,
         Translation, USER, VirtAddr, WRITABLE, WalkError,
     };
+
+    #[test]
+    fn hhdm_reader_only_accepts_bootloader_reclaimable_frames() {
+        use super::super::pmm::{LimineMemoryMapEntry, LimineMemoryMapResponse};
+        use super::super::{HhdmOffset, HhdmPageTableMemory, WalkError};
+
+        let reclaimable = LimineMemoryMapEntry {
+            base: 0x1000,
+            length: 0x4000,
+            entry_type: 5,
+        };
+        let usable = LimineMemoryMapEntry {
+            base: 0x8000,
+            length: 0x4000,
+            entry_type: 0,
+        };
+        let entries = [
+            &reclaimable as *const LimineMemoryMapEntry,
+            &usable as *const LimineMemoryMapEntry,
+        ];
+        let response = LimineMemoryMapResponse {
+            revision: 0,
+            entry_count: entries.len() as u64,
+            entries: entries.as_ptr(),
+        };
+        let offset = HhdmOffset::new(0xffff_8000_0000_0000).unwrap();
+        // SAFETY: The response, pointer array and entries remain valid for
+        // the lifetime of this test's reader.
+        let reader = unsafe { HhdmPageTableMemory::new(offset, &response) }.unwrap();
+
+        assert_eq!(
+            reader.table_frame_is_mapped(PhysAddr::new(0x1000).unwrap()),
+            Ok(true)
+        );
+        assert_eq!(
+            reader.table_frame_is_mapped(PhysAddr::new(0x4000).unwrap()),
+            Ok(true)
+        );
+        assert_eq!(
+            reader.table_frame_is_mapped(PhysAddr::new(0x8000).unwrap()),
+            Ok(false)
+        );
+        assert_eq!(
+            reader.read_entry(PhysAddr::new(0x8000).unwrap(), 0),
+            Err(WalkError::PhysicalRegionNotMapped)
+        );
+    }
 
     struct MockMemory {
         entries: [(u64, u16, u64); 4],
