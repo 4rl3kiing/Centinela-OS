@@ -6,10 +6,7 @@ use core::arch::asm;
 use core::panic::PanicInfo;
 
 const COM1: u16 = 0x3F8;
-const LIMINE_COMMON_MAGIC: [u64; 2] = [
-    0xc7b1_dd30_df4c_8b88,
-    0x0a82_e883_a194_f07b,
-];
+const LIMINE_COMMON_MAGIC: [u64; 2] = [0xc7b1_dd30_df4c_8b88, 0x0a82_e883_a194_f07b];
 
 #[repr(C)]
 struct LimineRequest {
@@ -147,9 +144,8 @@ pub extern "C" fn _start() -> ! {
     // Limine sets the third base-revision field to zero when the requested
     // protocol revision is supported. Read the bootloader-mutated field
     // without creating a Rust reference to the mutable static.
-    let revision_supported = unsafe {
-        core::ptr::addr_of!(LIMINE_REQUESTS.base_revision[2]).read_volatile() == 0
-    };
+    let revision_supported =
+        unsafe { core::ptr::addr_of!(LIMINE_REQUESTS.base_revision[2]).read_volatile() == 0 };
 
     if !revision_supported {
         serial_write("\r\nCentinela-OS: unsupported Limine base revision.\r\n");
