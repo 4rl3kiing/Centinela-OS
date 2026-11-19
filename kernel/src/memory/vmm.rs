@@ -461,7 +461,8 @@ impl HhdmPageTableMemory {
             }
         }
         Ok(false)
-    }}
+    }
+}
 
 // SAFETY: Before each read, the complete page-table frame is verified to be
 // in Limine bootloader-reclaimable memory, which base revision 5 guarantees is HHDM-mapped.
