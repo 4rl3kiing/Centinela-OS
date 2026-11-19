@@ -7,4 +7,6 @@
 //! hardware isolation until wired into the scheduler, MMU and syscall layer.
 
 pub mod capabilities;
+pub mod handles;
+pub mod syscall_policy;
 pub mod permissions;
