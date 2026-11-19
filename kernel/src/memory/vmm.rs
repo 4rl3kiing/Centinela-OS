@@ -266,3 +266,31 @@ mod tests {
         );
     }
 }
+
+#[cfg(kani)]
+mod verification {
+    use super::{PageTableEntry, PhysAddr, VirtAddr, is_canonical, PAGE_SIZE};
+    use centinela_security::permissions::PagePermissions;
+
+    #[kani::proof]
+    fn virtual_address_validation_matches_four_level_canonicality() {
+        let address: u64 = kani::any();
+        assert_eq!(VirtAddr::new(address).is_ok(), is_canonical(address));
+    }
+
+    #[kani::proof]
+    fn page_table_entries_reject_writable_executable_combinations() {
+        let writable: bool = kani::any();
+        let executable: bool = kani::any();
+        let physical = PhysAddr::new(PAGE_SIZE).expect("page-aligned physical address");
+        let permissions = PagePermissions {
+            readable: true,
+            writable,
+            executable,
+            user_accessible: false,
+        };
+
+        let entry = PageTableEntry::new(physical, permissions);
+        assert_eq!(entry.is_ok(), !(writable && executable));
+    }
+}
