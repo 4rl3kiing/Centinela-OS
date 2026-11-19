@@ -384,3 +384,47 @@ mod tests {
         assert_eq!(pmm.allocate_frame(), None);
     }
 }
+
+#[cfg(kani)]
+mod verification {
+    use super::{Pmm, PmmError, PAGE_SIZE};
+
+    #[kani::proof]
+    fn one_allocate_and_free_preserves_frame_accounting() {
+        let start: u64 = kani::any();
+        let end: u64 = kani::any();
+        kani::assume(start <= end);
+        kani::assume(end <= 64);
+
+        let mut bitmap = [u64::MAX; 1];
+        let mut allocated = [0_u64; 1];
+        let mut pmm = match Pmm::new(&mut bitmap, &mut allocated) {
+            Ok(pmm) => pmm,
+            Err(_) => return,
+        };
+
+        pmm.mark_free_range(start, end);
+        let before = pmm.free_frames();
+        match pmm.allocate_frame() {
+            Some(frame) => {
+                assert!(before > 0);
+                assert_eq!(pmm.free_frames(), before - 1);
+                assert_eq!(frame % PAGE_SIZE, 0);
+                assert_eq!(pmm.free_frame(frame), Ok(()));
+                assert_eq!(pmm.free_frames(), before);
+            }
+            None => assert_eq!(before, 0),
+        }
+    }
+
+    #[kani::proof]
+    fn free_rejects_unaligned_addresses() {
+        let address: u64 = kani::any();
+        kani::assume(address & (PAGE_SIZE - 1) != 0);
+
+        let mut bitmap = [u64::MAX; 1];
+        let mut allocated = [0_u64; 1];
+        let mut pmm = Pmm::new(&mut bitmap, &mut allocated).expect("one-word bitmaps are valid");
+        assert_eq!(pmm.free_frame(address), Err(PmmError::FrameOutOfRange));
+    }
+}
