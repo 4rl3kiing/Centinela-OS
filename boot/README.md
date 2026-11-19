@@ -35,8 +35,21 @@ bash scripts/test-qemu.sh
 ```
 
 The test starts QEMU in legacy BIOS mode and UEFI mode, captures COM1 serial
-output, and requires the kernel-entry and protocol-revision messages. Logs are
-written to `build/logs/`.
+output, and requires the kernel-entry, Limine base-revision, PMM initialization,
+and PMM allocation/free self-test messages. Logs are written to `build/logs/`.
+
+## Physical memory manager
+
+The initial PMM uses 4 KiB frames and two bitmaps covering physical addresses
+below 64 GiB. One bitmap distinguishes free from unavailable frames; the second
+tracks frames allocated by the PMM so reserved kernel and firmware frames
+cannot be released through the normal free operation. The kernel and its BSS
+(including both bitmaps) are reserved using physical linker symbols.
+
+Only Limine memory-map entries of type usable are released to the allocator.
+Other memory types remain reserved. Frame zero is always reserved. The PMM is
+single-core and must not be called concurrently; SMP locking and a virtual
+memory manager are future work. The two bitmaps consume approximately 4 MiB.
 
 A successful Cargo build or ISO creation alone is not proof of a successful
 firmware boot. The milestone is complete only after both QEMU boot checks pass.
