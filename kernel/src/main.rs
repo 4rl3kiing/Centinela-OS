@@ -7,7 +7,7 @@ use core::panic::PanicInfo;
 use core::ptr::{addr_of, addr_of_mut};
 
 use centinela_kernel::memory::pmm::{
-    LimineMemoryMapResponse, Pmm, BITMAP_WORDS, MAX_PHYSICAL_ADDRESS,
+    LimineMemoryMapResponse, Pmm, BITMAP_WORDS,
 };
 
 const COM1: u16 = 0x3F8;
@@ -224,7 +224,8 @@ fn initialize_memory() -> bool {
         serial_write("Centinela-OS: no usable physical frames detected.\r\n");
         return false;
     };
-    if pmm.free_frame(test_frame).is_err() {
+    // SAFETY: The self-test owns this freshly allocated frame and has not used it.
+    if unsafe { pmm.free_frame(test_frame) }.is_err() {
         serial_write("Centinela-OS: PMM allocation self-test failed.\r\n");
         return false;
     }
@@ -245,7 +246,6 @@ pub extern "C" fn _start() -> ! {
 
     serial_write("Bootstrap milestone: memory map validated and PMM online.\r\n");
     serial_write("HHDM response accepted.\r\n");
-    let _ = MAX_PHYSICAL_ADDRESS;
     halt_forever()
 }
 
