@@ -6,7 +6,7 @@
 use super::pmm::{Pmm, PmmError, PAGE_SIZE};
 
 /// A physical frame exclusively owned by the page-table subsystem.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct PageTableFrame(u64);
 
 impl PageTableFrame {
