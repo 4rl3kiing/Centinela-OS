@@ -1,6 +1,8 @@
 name: Kani bounded formal proofs
 
 on:
+  push:
+    branches: ["hardening/**"]
   workflow_dispatch:
   schedule:
     - cron: "17 5 * * 1"
