@@ -196,9 +196,9 @@ fn initialize_memory() -> bool {
 
     // The linker exports physical load boundaries, including the PMM bitmap
     // in BSS, so the allocator cannot hand kernel-owned frames back to callers.
-    // SAFETY: These linker symbols are defined by the kernel linker script.
-    let kernel_start = unsafe { addr_of!(__kernel_phys_start) as u64 };
-    let kernel_end = unsafe { addr_of!(__kernel_phys_end) as u64 };
+    // addr_of! obtains linker-symbol addresses without reading their contents.
+    let kernel_start = addr_of!(__kernel_phys_start) as u64;
+    let kernel_end = addr_of!(__kernel_phys_end) as u64;
 
     // SAFETY: The bitmap is a unique static buffer. The kernel is single-core
     // and interrupts are not enabled at this bootstrap stage.
