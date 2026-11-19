@@ -262,6 +262,18 @@ mod tests {
     }
 
     #[test]
+    fn captures_cr3_root_and_discards_low_control_bits() {
+        let hhdm = HhdmOffset::new(0xffff_8000_0000_0000).expect("canonical HHDM");
+        let info = BootPagingInfo::new(0x1234_5007, hhdm).expect("valid CR3 root");
+        assert_eq!(info.root_physical().get(), 0x1234_5000);
+        assert_eq!(info.root_virtual().get(), 0xffff_8000_1234_5000);
+        assert_eq!(
+            BootPagingInfo::new(0, hhdm),
+            Err(AddressError::InvalidPageTableRoot)
+        );
+    }
+
+    #[test]
     fn encodes_nx_and_writable_permissions_without_wx() {
         let physical = PhysAddr::new(0x4000).expect("aligned physical address");
         let data = PageTableEntry::new(
