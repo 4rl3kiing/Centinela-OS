@@ -4,6 +4,7 @@
 
 use core::arch::asm;
 use core::panic::PanicInfo;
+use core::mem::MaybeUninit;
 use core::ptr::{addr_of, addr_of_mut};
 
 use centinela_kernel::memory::pmm::{
@@ -97,6 +98,7 @@ static mut LIMINE_REQUESTS: LimineRequests = LimineRequests {
 // The bitmap itself is reserved automatically as part of the kernel BSS.
 static mut FRAME_BITMAP: [u64; BITMAP_WORDS] = [0; BITMAP_WORDS];
 static mut ALLOCATED_BITMAP: [u64; BITMAP_WORDS] = [0; BITMAP_WORDS];
+static mut PMM_STATE: MaybeUninit<Pmm<'static>> = MaybeUninit::uninit();
 
 #[inline]
 fn outb(port: u16, value: u8) {
@@ -199,11 +201,11 @@ fn initialize_memory() -> bool {
 
     // SAFETY: The bitmap is a unique static buffer. The kernel is single-core
     // and interrupts are not enabled at this bootstrap stage.
-    let bitmap = unsafe {
+    let bitmap: &'static mut [u64] = unsafe {
         core::slice::from_raw_parts_mut(addr_of_mut!(FRAME_BITMAP).cast::<u64>(), BITMAP_WORDS)
     };
     // SAFETY: This is a separate, unique static bitmap with the same length.
-    let allocated_bitmap = unsafe {
+    let allocated_bitmap: &'static mut [u64] = unsafe {
         core::slice::from_raw_parts_mut(
             addr_of_mut!(ALLOCATED_BITMAP).cast::<u64>(),
             BITMAP_WORDS,
@@ -235,6 +237,12 @@ fn initialize_memory() -> bool {
     if pmm.free_frame(test_frame).is_err() {
         serial_write("Centinela-OS: PMM allocation self-test failed.\r\n");
         return false;
+    }
+
+    // Keep the initialized manager alive for subsequent kernel subsystems.
+    // SAFETY: PMM_STATE is written exactly once during single-core bootstrap.
+    unsafe {
+        addr_of_mut!(PMM_STATE).write(MaybeUninit::new(pmm));
     }
 
     serial_write("PMM initialized: 4 KiB frames, 64 GiB address ceiling.\r\n");
