@@ -196,8 +196,8 @@ mod tests {
         let indices = address.page_table_indices();
         assert_eq!(indices.pml4, 0x102);
         assert_eq!(indices.pdpt, 0x08d);
-        assert_eq!(indices.pd, 0x0b3);
-        assert_eq!(indices.pt, 0x178);
+        assert_eq!(indices.pd, 0x02b);
+        assert_eq!(indices.pt, 0x078);
         assert_eq!(indices.offset, 0x9ab);
     }
 
