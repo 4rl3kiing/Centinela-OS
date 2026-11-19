@@ -22,18 +22,18 @@ SECTIONS
         *(.text .text.*)
     } :text
 
-    .rodata ALIGN(4K) : AT(LOADADDR(.text) + SIZEOF(.text))
+    .rodata ALIGN(4K) : AT(ALIGN(LOADADDR(.text) + SIZEOF(.text), 4K))
     {
         KEEP(*(.limine_requests))
         *(.rodata .rodata.*)
     } :rodata
 
-    .data ALIGN(4K) : AT(LOADADDR(.rodata) + SIZEOF(.rodata))
+    .data ALIGN(4K) : AT(ALIGN(LOADADDR(.rodata) + SIZEOF(.rodata), 4K))
     {
         *(.data .data.*)
     } :data
 
-    .bss ALIGN(4K) (NOLOAD) : AT(LOADADDR(.data) + SIZEOF(.data))
+    .bss ALIGN(4K) (NOLOAD) : AT(ALIGN(LOADADDR(.data) + SIZEOF(.data), 4K))
     {
         *(COMMON)
         *(.bss .bss.*)
