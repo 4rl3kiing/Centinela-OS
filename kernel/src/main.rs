@@ -6,7 +6,9 @@ use core::mem::MaybeUninit;
 use core::panic::PanicInfo;
 use core::ptr::{addr_of, addr_of_mut};
 
-use centinela_hal::cpu::{CpuHardeningError, current_page_table_root, enable_boot_hardening, halt_forever};
+use centinela_hal::cpu::{
+    CpuHardeningError, current_page_table_root, enable_boot_hardening, halt_forever,
+};
 use centinela_hal::serial::{init as serial_init, write as serial_write};
 use centinela_kernel::memory::pmm::{BITMAP_WORDS, LimineMemoryMapResponse, Pmm};
 use centinela_kernel::memory::vmm::{BootPagingInfo, HhdmOffset};
