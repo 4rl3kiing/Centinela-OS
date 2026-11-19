@@ -93,9 +93,10 @@ static mut LIMINE_REQUESTS: LimineRequests = LimineRequests {
     end_marker: [0xadc0_e053_1bb1_0d03, 0x9572_709f_3176_4c62],
 };
 
-// A 64 GiB physical-address ceiling requires a 2 MiB bitmap at 4 KiB granularity.
+// A 64 GiB physical-address ceiling uses two 2 MiB bitmaps at 4 KiB granularity.
 // The bitmap itself is reserved automatically as part of the kernel BSS.
 static mut FRAME_BITMAP: [u64; BITMAP_WORDS] = [0; BITMAP_WORDS];
+static mut ALLOCATED_BITMAP: [u64; BITMAP_WORDS] = [0; BITMAP_WORDS];
 
 #[inline]
 fn outb(port: u16, value: u8) {
@@ -201,7 +202,14 @@ fn initialize_memory() -> bool {
     let bitmap = unsafe {
         core::slice::from_raw_parts_mut(addr_of_mut!(FRAME_BITMAP).cast::<u64>(), BITMAP_WORDS)
     };
-    let mut pmm = match Pmm::new(bitmap) {
+    // SAFETY: This is a separate, unique static bitmap with the same length.
+    let allocated_bitmap = unsafe {
+        core::slice::from_raw_parts_mut(
+            addr_of_mut!(ALLOCATED_BITMAP).cast::<u64>(),
+            BITMAP_WORDS,
+        )
+    };
+    let mut pmm = match Pmm::new(bitmap, allocated_bitmap) {
         Ok(pmm) => pmm,
         Err(_) => {
             serial_write("Centinela-OS: PMM bitmap initialization failed.\r\n");
@@ -224,8 +232,7 @@ fn initialize_memory() -> bool {
         serial_write("Centinela-OS: no usable physical frames detected.\r\n");
         return false;
     };
-    // SAFETY: The self-test owns this freshly allocated frame and has not used it.
-    if unsafe { pmm.free_frame(test_frame) }.is_err() {
+    if pmm.free_frame(test_frame).is_err() {
         serial_write("Centinela-OS: PMM allocation self-test failed.\r\n");
         return false;
     }
