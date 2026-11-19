@@ -32,4 +32,4 @@ jobs:
         run: cargo kani -p centinela-security --default-unwind 16
 
       - name: Verify PMM and VMM invariants
-        run: cargo kani -p centinela-kernel --default-unwind 80
+        run: cargo kani -p centinela-kernel --lib --default-unwind 80
