@@ -193,9 +193,15 @@ pub extern "C" fn _start() -> ! {
     match enable_boot_hardening() {
         Ok(features) => {
             serial_write("CPU hardening: NXE enabled.\r\n");
-            if features.umip { serial_write("CPU hardening: UMIP enabled.\r\n"); }
-            if features.smep { serial_write("CPU hardening: SMEP enabled.\r\n"); }
-            if features.smap { serial_write("CPU hardening: SMAP enabled.\r\n"); }
+            if features.umip {
+                serial_write("CPU hardening: UMIP enabled.\r\n");
+            }
+            if features.smep {
+                serial_write("CPU hardening: SMEP enabled.\r\n");
+            }
+            if features.smap {
+                serial_write("CPU hardening: SMAP enabled.\r\n");
+            }
         }
         Err(_) => {
             serial_write("Centinela-OS: mandatory NX support unavailable.\r\n");
