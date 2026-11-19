@@ -18,6 +18,7 @@ impl PageTableFrame {
 /// Errors while acquiring or releasing page-table frames.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PageTableFrameError {
+    OutOfMemory,
     Pmm(PmmError),
     ZeroingFailed,
     RollbackFailed(PmmError),
@@ -42,13 +43,13 @@ pub unsafe trait PageTableFrameMemory {
 
 /// Couples PMM ownership with the requirement that page-table frames are zeroed
 /// before they can be published to a page-table builder.
-pub struct PageTableFrameAllocator<'a, M: PageTableFrameMemory> {
-    pmm: &'a mut Pmm<'a>,
+pub struct PageTableFrameAllocator<'p, 'm, M: PageTableFrameMemory> {
+    pmm: &'p mut Pmm<'m>,
     memory: M,
 }
 
-impl<'a, M: PageTableFrameMemory> PageTableFrameAllocator<'a, M> {
-    pub fn new(pmm: &'a mut Pmm<'a>, memory: M) -> Self {
+impl<'p, 'm, M: PageTableFrameMemory> PageTableFrameAllocator<'p, 'm, M> {
+    pub fn new(pmm: &'p mut Pmm<'m>, memory: M) -> Self {
         Self { pmm, memory }
     }
 
@@ -58,7 +59,7 @@ impl<'a, M: PageTableFrameMemory> PageTableFrameAllocator<'a, M> {
         let physical_address = self
             .pmm
             .allocate_frame()
-            .ok_or(PageTableFrameError::Pmm(PmmError::FrameNotAllocated))?;
+            .ok_or(PageTableFrameError::OutOfMemory)?;
 
         // SAFETY: PMM just transferred exclusive ownership of this allocated
         // frame to this allocator; callers serialize allocator access.
