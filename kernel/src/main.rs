@@ -163,7 +163,7 @@ fn initialize_memory() -> bool {
     let table_memory = match unsafe { HhdmPageTableMemory::new(hhdm_offset, memory_map) } {
         Ok(memory) => memory,
         Err(_) => {
-            serial_write("Centinela-OS: invalid HHDM page-table memory map.\\r\\n");
+            serial_write("Centinela-OS: invalid HHDM page-table memory map.\r\n");
             return false;
         }
     };
@@ -171,35 +171,35 @@ fn initialize_memory() -> bool {
     let root_alias = match walker.translate(paging_info.root_virtual()) {
         Ok(translation) => translation,
         Err(_) => {
-            serial_write("Centinela-OS: active page-table root is not readable through HHDM.\\r\\n");
+            serial_write("Centinela-OS: active page-table root is not readable through HHDM.\r\n");
             return false;
         }
     };
     if root_alias.physical_address != paging_info.root_physical().get() {
-        serial_write("Centinela-OS: HHDM root translation mismatch.\\r\\n");
+        serial_write("Centinela-OS: HHDM root translation mismatch.\r\n");
         return false;
     }
 
     let kernel_entry = match VirtAddr::new(_start as usize as u64) {
         Ok(address) => address,
         Err(_) => {
-            serial_write("Centinela-OS: kernel entry virtual address is invalid.\\r\\n");
+            serial_write("Centinela-OS: kernel entry virtual address is invalid.\r\n");
             return false;
         }
     };
     let entry_mapping = match walker.translate(kernel_entry) {
         Ok(translation) => translation,
         Err(_) => {
-            serial_write("Centinela-OS: kernel entry mapping could not be verified.\\r\\n");
+            serial_write("Centinela-OS: kernel entry mapping could not be verified.\r\n");
             return false;
         }
     };
     if !entry_mapping.executable || entry_mapping.writable {
-        serial_write("Centinela-OS: kernel entry mapping violates RX permissions.\\r\\n");
+        serial_write("Centinela-OS: kernel entry mapping violates RX permissions.\r\n");
         return false;
     }
-    serial_write("VMM bootstrap: Limine page-table frames validated through HHDM.\\r\\n");
-    serial_write("VMM bootstrap: HHDM root alias and kernel RX mapping verified.\\r\\n");
+    serial_write("VMM bootstrap: Limine page-table frames validated through HHDM.\r\n");
+    serial_write("VMM bootstrap: HHDM root alias and kernel RX mapping verified.\r\n");
 
     // Record the bootloader-owned paging root without switching CR3.
     // The active page tables remain unchanged.
