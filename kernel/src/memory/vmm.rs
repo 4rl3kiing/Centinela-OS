@@ -15,6 +15,7 @@ const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
 const NO_EXECUTE: u64 = 1 << 63;
+const RESERVED_HIGH_BITS: u64 = 0x7ff0_0000_0000_0000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VirtAddr(u64);
@@ -361,6 +362,7 @@ pub enum WalkError {
     MemoryReadFailed,
     NotMapped,
     InvalidHugePage,
+    InvalidEntry,
     InvalidPhysicalAddress,
     AddressOverflow,
 }
@@ -463,6 +465,9 @@ impl<'a, M: PageTableMemory> PageTableWalker<'a, M> {
             let raw = self.memory.read_entry(table, index)?;
             if raw & PRESENT == 0 {
                 return Err(WalkError::NotMapped);
+            }
+            if raw & RESERVED_HIGH_BITS != 0 {
+                return Err(WalkError::InvalidEntry);
             }
 
             writable &= raw & WRITABLE != 0;
@@ -612,6 +617,42 @@ mod walker_tests {
                 user_accessible: false,
                 executable: true,
             }
+        );
+    }
+
+    #[test]
+    fn rejects_reserved_high_bits_in_page_table_entries() {
+        let memory = MockMemory {
+            entries: [
+                (0x1000, 0, 0x2000 | PRESENT | (1 << 55)),
+                (0, 0, 0),
+                (0, 0, 0),
+                (0, 0, 0),
+            ],
+            len: 1,
+        };
+        let walker = PageTableWalker::new(&memory, PhysAddr::new(0x1000).unwrap());
+        assert_eq!(
+            walker.translate(VirtAddr::new(0).unwrap()),
+            Err(WalkError::InvalidEntry)
+        );
+    }
+
+    #[test]
+    fn rejects_page_size_bit_in_pml4_entry() {
+        let memory = MockMemory {
+            entries: [
+                (0x1000, 0, 0x2000 | PRESENT | HUGE_PAGE),
+                (0, 0, 0),
+                (0, 0, 0),
+                (0, 0, 0),
+            ],
+            len: 1,
+        };
+        let walker = PageTableWalker::new(&memory, PhysAddr::new(0x1000).unwrap());
+        assert_eq!(
+            walker.translate(VirtAddr::new(0).unwrap()),
+            Err(WalkError::InvalidHugePage)
         );
     }
 
