@@ -404,6 +404,7 @@ mod verification {
         };
 
         pmm.mark_free_range(start, end);
+        pmm.reserve_range(0, 1);
         let before = pmm.free_frames();
         match pmm.allocate_frame() {
             Some(frame) => {
