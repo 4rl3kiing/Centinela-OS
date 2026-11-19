@@ -180,7 +180,7 @@ fn initialize_memory() -> bool {
         return false;
     }
 
-    let kernel_entry = match VirtAddr::new(_start as usize as u64) {
+    let kernel_entry = match VirtAddr::new(_start as *const () as usize as u64) {
         Ok(address) => address,
         Err(_) => {
             serial_write("Centinela-OS: kernel entry virtual address is invalid.\r\n");
