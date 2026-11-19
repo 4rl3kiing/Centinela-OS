@@ -19,3 +19,6 @@ lto = true
 codegen-units = 1
 opt-level = 2
 overflow-checks = true
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
