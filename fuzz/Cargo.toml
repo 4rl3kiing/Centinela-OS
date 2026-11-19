@@ -1,0 +1,19 @@
+[package]
+name = "centinela-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+centinela-kernel = { path = "../kernel" }
+
+[[bin]]
+name = "pmm_memory_map"
+path = "fuzz_targets/pmm_memory_map.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
