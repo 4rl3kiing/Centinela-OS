@@ -105,11 +105,7 @@ impl<T, const N: usize> CapabilityTable<T, N> {
         })
     }
 
-    pub fn insert(
-        &mut self,
-        value: T,
-        rights: Rights,
-    ) -> Result<CapabilityHandle<T>, TableError> {
+    pub fn insert(&mut self, value: T, rights: Rights) -> Result<CapabilityHandle<T>, TableError> {
         if rights.is_empty() {
             return Err(TableError::EmptyRights);
         }
@@ -129,11 +125,7 @@ impl<T, const N: usize> CapabilityTable<T, N> {
         Err(TableError::Full)
     }
 
-    pub fn get(
-        &self,
-        handle: CapabilityHandle<T>,
-        required: Rights,
-    ) -> Result<&T, TableError> {
+    pub fn get(&self, handle: CapabilityHandle<T>, required: Rights) -> Result<&T, TableError> {
         let slot = self.validated_slot(handle)?;
         if !slot.rights.contains(required) {
             return Err(TableError::PermissionDenied);
@@ -201,30 +193,35 @@ mod tests {
             .insert(0xfeed, Rights::READ.union(Rights::WRITE))
             .expect("slot available");
 
-        assert_eq!(*table.get(handle, Rights::READ).expect("read allowed"), 0xfeed);
+        assert_eq!(
+            *table.get(handle, Rights::READ).expect("read allowed"),
+            0xfeed
+        );
         assert_eq!(
             table.get(handle, Rights::CONTROL),
             Err(TableError::PermissionDenied)
         );
-        *table
-            .get_mut(handle, Rights::WRITE)
-            .expect("write allowed") = 0xbeef;
-        assert_eq!(*table.get(handle, Rights::READ).expect("read allowed"), 0xbeef);
+        *table.get_mut(handle, Rights::WRITE).expect("write allowed") = 0xbeef;
+        assert_eq!(
+            *table.get(handle, Rights::READ).expect("read allowed"),
+            0xbeef
+        );
     }
 
     #[test]
     fn removed_handles_cannot_access_reused_slots() {
         let mut table = CapabilityTable::<u32, 1>::new().expect("valid capacity");
-        let stale = table
-            .insert(7, Rights::READ)
-            .expect("slot available");
+        let stale = table.insert(7, Rights::READ).expect("slot available");
         assert_eq!(table.remove(stale), Ok(7));
 
         let fresh = table
             .insert(9, Rights::READ)
             .expect("slot was safely reused");
         assert_ne!(stale, fresh);
-        assert_eq!(table.get(stale, Rights::READ), Err(TableError::InvalidHandle));
+        assert_eq!(
+            table.get(stale, Rights::READ),
+            Err(TableError::InvalidHandle)
+        );
         assert_eq!(*table.get(fresh, Rights::READ).expect("fresh handle"), 9);
     }
 
