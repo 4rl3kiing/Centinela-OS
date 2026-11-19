@@ -387,7 +387,7 @@ mod tests {
 
 #[cfg(kani)]
 mod verification {
-    use super::{Pmm, PmmError, PAGE_SIZE};
+    use super::{PAGE_SIZE, Pmm, PmmError};
 
     #[kani::proof]
     fn one_allocate_and_free_preserves_frame_accounting() {
