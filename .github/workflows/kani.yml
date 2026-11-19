@@ -1,0 +1,31 @@
+name: Kani bounded formal proofs
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  kani:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Kani verifier
+        run: cargo install --locked kani-verifier
+
+      - name: Prepare Kani toolchain
+        run: cargo kani setup
+
+      - name: Verify security policy invariants
+        run: cargo kani -p centinela-security --target x86_64-unknown-linux-gnu --default-unwind 16
+
+      - name: Verify PMM and VMM invariants
+        run: cargo kani -p centinela-kernel --target x86_64-unknown-linux-gnu --default-unwind 80
