@@ -494,3 +494,91 @@ impl<'a, M: PageTableMemory> PageTableWalker<'a, M> {
         Err(WalkError::NotMapped)
     }
 }
+
+#[cfg(test)]
+mod walker_tests {
+    use super::{
+        PageTableMemory, PageTableWalker, PhysAddr, Translation, VirtAddr, WalkError, PAGE_SIZE,
+        PRESENT, WRITABLE, USER, NO_EXECUTE, HUGE_PAGE,
+    };
+
+    struct MockMemory {
+        entries: [(u64, u16, u64); 4],
+        len: usize,
+    }
+
+    // SAFETY: The mock only returns entries from its fixed in-memory table.
+    unsafe impl PageTableMemory for MockMemory {
+        fn read_entry(&self, table: PhysAddr, index: u16) -> Result<u64, WalkError> {
+            self.entries[..self.len]
+                .iter()
+                .find(|(address, entry_index, _)| *address == table.get() && *entry_index == index)
+                .map(|(_, _, value)| *value)
+                .ok_or(WalkError::MemoryReadFailed)
+        }
+    }
+
+    #[test]
+    fn walks_four_kib_mapping_and_combines_permissions() {
+        let memory = MockMemory {
+            entries: [
+                (0x1000, 0, 0x2000 | PRESENT | WRITABLE | USER),
+                (0x2000, 0, 0x3000 | PRESENT | WRITABLE | USER),
+                (0x3000, 0, 0x4000 | PRESENT | WRITABLE | USER),
+                (0x4000, 1, 0x9000 | PRESENT | USER | NO_EXECUTE),
+            ],
+            len: 4,
+        };
+        let root = PhysAddr::new(0x1000).expect("aligned root");
+        let walker = PageTableWalker::new(&memory, root);
+        let address = VirtAddr::new(0x1000).expect("canonical virtual address");
+        assert_eq!(
+            walker.translate(address),
+            Ok(Translation {
+                physical_address: 0x9000,
+                page_size: PAGE_SIZE,
+                writable: false,
+                user_accessible: true,
+                executable: false,
+            })
+        );
+    }
+
+    #[test]
+    fn walks_two_megabyte_huge_page() {
+        let memory = MockMemory {
+            entries: [
+                (0x1000, 0, 0x2000 | PRESENT | WRITABLE),
+                (0x2000, 0, 0x3000 | PRESENT | WRITABLE),
+                (0x3000, 2, 0x800000 | PRESENT | WRITABLE | HUGE_PAGE),
+                (0, 0, 0),
+            ],
+            len: 3,
+        };
+        let walker = PageTableWalker::new(&memory, PhysAddr::new(0x1000).unwrap());
+        let address = VirtAddr::new(0x400000).unwrap();
+        assert_eq!(
+            walker.translate(address).unwrap(),
+            Translation {
+                physical_address: 0x800000,
+                page_size: 1 << 21,
+                writable: true,
+                user_accessible: false,
+                executable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn reports_unmapped_intermediate_entries() {
+        let memory = MockMemory {
+            entries: [(0x1000, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)],
+            len: 1,
+        };
+        let walker = PageTableWalker::new(&memory, PhysAddr::new(0x1000).unwrap());
+        assert_eq!(
+            walker.translate(VirtAddr::new(0).unwrap()),
+            Err(WalkError::NotMapped)
+        );
+    }
+}
