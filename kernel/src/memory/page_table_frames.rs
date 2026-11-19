@@ -24,6 +24,13 @@ pub enum PageTableFrameError {
     RollbackFailed(PmmError),
 }
 
+/// Errors reported by a page-table frame zeroing backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameZeroError {
+    MappingUnavailable,
+    WriteFailed,
+}
+
 /// Provides a writable mapping for clearing a complete physical frame.
 ///
 /// # Safety
@@ -38,7 +45,7 @@ pub unsafe trait PageTableFrameMemory {
     /// # Safety
     /// The caller must own the frame exclusively and must not concurrently
     /// access it through another alias.
-    unsafe fn zero_frame(&mut self, physical_address: u64) -> Result<(), ()>;
+    unsafe fn zero_frame(&mut self, physical_address: u64) -> Result<(), FrameZeroError>;
 }
 
 /// Couples PMM ownership with the requirement that page-table frames are zeroed
@@ -102,9 +109,9 @@ mod tests {
     // SAFETY: This test backend models an exclusive, complete-frame zeroing
     // operation and does not expose or retain aliases to the frame.
     unsafe impl PageTableFrameMemory for FakeMemory {
-        unsafe fn zero_frame(&mut self, physical_address: u64) -> Result<(), ()> {
+        unsafe fn zero_frame(&mut self, physical_address: u64) -> Result<(), FrameZeroError> {
             self.last_zeroed = Some(physical_address);
-            if self.fail { Err(()) } else { Ok(()) }
+            if self.fail { Err(FrameZeroError::WriteFailed) } else { Ok(()) }
         }
     }
 
