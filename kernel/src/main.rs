@@ -6,7 +6,7 @@ use core::mem::MaybeUninit;
 use core::panic::PanicInfo;
 use core::ptr::{addr_of, addr_of_mut};
 
-use centinela_hal::cpu::halt_forever;
+use centinela_hal::cpu::{enable_boot_hardening, halt_forever};
 use centinela_hal::serial::{init as serial_init, write as serial_write};
 use centinela_kernel::memory::pmm::{BITMAP_WORDS, LimineMemoryMapResponse, Pmm};
 
@@ -189,6 +189,19 @@ fn initialize_memory() -> bool {
 pub extern "C" fn _start() -> ! {
     serial_init();
     serial_write("\r\nCentinela-OS: Rust kernel entry reached.\r\n");
+
+    match enable_boot_hardening() {
+        Ok(features) => {
+            serial_write("CPU hardening: NXE enabled.\r\n");
+            if features.umip { serial_write("CPU hardening: UMIP enabled.\r\n"); }
+            if features.smep { serial_write("CPU hardening: SMEP enabled.\r\n"); }
+            if features.smap { serial_write("CPU hardening: SMAP enabled.\r\n"); }
+        }
+        Err(_) => {
+            serial_write("Centinela-OS: mandatory NX support unavailable.\r\n");
+            halt_forever();
+        }
+    }
 
     if !initialize_memory() {
         halt_forever();
