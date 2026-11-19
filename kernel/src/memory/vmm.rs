@@ -5,6 +5,7 @@
 //! primitives for the VMM implementation milestone.
 
 use centinela_security::permissions::PagePermissions;
+use super::pmm::{LimineMemoryMapEntry, LimineMemoryMapResponse};
 
 pub const PAGE_SIZE: u64 = 4096;
 const ADDRESS_BITS: u32 = 48;
@@ -365,6 +366,8 @@ pub enum WalkError {
     InvalidEntry,
     InvalidPhysicalAddress,
     AddressOverflow,
+    InvalidMemoryMap,
+    PhysicalRegionNotMapped,
 }
 
 /// Result of a read-only page-table walk.
@@ -395,46 +398,73 @@ pub unsafe trait PageTableMemory {
 /// Constructing this value does not prove that every page-table frame is
 /// mapped by the HHDM. Its PageTableMemory implementation is therefore
 /// unsafe and must only be used when that mapping property is established.
+const MAX_HHDM_MAP_ENTRIES: u64 = 4096;
+const MEMMAP_USABLE: u64 = 0;
+const MEMMAP_ACPI_RECLAIMABLE: u64 = 2;
+const MEMMAP_ACPI_NVS: u64 = 3;
+const MEMMAP_BOOTLOADER_RECLAIMABLE: u64 = 5;
+const MEMMAP_EXECUTABLE_AND_MODULES: u64 = 6;
+const MEMMAP_RESERVED_MAPPED: u64 = 8;
+
+/// Read-only page-table accessor through Limine's HHDM.
+/// Every table frame is checked against the base-revision-5 memory map.
 #[derive(Clone, Copy)]
 pub struct HhdmPageTableMemory {
     offset: HhdmOffset,
+    memory_map: *const LimineMemoryMapResponse,
 }
 
 impl HhdmPageTableMemory {
-    /// Creates a physical page-table reader backed by the HHDM.
-    ///
     /// # Safety
-    /// Every physical page-table frame that may be traversed must be mapped
-    /// and readable at HHDM_OFFSET + physical_address for the walk's duration.
-    pub const unsafe fn new(offset: HhdmOffset) -> Self {
-        Self { offset }
+    /// The response, pointer array and entries must remain valid and immutable
+    /// for this reader's lifetime. They must be the original Limine revision-5
+    /// memory map, and the HHDM mapping must remain active.
+    pub unsafe fn new(offset: HhdmOffset, memory_map: *const LimineMemoryMapResponse) -> Result<Self, WalkError> {
+        if memory_map.is_null() { return Err(WalkError::InvalidMemoryMap); }
+        // SAFETY: Required by the constructor contract.
+        let response = unsafe { &*memory_map };
+        if response.revision != 0 || response.entry_count == 0 || response.entry_count > MAX_HHDM_MAP_ENTRIES || response.entries.is_null() {
+            return Err(WalkError::InvalidMemoryMap);
+        }
+        Ok(Self { offset, memory_map })
+    }
+
+    fn table_frame_is_mapped(&self, table: PhysAddr) -> Result<bool, WalkError> {
+        // SAFETY: The constructor contract keeps this response valid.
+        let response = unsafe { &*self.memory_map };
+        for index in 0..response.entry_count as usize {
+            // SAFETY: The constructor contract covers the complete pointer array.
+            let pointer = unsafe { response.entries.add(index).read() };
+            if pointer.is_null() { return Err(WalkError::InvalidMemoryMap); }
+            // SAFETY: The constructor contract covers every entry pointer.
+            let entry: &LimineMemoryMapEntry = unsafe { &*pointer };
+            if !matches!(entry.entry_type, MEMMAP_USABLE | MEMMAP_ACPI_RECLAIMABLE | MEMMAP_ACPI_NVS | MEMMAP_BOOTLOADER_RECLAIMABLE | MEMMAP_EXECUTABLE_AND_MODULES | MEMMAP_RESERVED_MAPPED) {
+                continue;
+            }
+            let region_end = entry.base.checked_add(entry.length).ok_or(WalkError::InvalidMemoryMap)?;
+            // Limine rounds HHDM mappings outward to 4 KiB page boundaries.
+            let mapped_start = entry.base & !(PAGE_SIZE - 1);
+            let mapped_end = region_end.checked_add(PAGE_SIZE - 1).ok_or(WalkError::InvalidMemoryMap)? & !(PAGE_SIZE - 1);
+            let table_end = table.get().checked_add(PAGE_SIZE).ok_or(WalkError::AddressOverflow)?;
+            if table.get() >= mapped_start && table_end <= mapped_end { return Ok(true); }
+        }
+        Ok(false)
     }
 }
 
-// SAFETY: Callers must establish that the supplied physical table pages are
-// present in the HHDM before invoking the walker. Address arithmetic and
-// canonicality are checked before the volatile load.
+// SAFETY: Before each read, the complete page-table frame is verified to be
+// in a Limine base-revision-5 memory class guaranteed to be HHDM-mapped.
 unsafe impl PageTableMemory for HhdmPageTableMemory {
     fn read_entry(&self, table: PhysAddr, index: u16) -> Result<u64, WalkError> {
-        if index >= 512 {
-            return Err(WalkError::MemoryReadFailed);
-        }
-        let virtual_table = self
-            .offset
-            .physical_to_virtual(table)
-            .map_err(|_| WalkError::AddressOverflow)?;
-        let entry_address = virtual_table
-            .get()
-            .checked_add(u64::from(index) * 8)
-            .ok_or(WalkError::AddressOverflow)?;
+        if index >= 512 { return Err(WalkError::MemoryReadFailed); }
+        if !self.table_frame_is_mapped(table)? { return Err(WalkError::PhysicalRegionNotMapped); }
+        let virtual_table = self.offset.physical_to_virtual(table).map_err(|_| WalkError::AddressOverflow)?;
+        let entry_address = virtual_table.get().checked_add(u64::from(index) * 8).ok_or(WalkError::AddressOverflow)?;
         VirtAddr::new(entry_address).map_err(|_| WalkError::AddressOverflow)?;
-
-        // SAFETY: The unsafe PageTableMemory contract requires the table page
-        // to be mapped and readable at its HHDM alias.
+        // SAFETY: The full frame was checked against the Limine HHDM map classes.
         Ok(unsafe { core::ptr::read_volatile(entry_address as *const u64) })
     }
 }
-
 /// Walks the active four-level paging hierarchy without modifying it.
 pub struct PageTableWalker<'a, M: PageTableMemory> {
     memory: &'a M,
