@@ -398,6 +398,17 @@ pub struct HhdmPageTableMemory {
     offset: HhdmOffset,
 }
 
+impl HhdmPageTableMemory {
+    /// Creates a physical page-table reader backed by the HHDM.
+    ///
+    /// # Safety
+    /// Every physical page-table frame that may be traversed must be mapped
+    /// and readable at HHDM_OFFSET + physical_address for the walk's duration.
+    pub const unsafe fn new(offset: HhdmOffset) -> Self {
+        Self { offset }
+    }
+}
+
 // SAFETY: Callers must establish that the supplied physical table pages are
 // present in the HHDM before invoking the walker. Address arithmetic and
 // canonicality are checked before the volatile load.
@@ -465,6 +476,10 @@ impl<'a, M: PageTableMemory> PageTableWalker<'a, M> {
                 } else {
                     (1_u64 << 21, PAGE_2M_MASK, (1_u64 << 21) - 1)
                 };
+                let reserved_alignment_bits = (page_size - 1) & !0x1fff;
+                if raw & reserved_alignment_bits != 0 {
+                    return Err(WalkError::InvalidHugePage);
+                }
                 let base = raw & base_mask;
                 let offset = virtual_address.get() & offset_mask;
                 return Ok(Translation {
@@ -563,6 +578,31 @@ mod walker_tests {
                 physical_address: 0x800000,
                 page_size: 1 << 21,
                 writable: true,
+                user_accessible: false,
+                executable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn walks_one_gibibyte_huge_page() {
+        let memory = MockMemory {
+            entries: [
+                (0x1000, 0, 0x2000 | PRESENT),
+                (0x2000, 1, 0x40000000 | PRESENT | HUGE_PAGE),
+                (0, 0, 0),
+                (0, 0, 0),
+            ],
+            len: 2,
+        };
+        let walker = PageTableWalker::new(&memory, PhysAddr::new(0x1000).unwrap());
+        let address = VirtAddr::new((1 << 30) + 0x1234).unwrap();
+        assert_eq!(
+            walker.translate(address).unwrap(),
+            Translation {
+                physical_address: 0x40000000 + 0x1234,
+                page_size: 1 << 30,
+                writable: false,
                 user_accessible: false,
                 executable: true,
             }
