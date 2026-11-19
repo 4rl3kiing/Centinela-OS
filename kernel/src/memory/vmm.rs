@@ -212,7 +212,8 @@ const fn is_canonical(value: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AddressError, BootPagingInfo, EntryError, HhdmOffset, PAGE_SIZE, PageTableEntry, PhysAddr, VirtAddr,
+        AddressError, BootPagingInfo, EntryError, HhdmOffset, PAGE_SIZE, PageTableEntry,
+        PhysAddr, VirtAddr,
     };
     use centinela_security::permissions::PagePermissions;
 
@@ -519,8 +520,8 @@ impl<'a, M: PageTableMemory> PageTableWalker<'a, M> {
 #[cfg(test)]
 mod walker_tests {
     use super::{
-        PageTableMemory, PageTableWalker, PhysAddr, Translation, VirtAddr, WalkError, PAGE_SIZE,
-        PRESENT, WRITABLE, USER, NO_EXECUTE, HUGE_PAGE,
+        HUGE_PAGE, NO_EXECUTE, PAGE_SIZE, PRESENT, USER, WRITABLE, PageTableMemory,
+        PageTableWalker, PhysAddr, Translation, VirtAddr, WalkError,
     };
 
     struct MockMemory {
@@ -533,7 +534,9 @@ mod walker_tests {
         fn read_entry(&self, table: PhysAddr, index: u16) -> Result<u64, WalkError> {
             self.entries[..self.len]
                 .iter()
-                .find(|(address, entry_index, _)| *address == table.get() && *entry_index == index)
+                .find(|(address, entry_index, _)| {
+                    *address == table.get() && *entry_index == index
+                })
                 .map(|(_, _, value)| *value)
                 .ok_or(WalkError::MemoryReadFailed)
         }
