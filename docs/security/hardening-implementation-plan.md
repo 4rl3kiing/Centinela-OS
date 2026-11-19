@@ -104,6 +104,7 @@ Requires a working VMM and heap. Add guard pages, randomized freelists, metadata
 - CPU boot hardening detects and enables NXE, CR0.WP, UMIP, SMEP and SMAP when supported, with register readback.
 - HAL exposes bounded RDRAND/RDSEED reads after CPUID feature detection; these are not yet mixed into a kernel CSPRNG or used for KASLR.
 - VMM groundwork provides checked 48-bit canonical virtual addresses, bounded physical addresses, HHDM conversion, four-level page-table indices and NX/W^X page-entry encoding. It does not yet install or own active page tables.
+- Bootstrap now captures the active CR3 physical root and computes its checked HHDM alias before PMM initialization. This is a metadata snapshot only: it does not dereference the root, verify that the HHDM mapping is present, clone tables, or switch CR3.
 - PMM allocator is being optimized to scan bitmap words rather than every frame.
 - W^X permission policy, fixed-capacity typed generation-tagged capability handles, and monotonic syscall allow-list primitives exist; they are not yet wired into process creation or a syscall dispatcher.
 
