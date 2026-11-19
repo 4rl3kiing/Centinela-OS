@@ -6,7 +6,7 @@ use core::mem::MaybeUninit;
 use core::panic::PanicInfo;
 use core::ptr::{addr_of, addr_of_mut};
 
-use centinela_hal::cpu::{enable_boot_hardening, halt_forever};
+use centinela_hal::cpu::{CpuHardeningError, enable_boot_hardening, halt_forever};
 use centinela_hal::serial::{init as serial_init, write as serial_write};
 use centinela_kernel::memory::pmm::{BITMAP_WORDS, LimineMemoryMapResponse, Pmm};
 
@@ -206,8 +206,12 @@ pub extern "C" fn _start() -> ! {
                 serial_write("CPU hardening: SMAP enabled.\r\n");
             }
         }
-        Err(_) => {
+        Err(CpuHardeningError::NxUnsupported) => {
             serial_write("Centinela-OS: mandatory NX support unavailable.\r\n");
+            halt_forever();
+        }
+        Err(CpuHardeningError::FeatureEnableFailed) => {
+            serial_write("Centinela-OS: CPU hardening register verification failed.\r\n");
             halt_forever();
         }
     }
