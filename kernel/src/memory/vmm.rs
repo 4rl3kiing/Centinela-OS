@@ -351,7 +351,6 @@ mod verification {
     }
 }
 
-
 const HUGE_PAGE: u64 = 1 << 7;
 const PAGE_2M_MASK: u64 = 0x000f_ffff_ffe0_0000;
 const PAGE_1G_MASK: u64 = 0x000f_ffff_c000_0000;
@@ -520,8 +519,8 @@ impl<'a, M: PageTableMemory> PageTableWalker<'a, M> {
 #[cfg(test)]
 mod walker_tests {
     use super::{
-        HUGE_PAGE, NO_EXECUTE, PAGE_SIZE, PRESENT, USER, WRITABLE, PageTableMemory,
-        PageTableWalker, PhysAddr, Translation, VirtAddr, WalkError,
+        HUGE_PAGE, NO_EXECUTE, PAGE_SIZE, PRESENT, PageTableMemory, PageTableWalker, PhysAddr,
+        Translation, USER, VirtAddr, WRITABLE, WalkError,
     };
 
     struct MockMemory {
