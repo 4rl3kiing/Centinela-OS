@@ -98,6 +98,7 @@ impl<'a> Pmm<'a> {
         }
 
         self.bitmap.fill(u64::MAX);
+        self.allocated.fill(0);
         self.free_frames = 0;
         self.allocation_hint = 1;
 
@@ -166,7 +167,7 @@ impl<'a> Pmm<'a> {
 
     /// Releases a frame previously returned by allocate_frame.
     pub fn free_frame(&mut self, physical_address: u64) -> Result<(), PmmError> {
-        if physical_address % PAGE_SIZE != 0 {
+        if physical_address & (PAGE_SIZE - 1) != 0 {
             return Err(PmmError::FrameOutOfRange);
         }
 
@@ -298,7 +299,9 @@ mod tests {
     #[test]
     fn unaligned_and_out_of_range_addresses_are_rejected() {
         let mut bitmap = [u64::MAX; 1];
-        let mut pmm = Pmm::new(&mut bitmap).expect("bitmap should be accepted");
+        let mut allocated = [0_u64; 1];
+        let mut pmm =
+            Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
 
         assert_eq!(pmm.free_frame(1), Err(PmmError::FrameOutOfRange));
         assert_eq!(
