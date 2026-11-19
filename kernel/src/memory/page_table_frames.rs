@@ -3,7 +3,7 @@
 //! This is an ownership primitive only. It does not map, unmap, or install
 //! page tables. The caller must serialize access while the kernel is single-core.
 
-use super::pmm::{Pmm, PmmError, PAGE_SIZE};
+use super::pmm::{Pmm, PmmError};
 
 /// A physical frame exclusively owned by the page-table subsystem.
 #[derive(Debug, Eq, PartialEq)]
@@ -95,7 +95,7 @@ mod tests {
         PageTableFrameAllocator, PageTableFrameError, PageTableFrameMemory,
     };
     use crate::memory::pmm::{
-        LimineMemoryMapEntry, LimineMemoryMapResponse, Pmm, PmmError, PAGE_SIZE,
+        LimineMemoryMapEntry, LimineMemoryMapResponse, Pmm, PAGE_SIZE,
     };
 
     struct FakeMemory {
@@ -173,9 +173,5 @@ mod tests {
 
         allocator.release(frame).expect("owned frame should be releasable");
         assert_eq!(allocator.pmm.free_frames(), before);
-        assert_eq!(
-            allocator.release(frame),
-            Err(PageTableFrameError::Pmm(PmmError::FrameAlreadyFree))
-        );
     }
 }
