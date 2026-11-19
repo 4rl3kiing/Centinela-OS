@@ -11,7 +11,9 @@ use centinela_hal::cpu::{
 };
 use centinela_hal::serial::{init as serial_init, write as serial_write};
 use centinela_kernel::memory::pmm::{BITMAP_WORDS, LimineMemoryMapResponse, Pmm};
-use centinela_kernel::memory::vmm::{BootPagingInfo, HhdmOffset};
+use centinela_kernel::memory::vmm::{
+    BootPagingInfo, HhdmOffset, HhdmPageTableMemory, PageTableWalker, VirtAddr,
+};
 
 const LIMINE_COMMON_MAGIC: [u64; 2] = [0xc7b1_dd30_df4c_8b88, 0x0a82_e883_a194_f07b];
 
@@ -153,9 +155,54 @@ fn initialize_memory() -> bool {
             return false;
         }
     };
-    // Record the bootloader-owned paging root without switching CR3 or
-    // dereferencing page-table memory. Future VMM work must preserve its
-    // kernel, stack, HHDM, and boot-response mappings before any switch.
+    // The Limine protocol guarantees that its page-table pages are in
+    // bootloader-reclaimable memory, which is mapped by the revision-5 HHDM.
+    // The reader checks each complete table frame against that map before use.
+    // SAFETY: Limine's response and entry pointers remain valid throughout boot;
+    // the requested and accepted base revision is 5 and the HHDM stays active.
+    let table_memory = match unsafe { HhdmPageTableMemory::new(hhdm_offset, memory_map) } {
+        Ok(memory) => memory,
+        Err(_) => {
+            serial_write("Centinela-OS: invalid HHDM page-table memory map.\\r\\n");
+            return false;
+        }
+    };
+    let walker = PageTableWalker::new(&table_memory, paging_info.root_physical());
+    let root_alias = match walker.translate(paging_info.root_virtual()) {
+        Ok(translation) => translation,
+        Err(_) => {
+            serial_write("Centinela-OS: active page-table root is not readable through HHDM.\\r\\n");
+            return false;
+        }
+    };
+    if root_alias.physical_address != paging_info.root_physical().get() {
+        serial_write("Centinela-OS: HHDM root translation mismatch.\\r\\n");
+        return false;
+    }
+
+    let kernel_entry = match VirtAddr::new(_start as usize as u64) {
+        Ok(address) => address,
+        Err(_) => {
+            serial_write("Centinela-OS: kernel entry virtual address is invalid.\\r\\n");
+            return false;
+        }
+    };
+    let entry_mapping = match walker.translate(kernel_entry) {
+        Ok(translation) => translation,
+        Err(_) => {
+            serial_write("Centinela-OS: kernel entry mapping could not be verified.\\r\\n");
+            return false;
+        }
+    };
+    if !entry_mapping.executable || entry_mapping.writable {
+        serial_write("Centinela-OS: kernel entry mapping violates RX permissions.\\r\\n");
+        return false;
+    }
+    serial_write("VMM bootstrap: Limine page-table frames validated through HHDM.\\r\\n");
+    serial_write("VMM bootstrap: HHDM root alias and kernel RX mapping verified.\\r\\n");
+
+    // Record the bootloader-owned paging root without switching CR3.
+    // The active page tables remain unchanged.
     unsafe {
         addr_of_mut!(BOOT_PAGING_INFO).write(MaybeUninit::new(paging_info));
     }
