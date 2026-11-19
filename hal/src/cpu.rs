@@ -187,7 +187,6 @@ pub fn halt_forever() -> ! {
     }
 }
 
-
 /// Returns the physical base address of the currently active four-level page table.
 ///
 /// CR3 may also contain PCID or cache-control flags in its low bits. Only the
