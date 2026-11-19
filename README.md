@@ -2,7 +2,7 @@
 
 **Centinela-OS** is an experimental operating-system project built primarily in Rust. Its initial target is x86_64, with boot support for legacy BIOS and UEFI and intended use across desktop and server systems.
 
-The project has a freestanding Rust kernel that has passed formatting, Clippy, compilation, hybrid BIOS/UEFI ISO generation, and QEMU boot checks in both firmware modes. The physical memory manager (PMM) is now being integrated; its unit tests and boot-time validation are in the current CI run.
+The project has a freestanding Rust kernel that has passed formatting, Clippy, compilation, hybrid BIOS/UEFI ISO generation, and QEMU boot checks in both firmware modes. The initial physical memory manager (PMM) is implemented and its unit tests and BIOS/UEFI boot-time validation pass in CI.
 
 ## Initial technical decisions
 
@@ -33,9 +33,11 @@ The project has a freestanding Rust kernel that has passed formatting, Clippy, c
 - Limine base-revision 5, stack-size, HHDM, and memory-map requests.
 - Pinned Limine v12.9.6 image builder with SHA-256 verification.
 - Automated BIOS and UEFI QEMU boot checks with serial-log assertions.
-- Initial bitmap PMM for 4 KiB frames, bounded to the first 64 GiB of physical address space.
+- Initial bitmap PMM for 4 KiB frames, bounded to the first 64 GiB of physical address space; single-core and validated at boot.
 - Separate free/reserved and allocated-frame bitmaps, with kernel/BSS reservation and allocation/free self-test.
 - Host-side PMM unit tests in CI.
+- Workspace split into `kernel`, `hal` and `security` crates; privileged UART and CPU halt operations are encapsulated in HAL.
+- Safe capability-set and W^X permission-policy primitives in the security crate.
 
 The PMM is an initial single-core implementation. It is not yet a complete virtual-memory manager and does not yet provide SMP-safe allocation.
 
@@ -46,4 +48,4 @@ The PMM is an initial single-core implementation. It is not yet a complete virtu
 
 ## Current status
 
-Bootstrap milestone passed: the kernel builds, produces a hybrid ISO, and reaches its Rust entry point under BIOS and UEFI in QEMU. PMM implementation is in progress and must pass its current unit-test and boot-validation run. VMM, scheduling, drivers, storage, networking, and user space remain unimplemented.
+Bootstrap and initial PMM milestones passed: the kernel builds, produces a hybrid ISO, reaches its Rust entry point, validates the Limine memory map and exercises PMM allocation/free under BIOS and UEFI in QEMU. The HAL/security workspace split is now being validated. VMM, scheduling, drivers, storage, networking, and user space remain unimplemented.
