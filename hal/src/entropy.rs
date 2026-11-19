@@ -31,11 +31,7 @@ pub fn detect_cpu_entropy() -> CpuEntropyFeatures {
     decode_features(basic.eax, leaf1.ecx, leaf7.ebx)
 }
 
-fn decode_features(
-    max_basic_leaf: u32,
-    leaf1_ecx: u32,
-    leaf7_ebx: u32,
-) -> CpuEntropyFeatures {
+fn decode_features(max_basic_leaf: u32, leaf1_ecx: u32, leaf7_ebx: u32) -> CpuEntropyFeatures {
     CpuEntropyFeatures {
         rdrand: max_basic_leaf >= 1 && leaf1_ecx & (1 << 30) != 0,
         rdseed: max_basic_leaf >= 7 && leaf7_ebx & (1 << 18) != 0,
@@ -104,7 +100,7 @@ pub fn rdrand_u64() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_features, CpuEntropyFeatures};
+    use super::{CpuEntropyFeatures, decode_features};
 
     #[test]
     fn detects_rdrand_and_rdseed_only_when_their_leaves_exist() {
