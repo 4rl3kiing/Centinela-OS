@@ -132,7 +132,10 @@ mod tests {
         let mut bitmap = [u64::MAX; 2];
         let mut allocated = [0_u64; 2];
         let mut pmm = initialized_pmm(&mut bitmap, &mut allocated);
-        let memory = FakeMemory {\n            fail: false,\n            last_zeroed: None,\n        };
+        let memory = FakeMemory {
+            fail: false,
+            last_zeroed: None,
+        };
         let mut allocator = PageTableFrameAllocator::new(&mut pmm, memory);
 
         let frame = allocator.allocate().expect("frame should be allocated");
@@ -146,10 +149,16 @@ mod tests {
         let mut allocated = [0_u64; 2];
         let mut pmm = initialized_pmm(&mut bitmap, &mut allocated);
         let before = pmm.free_frames();
-        let memory = FakeMemory {\n            fail: true,\n            last_zeroed: None,\n        };
+        let memory = FakeMemory {
+            fail: true,
+            last_zeroed: None,
+        };
         let mut allocator = PageTableFrameAllocator::new(&mut pmm, memory);
 
-        assert_eq!(\n            allocator.allocate(),\n            Err(PageTableFrameError::ZeroingFailed)\n        );
+        assert_eq!(
+            allocator.allocate(),
+            Err(PageTableFrameError::ZeroingFailed)
+        );
         assert_eq!(allocator.pmm.free_frames(), before);
         assert_eq!(allocator.memory().last_zeroed, Some(PAGE_SIZE));
     }
@@ -159,12 +168,17 @@ mod tests {
         let mut bitmap = [u64::MAX; 2];
         let mut allocated = [0_u64; 2];
         let mut pmm = initialized_pmm(&mut bitmap, &mut allocated);
-        let memory = FakeMemory { fail: false, last_zeroed: None };
+        let memory = FakeMemory {
+            fail: false,
+            last_zeroed: None,
+        };
         let mut allocator = PageTableFrameAllocator::new(&mut pmm, memory);
         let before = allocator.pmm.free_frames();
         let frame = allocator.allocate().expect("frame should be allocated");
 
-        allocator\n            .release(frame)\n            .expect("owned frame should be releasable");
+        allocator
+            .release(frame)
+            .expect("owned frame should be releasable");
         assert_eq!(allocator.pmm.free_frames(), before);
     }
 }
