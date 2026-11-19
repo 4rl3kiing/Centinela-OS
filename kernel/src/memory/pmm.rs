@@ -51,10 +51,7 @@ pub struct Pmm<'a> {
 
 impl<'a> Pmm<'a> {
     /// Creates a manager with every frame reserved.
-    pub fn new(
-        bitmap: &'a mut [u64],
-        allocated: &'a mut [u64],
-    ) -> Result<Self, PmmError> {
+    pub fn new(bitmap: &'a mut [u64], allocated: &'a mut [u64]) -> Result<Self, PmmError> {
         if bitmap.is_empty() || bitmap.len() != allocated.len() {
             return Err(PmmError::InvalidBitmapSize);
         }
@@ -260,21 +257,20 @@ impl<'a> Pmm<'a> {
 }
 
 fn align_up(value: u64, alignment: u64) -> Option<u64> {
-    value.checked_add(alignment - 1).map(|aligned| aligned & !(alignment - 1))
+    value
+        .checked_add(alignment - 1)
+        .map(|aligned| aligned & !(alignment - 1))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        LimineMemoryMapEntry, LimineMemoryMapResponse, Pmm, PmmError, PAGE_SIZE,
-    };
+    use super::{LimineMemoryMapEntry, LimineMemoryMapResponse, PAGE_SIZE, Pmm, PmmError};
 
     #[test]
     fn allocation_and_free_are_accounted() {
         let mut bitmap = [u64::MAX; 2];
         let mut allocated = [0_u64; 2];
-        let mut pmm =
-            Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
+        let mut pmm = Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
         pmm.mark_free_range(1, 128);
         assert_eq!(pmm.free_frames(), 127);
 
@@ -282,7 +278,8 @@ mod tests {
         assert_eq!(first, PAGE_SIZE);
         assert_eq!(pmm.free_frames(), 126);
 
-        pmm.free_frame(first).expect("allocated frame should be releasable");
+        pmm.free_frame(first)
+            .expect("allocated frame should be releasable");
         assert_eq!(pmm.free_frames(), 127);
     }
 
@@ -332,14 +329,8 @@ mod tests {
         };
 
         // SAFETY: response, entries, and usable all remain valid for this call.
-        unsafe {
-            pmm.initialize_from_limine(
-                &response,
-                2 * PAGE_SIZE,
-                4 * PAGE_SIZE,
-            )
-        }
-        .expect("valid Limine map should initialize");
+        unsafe { pmm.initialize_from_limine(&response, 2 * PAGE_SIZE, 4 * PAGE_SIZE) }
+            .expect("valid Limine map should initialize");
 
         assert_eq!(pmm.free_frames(), 253);
         assert_eq!(pmm.allocate_frame(), Some(PAGE_SIZE));
