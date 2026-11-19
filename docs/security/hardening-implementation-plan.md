@@ -80,7 +80,7 @@ An IOMMU must not be represented as enabled merely because firmware tables exist
 - Evaluate nightly-only CFI and stack-protector support in a separate experimental CI job; do not pass unsupported `-Z` flags to the stable kernel build.
 - Treat stack protectors, stack probing and interrupt-stack guard pages as separate controls.
 - Run host-testable unsafe-sensitive code under Miri where supported; the current workspace host test suite passes under Miri.
-- Add Kani harnesses for bounded arithmetic, permission validation and allocator invariants where proofs are tractable; Kani is not configured yet.
+- Kani proof harnesses cover W^X policy, monotonic syscall restrictions, PMM frame accounting/alignment, canonical virtual addresses and W^X PTE encoding; the bounded proof workflow passes.
 - Fuzz parsers, syscall argument decoders, IPC message validation and filesystem/network parsers in host builds using cargo-fuzz; the first PMM/Limine memory-map fuzz target and bounded CI smoke run pass.
 - Preserve seeds, regression cases and sanitizer findings.
 
