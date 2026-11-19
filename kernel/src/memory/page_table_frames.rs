@@ -98,7 +98,9 @@ impl<'p, 'm, M: PageTableFrameMemory> PageTableFrameAllocator<'p, 'm, M> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameZeroError, PageTableFrameAllocator, PageTableFrameError, PageTableFrameMemory};
+    use super::{
+        FrameZeroError, PageTableFrameAllocator, PageTableFrameError, PageTableFrameMemory,
+    };
     use crate::memory::pmm::{LimineMemoryMapEntry, LimineMemoryMapResponse, PAGE_SIZE, Pmm};
 
     struct FakeMemory {
