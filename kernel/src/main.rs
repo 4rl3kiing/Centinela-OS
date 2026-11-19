@@ -3,13 +3,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use core::arch::asm;
-use core::panic::PanicInfo;
 use core::mem::MaybeUninit;
+use core::panic::PanicInfo;
 use core::ptr::{addr_of, addr_of_mut};
 
-use centinela_kernel::memory::pmm::{
-    LimineMemoryMapResponse, Pmm, BITMAP_WORDS,
-};
+use centinela_kernel::memory::pmm::{BITMAP_WORDS, LimineMemoryMapResponse, Pmm};
 
 const COM1: u16 = 0x3F8;
 const LIMINE_COMMON_MAGIC: [u64; 2] = [0xc7b1_dd30_df4c_8b88, 0x0a82_e883_a194_f07b];
@@ -207,10 +205,7 @@ fn initialize_memory() -> bool {
     };
     // SAFETY: This is a separate, unique static bitmap with the same length.
     let allocated_bitmap: &'static mut [u64] = unsafe {
-        core::slice::from_raw_parts_mut(
-            addr_of_mut!(ALLOCATED_BITMAP).cast::<u64>(),
-            BITMAP_WORDS,
-        )
+        core::slice::from_raw_parts_mut(addr_of_mut!(ALLOCATED_BITMAP).cast::<u64>(), BITMAP_WORDS)
     };
     let mut pmm = match Pmm::new(bitmap, allocated_bitmap) {
         Ok(pmm) => pmm,
@@ -222,11 +217,7 @@ fn initialize_memory() -> bool {
 
     // SAFETY: Limine's memory-map response and its entry array are valid boot
     // information, and all PMM access is serialized on this single CPU.
-    if unsafe {
-        pmm.initialize_from_limine(memory_map, kernel_start, kernel_end)
-    }
-    .is_err()
-    {
+    if unsafe { pmm.initialize_from_limine(memory_map, kernel_start, kernel_end) }.is_err() {
         serial_write("Centinela-OS: invalid physical memory map.\r\n");
         return false;
     }
