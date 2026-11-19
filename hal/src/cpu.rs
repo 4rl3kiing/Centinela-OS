@@ -3,6 +3,7 @@
 /// IA32_EFER model-specific register.
 const IA32_EFER: u32 = 0xC000_0080;
 const EFER_NXE: u64 = 1 << 11;
+const CR0_WP: u64 = 1 << 16;
 
 const CR4_UMIP: u64 = 1 << 11;
 const CR4_SMEP: u64 = 1 << 20;
@@ -11,6 +12,7 @@ const CR4_SMAP: u64 = 1 << 21;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuHardening {
     pub nx: bool,
+    pub write_protect: bool,
     pub umip: bool,
     pub smep: bool,
     pub smap: bool,
@@ -33,23 +35,23 @@ pub enum CpuHardeningError {
 /// failure to enable it aborts bootstrap.
 pub fn enable_boot_hardening() -> Result<CpuHardening, CpuHardeningError> {
     // SAFETY: CPUID is available on all x86_64 processors.
-    let basic = unsafe { core::arch::x86_64::__cpuid(0) };
+    let basic = core::arch::x86_64::__cpuid(0);
     let leaf7_supported = basic.eax >= 7;
     let leaf7 = if leaf7_supported {
         // SAFETY: The maximum basic leaf advertises leaf 7.
-        unsafe { core::arch::x86_64::__cpuid_count(7, 0) }
+        core::arch::x86_64::__cpuid_count(7, 0)
     } else {
         // No feature bits are advertised when the leaf is unavailable.
-        unsafe { core::arch::x86_64::__cpuid(0) }
+        core::arch::x86_64::__cpuid(0)
     };
 
     // SAFETY: Query the maximum supported extended CPUID leaf first.
-    let extended = unsafe { core::arch::x86_64::__cpuid(0x8000_0000) };
+    let extended = core::arch::x86_64::__cpuid(0x8000_0000);
     if extended.eax < 0x8000_0001 {
         return Err(CpuHardeningError::NxUnsupported);
     }
     // SAFETY: The maximum extended leaf confirms this leaf exists.
-    let extended_features = unsafe { core::arch::x86_64::__cpuid(0x8000_0001) };
+    let extended_features = core::arch::x86_64::__cpuid(0x8000_0001);
     let nx_supported = (extended_features.edx & (1 << 20)) != 0;
     if !nx_supported {
         return Err(CpuHardeningError::NxUnsupported);
@@ -97,6 +99,32 @@ pub fn enable_boot_hardening() -> Result<CpuHardening, CpuHardeningError> {
         return Err(CpuHardeningError::FeatureEnableFailed);
     }
 
+    // Enable supervisor write protection so CR0.WP enforces read-only PTEs
+    // even while executing in ring 0.
+    let mut cr0: u64;
+    // SAFETY: Reading CR0 is a privileged operation in ring 0.
+    unsafe {
+        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+    }
+    cr0 |= CR0_WP;
+    // SAFETY: Preserve existing CR0 state and set only the architectural WP bit.
+    unsafe {
+        core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack, preserves_flags));
+    }
+    let verified_cr0: u64;
+    // SAFETY: Read back CR0 to confirm supervisor write protection is active.
+    unsafe {
+        core::arch::asm!(
+            "mov {}, cr0",
+            out(reg) verified_cr0,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    let write_protect = verified_cr0 & CR0_WP != 0;
+    if !write_protect {
+        return Err(CpuHardeningError::FeatureEnableFailed);
+    }
+
     let mut cr4: u64;
     // SAFETY: Reading CR4 is a privileged operation in ring 0.
     unsafe {
@@ -138,6 +166,7 @@ pub fn enable_boot_hardening() -> Result<CpuHardening, CpuHardeningError> {
 
     Ok(CpuHardening {
         nx: true,
+        write_protect,
         umip: verified_umip,
         smep: verified_smep,
         smap: verified_smap,
