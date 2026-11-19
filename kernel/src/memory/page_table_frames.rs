@@ -98,7 +98,7 @@ impl<'p, 'm, M: PageTableFrameMemory> PageTableFrameAllocator<'p, 'm, M> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PageTableFrameAllocator, PageTableFrameError, PageTableFrameMemory};
+    use super::{FrameZeroError, PageTableFrameAllocator, PageTableFrameError, PageTableFrameMemory};
     use crate::memory::pmm::{LimineMemoryMapEntry, LimineMemoryMapResponse, PAGE_SIZE, Pmm};
 
     struct FakeMemory {
@@ -111,7 +111,11 @@ mod tests {
     unsafe impl PageTableFrameMemory for FakeMemory {
         unsafe fn zero_frame(&mut self, physical_address: u64) -> Result<(), FrameZeroError> {
             self.last_zeroed = Some(physical_address);
-            if self.fail { Err(FrameZeroError::WriteFailed) } else { Ok(()) }
+            if self.fail {
+                Err(FrameZeroError::WriteFailed)
+            } else {
+                Ok(())
+            }
         }
     }
 
