@@ -186,3 +186,22 @@ pub fn halt_forever() -> ! {
         }
     }
 }
+
+
+/// Returns the physical base address of the currently active four-level page table.
+///
+/// CR3 may also contain PCID or cache-control flags in its low bits. Only the
+/// architectural physical-address field is returned. This function does not
+/// switch page tables or validate that the referenced root is HHDM-mapped.
+pub fn current_page_table_root() -> u64 {
+    let value: u64;
+    // SAFETY: Reading CR3 is a privileged, side-effect-free operation in ring 0.
+    unsafe {
+        core::arch::asm!(
+            "mov {}, cr3",
+            out(reg) value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    value & 0x000f_ffff_ffff_f000
+}
