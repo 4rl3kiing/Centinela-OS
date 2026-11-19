@@ -265,7 +265,9 @@ fn align_up(value: u64, alignment: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Pmm, PmmError, PAGE_SIZE};
+    use super::{
+        LimineMemoryMapEntry, LimineMemoryMapResponse, Pmm, PmmError, PAGE_SIZE,
+    };
 
     #[test]
     fn allocation_and_free_are_accounted() {
@@ -310,10 +312,49 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn limine_map_initialization_reserves_kernel_and_frame_zero() {
+        let mut bitmap = [u64::MAX; 4];
+        let mut allocated = [0_u64; 4];
+        let mut pmm =
+            Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
+        let usable = LimineMemoryMapEntry {
+            base: 0,
+            length: 256 * PAGE_SIZE,
+            entry_type: super::LIMINE_MEMMAP_USABLE,
+        };
+        let entries = [&usable as *const LimineMemoryMapEntry];
+        let response = LimineMemoryMapResponse {
+            revision: 0,
+            entry_count: entries.len() as u64,
+            entries: entries.as_ptr(),
+        };
+
+        // SAFETY: response, entries, and usable all remain valid for this call.
+        unsafe {
+            pmm.initialize_from_limine(
+                &response,
+                2 * PAGE_SIZE,
+                4 * PAGE_SIZE,
+            )
+        }
+        .expect("valid Limine map should initialize");
+
+        assert_eq!(pmm.free_frames(), 253);
+        assert_eq!(pmm.allocate_frame(), Some(PAGE_SIZE));
+        assert_eq!(
+            pmm.free_frame(2 * PAGE_SIZE),
+            Err(PmmError::FrameNotAllocated)
+        );
+    }
+
     #[test]
     fn allocation_returns_none_when_no_frames_are_free() {
         let mut bitmap = [u64::MAX; 1];
-        let mut pmm = Pmm::new(&mut bitmap).expect("bitmap should be accepted");
+        let mut allocated = [0_u64; 1];
+        let mut pmm =
+            Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
         assert_eq!(pmm.allocate_frame(), None);
     }
 }
