@@ -27,7 +27,7 @@ jobs:
           components: miri
 
       - name: Prepare Miri sysroot
-        run: cargo miri setup
+        run: cargo +nightly miri setup
 
       - name: Run host-side tests under Miri
-        run: cargo miri test --workspace --lib --target x86_64-unknown-linux-gnu
+        run: cargo +nightly miri test --workspace --lib --target x86_64-unknown-linux-gnu
