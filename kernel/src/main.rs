@@ -4,6 +4,11 @@
 
 use core::arch::asm;
 use core::panic::PanicInfo;
+use core::ptr::{addr_of, addr_of_mut};
+
+use centinela_kernel::memory::pmm::{
+    LimineMemoryMapResponse, Pmm, BITMAP_WORDS, MAX_PHYSICAL_ADDRESS,
+};
 
 const COM1: u16 = 0x3F8;
 const LIMINE_COMMON_MAGIC: [u64; 2] = [0xc7b1_dd30_df4c_8b88, 0x0a82_e883_a194_f07b];
@@ -24,6 +29,12 @@ struct LimineStackSizeRequest {
 }
 
 #[repr(C)]
+struct LimineHhdmResponse {
+    revision: u64,
+    offset: u64,
+}
+
+#[repr(C)]
 struct LimineRequests {
     start_marker: [u64; 4],
     base_revision: [u64; 3],
@@ -31,6 +42,11 @@ struct LimineRequests {
     hhdm: LimineRequest,
     memory_map: LimineRequest,
     end_marker: [u64; 2],
+}
+
+unsafe extern "C" {
+    static __kernel_phys_start: u8;
+    static __kernel_phys_end: u8;
 }
 
 #[used]
@@ -42,7 +58,6 @@ static mut LIMINE_REQUESTS: LimineRequests = LimineRequests {
         0x785c_6ed0_15d3_e316,
         0x181e_920a_7852_b9d9,
     ],
-    // Base revision 5 gives x86_64 a defined machine state at handoff.
     base_revision: [0xf956_2b2d_5c95_a6c8, 0x6a7b_3849_4453_6bdc, 5],
     stack_size: LimineStackSizeRequest {
         id: [
@@ -77,6 +92,10 @@ static mut LIMINE_REQUESTS: LimineRequests = LimineRequests {
     },
     end_marker: [0xadc0_e053_1bb1_0d03, 0x9572_709f_3176_4c62],
 };
+
+// A 64 GiB physical-address ceiling requires a 2 MiB bitmap at 4 KiB granularity.
+// The bitmap itself is reserved automatically as part of the kernel BSS.
+static mut FRAME_BITMAP: [u64; BITMAP_WORDS] = [0; BITMAP_WORDS];
 
 #[inline]
 fn outb(port: u16, value: u8) {
@@ -137,25 +156,96 @@ fn halt_forever() -> ! {
     }
 }
 
+fn initialize_memory() -> bool {
+    // Limine sets the third base-revision field to zero when the requested
+    // protocol revision is supported.
+    let revision_supported =
+        unsafe { addr_of!(LIMINE_REQUESTS.base_revision[2]).read_volatile() == 0 };
+    if !revision_supported {
+        serial_write("Centinela-OS: unsupported Limine base revision.\r\n");
+        return false;
+    }
+
+    // Read bootloader-populated response pointers without creating references
+    // to the mutable request structure.
+    let memory_map = unsafe {
+        addr_of!(LIMINE_REQUESTS.memory_map.response)
+            .read_volatile()
+            .cast::<LimineMemoryMapResponse>()
+    };
+    let hhdm = unsafe {
+        addr_of!(LIMINE_REQUESTS.hhdm.response)
+            .read_volatile()
+            .cast::<LimineHhdmResponse>()
+    };
+
+    if memory_map.is_null() || hhdm.is_null() {
+        serial_write("Centinela-OS: required Limine memory response missing.\r\n");
+        return false;
+    }
+
+    // SAFETY: Limine supplies a valid HHDM response for the lifetime of boot.
+    let hhdm_offset = unsafe { addr_of!((*hhdm).offset).read() };
+    if hhdm_offset & 0xfff != 0 {
+        serial_write("Centinela-OS: invalid HHDM offset alignment.\r\n");
+        return false;
+    }
+
+    // The linker exports physical load boundaries, including the PMM bitmap
+    // in BSS, so the allocator cannot hand kernel-owned frames back to callers.
+    let kernel_start = addr_of!(__kernel_phys_start) as u64;
+    let kernel_end = addr_of!(__kernel_phys_end) as u64;
+
+    // SAFETY: The bitmap is a unique static buffer. The kernel is single-core
+    // and interrupts are not enabled at this bootstrap stage.
+    let bitmap = unsafe {
+        core::slice::from_raw_parts_mut(addr_of_mut!(FRAME_BITMAP).cast::<u64>(), BITMAP_WORDS)
+    };
+    let mut pmm = match Pmm::new(bitmap) {
+        Ok(pmm) => pmm,
+        Err(_) => {
+            serial_write("Centinela-OS: PMM bitmap initialization failed.\r\n");
+            return false;
+        }
+    };
+
+    // SAFETY: Limine's memory-map response and its entry array are valid boot
+    // information, and all PMM access is serialized on this single CPU.
+    if unsafe {
+        pmm.initialize_from_limine(memory_map, kernel_start, kernel_end)
+    }
+    .is_err()
+    {
+        serial_write("Centinela-OS: invalid physical memory map.\r\n");
+        return false;
+    }
+
+    let Some(test_frame) = pmm.allocate_frame() else {
+        serial_write("Centinela-OS: no usable physical frames detected.\r\n");
+        return false;
+    };
+    if pmm.free_frame(test_frame).is_err() {
+        serial_write("Centinela-OS: PMM allocation self-test failed.\r\n");
+        return false;
+    }
+
+    serial_write("PMM initialized: 4 KiB frames, 64 GiB address ceiling.\r\n");
+    serial_write("PMM allocation/free self-test passed.\r\n");
+    true
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     serial_init();
+    serial_write("\r\nCentinela-OS: Rust kernel entry reached.\r\n");
 
-    // Limine sets the third base-revision field to zero when the requested
-    // protocol revision is supported. Read the bootloader-mutated field
-    // without creating a Rust reference to the mutable static.
-    let revision_supported =
-        unsafe { core::ptr::addr_of!(LIMINE_REQUESTS.base_revision[2]).read_volatile() == 0 };
-
-    if !revision_supported {
-        serial_write("\r\nCentinela-OS: unsupported Limine base revision.\r\n");
+    if !initialize_memory() {
         halt_forever();
     }
 
-    serial_write("\r\nCentinela-OS: Rust kernel entry reached.\r\n");
-    serial_write("Limine base revision 5 accepted.\r\n");
-    serial_write("HHDM and memory-map requests submitted.\r\n");
-    serial_write("Bootstrap milestone: serial diagnostics operational.\r\n");
+    serial_write("Bootstrap milestone: memory map validated and PMM online.\r\n");
+    serial_write("HHDM response accepted.\r\n");
+    let _ = MAX_PHYSICAL_ADDRESS;
     halt_forever()
 }
 
