@@ -4,8 +4,8 @@
 //! active page tables yet. It provides checked address/index/entry encoding
 //! primitives for the VMM implementation milestone.
 
-use centinela_security::permissions::PagePermissions;
 use super::pmm::{LimineMemoryMapEntry, LimineMemoryMapResponse};
+use centinela_security::permissions::PagePermissions;
 
 pub const PAGE_SIZE: u64 = 4096;
 const ADDRESS_BITS: u32 = 48;
@@ -414,11 +414,20 @@ impl HhdmPageTableMemory {
     /// The response, pointer array and entries must remain valid and immutable
     /// for this reader's lifetime. They must be the original Limine revision-5
     /// memory map, and the HHDM mapping must remain active.
-    pub unsafe fn new(offset: HhdmOffset, memory_map: *const LimineMemoryMapResponse) -> Result<Self, WalkError> {
-        if memory_map.is_null() { return Err(WalkError::InvalidMemoryMap); }
+    pub unsafe fn new(
+        offset: HhdmOffset,
+        memory_map: *const LimineMemoryMapResponse,
+    ) -> Result<Self, WalkError> {
+        if memory_map.is_null() {
+            return Err(WalkError::InvalidMemoryMap);
+        }
         // SAFETY: Required by the constructor contract.
         let response = unsafe { &*memory_map };
-        if response.revision != 0 || response.entry_count == 0 || response.entry_count > MAX_HHDM_MAP_ENTRIES || response.entries.is_null() {
+        if response.revision != 0
+            || response.entry_count == 0
+            || response.entry_count > MAX_HHDM_MAP_ENTRIES
+            || response.entries.is_null()
+        {
             return Err(WalkError::InvalidMemoryMap);
         }
         Ok(Self { offset, memory_map })
@@ -458,12 +467,22 @@ impl HhdmPageTableMemory {
 // in Limine bootloader-reclaimable memory, which base revision 5 guarantees is HHDM-mapped.
 unsafe impl PageTableMemory for HhdmPageTableMemory {
     fn read_entry(&self, table: PhysAddr, index: u16) -> Result<u64, WalkError> {
-        if index >= 512 { return Err(WalkError::MemoryReadFailed); }
-        if !self.table_frame_is_mapped(table)? { return Err(WalkError::PhysicalRegionNotMapped); }
-        let virtual_table = self.offset.physical_to_virtual(table).map_err(|_| WalkError::AddressOverflow)?;
-        let entry_address = virtual_table.get().checked_add(u64::from(index) * 8).ok_or(WalkError::AddressOverflow)?;
+        if index >= 512 {
+            return Err(WalkError::MemoryReadFailed);
+        }
+        if !self.table_frame_is_mapped(table)? {
+            return Err(WalkError::PhysicalRegionNotMapped);
+        }
+        let virtual_table = self
+            .offset
+            .physical_to_virtual(table)
+            .map_err(|_| WalkError::AddressOverflow)?;
+        let entry_address = virtual_table
+            .get()
+            .checked_add(u64::from(index) * 8)
+            .ok_or(WalkError::AddressOverflow)?;
         VirtAddr::new(entry_address).map_err(|_| WalkError::AddressOverflow)?;
-        // SAFETY: The full frame was checked against the Limine HHDM map classes.
+        // SAFETY: The full frame was checked against the bootloader-reclaimable memory map.
         Ok(unsafe { core::ptr::read_volatile(entry_address as *const u64) })
     }
 }
