@@ -187,6 +187,43 @@ pub fn halt_forever() -> ! {
     }
 }
 
+/// Errors returned by local TLB invalidation primitives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TlbError {
+    NonCanonicalAddress,
+}
+
+/// Invalidates one virtual page in the current logical processor's TLB.
+///
+/// This uses INVLPG, which also invalidates a matching global translation.
+/// It does not send IPIs or invalidate another CPU's TLB. Until an SMP
+/// shootdown controller exists, callers must restrict page-table mutation
+/// to the bootstrap CPU and must not expose the address space to other CPUs.
+///
+/// # Safety
+/// Must execute at CPL 0 with paging enabled. The caller must serialize page
+/// table mutation and ensure no concurrent CPU can use the affected address
+/// space.
+pub unsafe fn invalidate_page_local(virtual_address: u64) -> Result<(), TlbError> {
+    let sign = (virtual_address >> 47) & 1;
+    let upper = virtual_address >> 48;
+    let canonical = if sign == 0 { upper == 0 } else { upper == 0xffff };
+    if !canonical {
+        return Err(TlbError::NonCanonicalAddress);
+    }
+
+    // SAFETY: The caller guarantees privileged execution and serialization.
+    // INVLPG accepts any address within the page and invalidates its translation.
+    unsafe {
+        core::arch::asm!(
+            "invlpg [{}]",
+            in(reg) virtual_address,
+            options(nostack, preserves_flags)
+        );
+    }
+    Ok(())
+}
+
 /// Returns the physical base address of the currently active four-level page table.
 ///
 /// CR3 may also contain PCID or cache-control flags in its low bits. Only the
