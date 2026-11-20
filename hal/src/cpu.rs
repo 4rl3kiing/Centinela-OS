@@ -205,10 +205,7 @@ pub enum TlbError {
 /// table mutation and ensure no concurrent CPU can use the affected address
 /// space.
 pub unsafe fn invalidate_page_local(virtual_address: u64) -> Result<(), TlbError> {
-    let sign = (virtual_address >> 47) & 1;
-    let upper = virtual_address >> 48;
-    let canonical = if sign == 0 { upper == 0 } else { upper == 0xffff };
-    if !canonical {
+    if !is_canonical_address(virtual_address) {
         return Err(TlbError::NonCanonicalAddress);
     }
 
@@ -241,3 +238,24 @@ pub fn current_page_table_root() -> u64 {
     }
     value & 0x000f_ffff_ffff_f000
 }
+
+
+const fn is_canonical_address(address: u64) -> bool {
+    let sign = (address >> 47) & 1;
+    let upper = address >> 48;
+    if sign == 0 { upper == 0 } else { upper == 0xffff }
+}
+
+#[cfg(test)]
+mod tlb_tests {
+    use super::is_canonical_address;
+
+    #[test]
+    fn canonicality_matches_four_level_paging() {
+        assert!(is_canonical_address(0x0000_7fff_ffff_ffff));
+        assert!(is_canonical_address(0xffff_8000_0000_0000));
+        assert!(!is_canonical_address(0x0000_8000_0000_0000));
+        assert!(!is_canonical_address(0xffff_7fff_ffff_ffff));
+    }
+}
+
