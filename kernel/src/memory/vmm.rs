@@ -1042,7 +1042,7 @@ impl<'a, M: PageTableMutationMemory> PageTableMapper<'a, M> {
                 let child = match self.memory.allocate_zeroed_table_frame() {
                     Ok(frame) => frame,
                     Err(error) => {
-                        return self.rollback(created, created_len, MappingTransactionError::Backend(error));
+                        return self.rollback(mapping.virtual_address, created, created_len, MappingTransactionError::Backend(error));
                     }
                 };
                 let parent_entry = match PageTableEntry::new_table(
