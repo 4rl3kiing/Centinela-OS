@@ -908,6 +908,9 @@ pub enum MutationBackendError {
 /// table frames. Newly allocated frames must be fully zeroed before return.
 /// Writes must be atomic at the entry level, and release must only reclaim
 /// frames owned by this mapper and no longer reachable by hardware page walks.
+/// The invalidation operation must cover every CPU that can execute the
+/// affected address space. Local INVLPG is sufficient only while that address
+/// space is pinned to one CPU.
 pub unsafe trait PageTableMutationMemory {
     fn allocate_zeroed_table_frame(&mut self) -> Result<PhysAddr, MutationBackendError>;
     fn release_table_frame(&mut self, frame: PhysAddr) -> Result<(), MutationBackendError>;
@@ -918,6 +921,13 @@ pub unsafe trait PageTableMutationMemory {
         index: u16,
         value: u64,
     ) -> Result<(), MutationBackendError>;
+    /// Invalidates the address on all CPUs that may run this address space.
+    ///
+    /// # Safety
+    /// The implementation must serialize shootdown requests, wait for all
+    /// required acknowledgements, and not return success while stale
+    /// translations can still be used. A uniprocessor backend may use local
+    /// INVLPG only if migration and concurrent execution are impossible.
     fn invalidate_page(&mut self, virtual_address: VirtAddr)
         -> Result<(), MutationBackendError>;
 }
