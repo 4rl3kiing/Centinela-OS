@@ -9,7 +9,7 @@ The project has a freestanding Rust kernel with a Limine BIOS/UEFI boot path and
 - CPU architecture: x86_64.
 - Firmware boot: legacy BIOS and UEFI through a common boot protocol.
 - Bootloader/protocol candidate: Limine.
-- Kernel model: modular monolithic kernel.
+- Kernel model: capability-based hybrid microkernel (migration target; current executable baseline remains a minimal monolithic bootstrap).
 - Kernel language: Rust, `no_std` in privileged code.
 - Initial binary target: `x86_64-unknown-none`.
 - Initial execution environments: QEMU first; physical hardware after repeatable virtual-machine validation.
@@ -51,8 +51,9 @@ The PMM is an initial single-core implementation. It is not yet a complete virtu
 
 - [Kernel architecture and implementation roadmap](docs/architecture/overview.md)
 - [ADR-0001: x86_64, BIOS/UEFI, and boot strategy](docs/decisions/0001-platform-and-boot.md)
+- [ADR-0002: capability-based hybrid microkernel](docs/decisions/0002-hybrid-microkernel.md)
 - [Layered security hardening implementation plan](docs/security/hardening-implementation-plan.md)
 
 ## Current status
 
-Bootstrap and initial PMM milestones passed: the kernel builds, produces a hybrid ISO, reaches its Rust entry point, validates the Limine memory map and exercises PMM allocation/free under BIOS and UEFI in QEMU. The hardening implementation branch passed formatting, Clippy, host unit tests, freestanding compilation, hybrid ISO generation, and BIOS/UEFI QEMU boot checks at commit `0c7bd37177271ad0e7f3fbb7ad8b8acc5e8c9f85` (including passing Miri, Kani and PMM fuzz smoke workflows). VMM, enforced NX/W^X mappings, KASLR, KPTI, heap hardening, scheduling, user space, IPC, driver isolation and IOMMU remain unimplemented.
+Bootstrap and initial PMM milestones passed: the kernel builds, produces a hybrid ISO, reaches its Rust entry point, validates the Limine memory map and exercises PMM allocation/free under BIOS and UEFI in QEMU. The hardening implementation branch passed formatting, Clippy, host unit tests, freestanding compilation, hybrid ISO generation, and BIOS/UEFI QEMU boot checks at commit `0c7bd37177271ad0e7f3fbb7ad8b8acc5e8c9f85` (including passing Miri, Kani and PMM fuzz smoke workflows). The microkernel migration is a target architecture, not an implemented runtime yet. VMM enforcement, scheduler, Ring 3, syscall dispatch, IPC, user-space services/drivers, KASLR, KPTI, heap hardening and IOMMU remain incomplete.
