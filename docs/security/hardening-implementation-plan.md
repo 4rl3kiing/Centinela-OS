@@ -54,7 +54,22 @@ Required order:
 
 Do not enable LA57 or switch paging depth until a tested transition path exists. Detect support separately from enabling it.
 
-## Microkernel migration gate (approved target; not yet implemented)\n\nThe target architecture is a capability-based hybrid microkernel. The migration must be additive and gated; the existing Limine boot path and PMM remain intact until equivalent replacement paths are validated.\n\n1. Complete kernel-owned VMM mapping, unmapping, permission enforcement, rollback, and TLB invalidation.\n2. Implement GDT/TSS/IST/IDT and audited Ring 0/Ring 3 entry/exit paths.\n3. Implement process/address-space ownership, scheduler, context switching, and safe user-memory access.\n4. Implement a bounded IPC transport with endpoint capabilities, message validation, quotas, timeout/cancellation semantics, and explicit shared-memory grants.\n5. Add a user-space init/service manager with crash isolation, restart limits, and dependency ordering.\n6. Move one low-risk service to Ring 3, then console/storage/network drivers in independently tested increments.\n7. Add IOMMU isolation before assigning DMA-capable devices to untrusted user-space drivers.\n8. Benchmark syscall, IPC, context-switch, and I/O latency against the retained baseline; reject regressions without a documented security/performance trade-off.\n\nDo not claim microkernel operation until a Ring 3 service successfully boots, communicates through enforced IPC, and can fail/restart without corrupting kernel state.\n\n## Layer 3 — execution and privilege boundary
+## Microkernel migration gate (approved target; not yet implemented)
+
+The target architecture is a capability-based hybrid microkernel. The migration must be additive and gated; the existing Limine boot path and PMM remain intact until equivalent replacement paths are validated.
+
+1. Complete kernel-owned VMM mapping, unmapping, permission enforcement, rollback, and TLB invalidation.
+2. Implement GDT/TSS/IST/IDT and audited Ring 0/Ring 3 entry/exit paths.
+3. Implement process/address-space ownership, scheduler, context switching, and safe user-memory access.
+4. Implement a bounded IPC transport with endpoint capabilities, message validation, quotas, timeout/cancellation semantics, and explicit shared-memory grants.
+5. Add a user-space init/service manager with crash isolation, restart limits, and dependency ordering.
+6. Move one low-risk service to Ring 3, then console/storage/network drivers in independently tested increments.
+7. Add IOMMU isolation before assigning DMA-capable devices to untrusted user-space drivers.
+8. Benchmark syscall, IPC, context-switch, and I/O latency against the retained baseline; reject regressions without a documented security/performance trade-off.
+
+Do not claim microkernel operation until a Ring 3 service successfully boots, communicates through enforced IPC, and can fail/restart without corrupting kernel state.
+
+## Layer 3 — execution and privilege boundary
 
 - Implement GDT, TSS, IST stacks and IDT exception handlers.
 - Add a single-core scheduler and context switching only after interrupt entry/exit invariants are tested.
