@@ -886,3 +886,174 @@ mod walker_tests {
         );
     }
 }
+
+
+/// Backend failures are kept separate from page-table policy errors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationBackendError {
+    AllocationFailed,
+    ReadFailed,
+    WriteFailed,
+    ReleaseFailed,
+    TlbInvalidationFailed,
+}
+
+/// Operations required by the transactional 4 KiB mapper.
+///
+/// # Safety
+/// Implementations must provide exclusive, correctly aligned access to page
+/// table frames. Newly allocated frames must be fully zeroed before return.
+/// Writes must be atomic at the entry level, and release must only reclaim
+/// frames owned by this mapper and no longer reachable by hardware page walks.
+pub unsafe trait PageTableMutationMemory {
+    fn allocate_zeroed_table_frame(&mut self) -> Result<PhysAddr, MutationBackendError>;
+    fn release_table_frame(&mut self, frame: PhysAddr) -> Result<(), MutationBackendError>;
+    fn read_entry(&self, table: PhysAddr, index: u16) -> Result<u64, MutationBackendError>;
+    fn write_entry(
+        &mut self,
+        table: PhysAddr,
+        index: u16,
+        value: u64,
+    ) -> Result<(), MutationBackendError>;
+    fn invalidate_page(&mut self, virtual_address: VirtAddr)
+        -> Result<(), MutationBackendError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MappingTransactionError {
+    Backend(MutationBackendError),
+    AlreadyMapped,
+    HugePageConflict,
+    InvalidParentEntry,
+    ParentPermissionConflict,
+    RollbackFailed,
+}
+
+#[derive(Clone, Copy)]
+struct CreatedTable {
+    parent: PhysAddr,
+    index: u16,
+    child: PhysAddr,
+}
+
+/// Transactional mapper for 4 KiB leaves. It never replaces existing mappings.
+pub struct PageTableMapper<'a, M: PageTableMutationMemory> {
+    memory: &'a mut M,
+    root: PhysAddr,
+}
+
+impl<'a, M: PageTableMutationMemory> PageTableMapper<'a, M> {
+    pub const fn new(memory: &'a mut M, root: PhysAddr) -> Self {
+        Self { memory, root }
+    }
+
+    pub fn map_4k(&mut self, mapping: PageMapping) -> Result<(), MappingTransactionError> {
+        let indices = mapping.virtual_address.page_table_indices();
+        let path = [indices.pml4, indices.pdpt, indices.pd];
+        let mut table = self.root;
+        let mut created: [Option<CreatedTable>; 3] = [None; 3];
+        let mut created_len = 0usize;
+
+        for (depth, index) in path.into_iter().enumerate() {
+            let raw = match self.memory.read_entry(table, index) {
+                Ok(value) => value,
+                Err(error) => {
+                    return self.rollback(created, created_len, MappingTransactionError::Backend(error));
+                }
+            };
+
+            if raw & PRESENT == 0 {
+                let child = match self.memory.allocate_zeroed_table_frame() {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        return self.rollback(created, created_len, MappingTransactionError::Backend(error));
+                    }
+                };
+                let parent_entry = match PageTableEntry::new_table(
+                    child,
+                    mapping.permissions.user_accessible,
+                ) {
+                    Ok(entry) => entry.raw(),
+                    Err(_) => {
+                        let _ = self.memory.release_table_frame(child);
+                        return self.rollback(created, created_len, MappingTransactionError::InvalidParentEntry);
+                    }
+                };
+                if let Err(error) = self.memory.write_entry(table, index, parent_entry) {
+                    let release = self.memory.release_table_frame(child);
+                    let cause = if release.is_err() {
+                        MappingTransactionError::RollbackFailed
+                    } else {
+                        MappingTransactionError::Backend(error)
+                    };
+                    return self.rollback(created, created_len, cause);
+                }
+                created[created_len] = Some(CreatedTable { parent: table, index, child });
+                created_len += 1;
+                table = child;
+            } else {
+                if (depth == 0 && raw & HUGE_PAGE != 0) || (raw & HUGE_PAGE != 0) {
+                    return self.rollback(created, created_len, MappingTransactionError::HugePageConflict);
+                }
+                if raw & RESERVED_HIGH_BITS != 0 {
+                    return self.rollback(created, created_len, MappingTransactionError::InvalidParentEntry);
+                }
+                if (mapping.permissions.user_accessible && raw & USER == 0)
+                    || (mapping.permissions.writable && raw & WRITABLE == 0)
+                    || (mapping.permissions.executable && raw & NO_EXECUTE != 0)
+                {
+                    return self.rollback(created, created_len, MappingTransactionError::ParentPermissionConflict);
+                }
+                let next = raw & PHYSICAL_ADDRESS_MASK;
+                table = match PhysAddr::new(next) {
+                    Ok(address) if next != 0 => address,
+                    _ => return self.rollback(created, created_len, MappingTransactionError::InvalidParentEntry),
+                };
+            }
+        }
+
+        let leaf_index = indices.pt;
+        let existing = match self.memory.read_entry(table, leaf_index) {
+            Ok(value) => value,
+            Err(error) => {
+                return self.rollback(created, created_len, MappingTransactionError::Backend(error));
+            }
+        };
+        if existing & PRESENT != 0 {
+            return self.rollback(created, created_len, MappingTransactionError::AlreadyMapped);
+        }
+        if let Err(error) = self.memory.write_entry(table, leaf_index, mapping.leaf_entry().raw()) {
+            return self.rollback(created, created_len, MappingTransactionError::Backend(error));
+        }
+        if let Err(error) = self.memory.invalidate_page(mapping.virtual_address) {
+            // The mapping is now visible. Do not free reachable page-table frames;
+            // report the TLB failure so the caller can enter its recovery path.
+            return Err(MappingTransactionError::Backend(error));
+        }
+        Ok(())
+    }
+
+    fn rollback(
+        &mut self,
+        created: [Option<CreatedTable>; 3],
+        created_len: usize,
+        cause: MappingTransactionError,
+    ) -> Result<(), MappingTransactionError> {
+        let mut clear_failed = false;
+        for item in created[..created_len].iter().rev().flatten() {
+            if self.memory.write_entry(item.parent, item.index, 0).is_err() {
+                clear_failed = true;
+            }
+        }
+        if clear_failed {
+            // Some frames may still be reachable. Leak rather than risk use-after-free.
+            return Err(MappingTransactionError::RollbackFailed);
+        }
+        for item in created[..created_len].iter().rev().flatten() {
+            if self.memory.release_table_frame(item.child).is_err() {
+                return Err(MappingTransactionError::RollbackFailed);
+            }
+        }
+        Err(cause)
+    }
+}
