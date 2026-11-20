@@ -1140,7 +1140,7 @@ impl<'a, M: PageTableMutationMemory> PageTableMapper<'a, M> {
 mod mutation_tests {
     use super::{
         MappingTransactionError, MutationBackendError, PageTableMapper,
-        PageTableMutationMemory, PageMapping, PhysAddr, VirtAddr,
+        PageTableMutationMemory, PhysAddr, VirtAddr,
         PRESENT, USER, WRITABLE, NO_EXECUTE,
     };
     use centinela_security::permissions::PagePermissions;
