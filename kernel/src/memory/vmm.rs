@@ -63,6 +63,67 @@ pub enum EntryError {
     UnreadablePageUnsupported,
 }
 
+/// A single 4 KiB mapping request validated before any page-table mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageMapping {
+    virtual_address: VirtAddr,
+    physical_address: PhysAddr,
+    permissions: PagePermissions,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MappingError {
+    Address(AddressError),
+    VirtualAddressUnaligned,
+    UserMappingInKernelHalf,
+    WriteExecuteViolation,
+    UnreadablePageUnsupported,
+}
+
+impl PageMapping {
+    /// Validates mapping invariants without changing page tables or ownership.
+    pub const fn new(
+        virtual_address: u64,
+        physical_address: u64,
+        permissions: PagePermissions,
+    ) -> Result<Self, MappingError> {
+        if virtual_address & (PAGE_SIZE - 1) != 0 {
+            return Err(MappingError::VirtualAddressUnaligned);
+        }
+        let virtual_address = match VirtAddr::new(virtual_address) {
+            Ok(address) => address,
+            Err(error) => return Err(MappingError::Address(error)),
+        };
+        let physical_address = match PhysAddr::new(physical_address) {
+            Ok(address) => address,
+            Err(error) => return Err(MappingError::Address(error)),
+        };
+        if permissions.writable && permissions.executable {
+            return Err(MappingError::WriteExecuteViolation);
+        }
+        if !permissions.readable {
+            return Err(MappingError::UnreadablePageUnsupported);
+        }
+        if permissions.user_accessible && virtual_address.get() >= 0xffff_8000_0000_0000 {
+            return Err(MappingError::UserMappingInKernelHalf);
+        }
+        Ok(Self { virtual_address, physical_address, permissions })
+    }
+
+    pub const fn virtual_address(self) -> VirtAddr { self.virtual_address }
+    pub const fn physical_address(self) -> PhysAddr { self.physical_address }
+    pub const fn permissions(self) -> PagePermissions { self.permissions }
+
+    /// Encodes the leaf entry after the request has passed validation.
+    pub const fn leaf_entry(self) -> PageTableEntry {
+        let mut raw = self.physical_address.0 | PRESENT;
+        if self.permissions.writable { raw |= WRITABLE; }
+        if self.permissions.user_accessible { raw |= USER; }
+        if !self.permissions.executable { raw |= NO_EXECUTE; }
+        PageTableEntry(raw)
+    }
+}
+
 impl VirtAddr {
     pub const fn new(value: u64) -> Result<Self, AddressError> {
         if is_canonical(value) {
@@ -290,6 +351,30 @@ mod tests {
         assert_eq!(
             BootPagingInfo::new(0, hhdm),
             Err(AddressError::InvalidPageTableRoot)
+        );
+    }
+
+    #[test]
+    fn validates_mapping_alignment_wx_and_user_kernel_boundary() {
+        use super::{MappingError, PageMapping};
+        let user = PagePermissions::new(true, true, false, true).unwrap();
+        let mapping = PageMapping::new(0x4000, 0x9000, user).unwrap();
+        assert!(mapping.leaf_entry().is_user_accessible());
+        assert!(mapping.leaf_entry().is_writable());
+        assert!(!mapping.leaf_entry().is_executable());
+
+        assert_eq!(
+            PageMapping::new(0x4001, 0x9000, user),
+            Err(MappingError::VirtualAddressUnaligned)
+        );
+        assert_eq!(
+            PageMapping::new(0xffff_8000_0000_0000, 0x9000, user),
+            Err(MappingError::UserMappingInKernelHalf)
+        );
+        let wx = PagePermissions { readable: true, writable: true, executable: true, user_accessible: false };
+        assert_eq!(
+            PageMapping::new(0xffff_8000_0000_0000, 0x9000, wx),
+            Err(MappingError::WriteExecuteViolation)
         );
     }
 
