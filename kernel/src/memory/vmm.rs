@@ -199,6 +199,27 @@ impl PageTableEntry {
     pub const fn physical_address(self) -> u64 {
         self.0 & PHYSICAL_ADDRESS_MASK
     }
+
+    /// Encodes a non-leaf page-table pointer.
+    ///
+    /// Parent entries are writable so that leaf-level permissions can decide
+    /// whether a mapping is writable. USER is propagated only for an address
+    /// subtree that may contain user mappings; the leaf must still grant USER.
+    /// NX is intentionally left clear here so the leaf controls execution.
+    pub const fn new_table(
+        physical: PhysAddr,
+        user_accessible: bool,
+    ) -> Result<Self, EntryError> {
+        let mut raw = physical.0 | PRESENT | WRITABLE;
+        if user_accessible {
+            raw |= USER;
+        }
+        Ok(Self(raw))
+    }
+
+    pub const fn is_user_accessible(self) -> bool {
+        self.0 & USER != 0
+    }
 }
 
 const fn is_canonical(value: u64) -> bool {
@@ -296,6 +317,22 @@ mod tests {
         .expect("code page entry");
         assert!(!code.is_writable());
         assert!(code.is_executable());
+    }
+
+    #[test]
+    fn encodes_non_leaf_table_pointers_with_explicit_user_propagation() {
+        let physical = PhysAddr::new(0x8000).expect("aligned table frame");
+        let supervisor = PageTableEntry::new_table(physical, false).unwrap();
+        assert!(supervisor.is_present());
+        assert!(supervisor.is_writable());
+        assert!(!supervisor.is_user_accessible());
+        assert!(supervisor.is_executable());
+        assert_eq!(supervisor.physical_address(), 0x8000);
+
+        let user = PageTableEntry::new_table(physical, true).unwrap();
+        assert!(user.is_user_accessible());
+        assert!(user.is_writable());
+        assert!(user.is_executable());
     }
 
     #[test]
