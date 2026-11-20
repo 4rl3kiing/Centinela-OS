@@ -216,10 +216,6 @@ impl PageTableEntry {
         }
         Ok(Self(raw))
     }
-
-    pub const fn is_user_accessible(self) -> bool {
-        self.0 & USER != 0
-    }
 }
 
 const fn is_canonical(value: u64) -> bool {
