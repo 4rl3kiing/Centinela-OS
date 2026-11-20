@@ -923,6 +923,7 @@ pub unsafe trait PageTableMutationMemory {
 pub enum MappingTransactionError {
     Backend(MutationBackendError),
     AlreadyMapped,
+    NotMapped,
     HugePageConflict,
     InvalidParentEntry,
     ParentPermissionConflict,
@@ -946,6 +947,81 @@ pub struct PageTableMapper<'a, M: PageTableMutationMemory> {
 impl<'a, M: PageTableMutationMemory> PageTableMapper<'a, M> {
     pub const fn new(memory: &'a mut M, root: PhysAddr) -> Self {
         Self { memory, root }
+    }
+
+    /// Removes one 4 KiB leaf mapping. It never frees the mapped data frame
+    /// or intermediate tables; ownership and subtree-wide TLB shootdown are
+    /// separate responsibilities.
+    ///
+    /// If invalidation fails, the leaf is already cleared in memory but stale
+    /// translations may remain. The caller must complete an address-space
+    /// flush before reusing the returned physical frame.
+    pub fn unmap_4k(
+        &mut self,
+        virtual_address: VirtAddr,
+    ) -> Result<PageMapping, MappingTransactionError> {
+        let indices = virtual_address.page_table_indices();
+        let path = [indices.pml4, indices.pdpt, indices.pd];
+        let mut table = self.root;
+        let mut writable = true;
+        let mut user_accessible = true;
+        let mut executable = true;
+
+        for (depth, index) in path.into_iter().enumerate() {
+            let raw = self.memory.read_entry(table, index)
+                .map_err(MappingTransactionError::Backend)?;
+            if raw & PRESENT == 0 {
+                return Err(MappingTransactionError::NotMapped);
+            }
+            if raw & RESERVED_HIGH_BITS != 0 {
+                return Err(MappingTransactionError::InvalidParentEntry);
+            }
+            if raw & HUGE_PAGE != 0 {
+                return Err(MappingTransactionError::HugePageConflict);
+            }
+            writable &= raw & WRITABLE != 0;
+            user_accessible &= raw & USER != 0;
+            executable &= raw & NO_EXECUTE == 0;
+
+            let next = raw & PHYSICAL_ADDRESS_MASK;
+            if next == 0 {
+                return Err(MappingTransactionError::InvalidParentEntry);
+            }
+            table = PhysAddr::new(next)
+                .map_err(|_| MappingTransactionError::InvalidParentEntry)?;
+            let _ = depth;
+        }
+
+        let raw = self.memory.read_entry(table, indices.pt)
+            .map_err(MappingTransactionError::Backend)?;
+        if raw & PRESENT == 0 {
+            return Err(MappingTransactionError::NotMapped);
+        }
+        if raw & RESERVED_HIGH_BITS != 0 {
+            return Err(MappingTransactionError::InvalidParentEntry);
+        }
+
+        writable &= raw & WRITABLE != 0;
+        user_accessible &= raw & USER != 0;
+        executable &= raw & NO_EXECUTE == 0;
+        let physical = PhysAddr::new(raw & PHYSICAL_ADDRESS_MASK)
+            .map_err(|_| MappingTransactionError::InvalidParentEntry)?;
+        let removed = PageMapping {
+            virtual_address,
+            physical_address: physical,
+            permissions: PagePermissions {
+                readable: true,
+                writable,
+                executable,
+                user_accessible,
+            },
+        };
+
+        self.memory.write_entry(table, indices.pt, 0)
+            .map_err(MappingTransactionError::Backend)?;
+        self.memory.invalidate_page(virtual_address)
+            .map_err(MappingTransactionError::TlbInvalidationFailed)?;
+        Ok(removed)
     }
 
     pub fn map_4k(&mut self, mapping: PageMapping) -> Result<(), MappingTransactionError> {
@@ -1058,3 +1134,106 @@ impl<'a, M: PageTableMutationMemory> PageTableMapper<'a, M> {
         Err(cause)
     }
 }
+
+
+#[cfg(test)]
+mod mutation_tests {
+    use super::{
+        MappingTransactionError, MutationBackendError, PageTableMapper,
+        PageTableMutationMemory, PageMapping, PhysAddr, VirtAddr,
+        PRESENT, USER, WRITABLE, NO_EXECUTE,
+    };
+    use centinela_security::permissions::PagePermissions;
+
+    struct MockMutationMemory {
+        entries: [(u64, u16, u64); 8],
+        len: usize,
+        invalidations: usize,
+    }
+
+    // SAFETY: This mock owns a fixed in-memory entry array, returns zero for
+    // absent entries, and performs atomic updates to individual entries.
+    unsafe impl PageTableMutationMemory for MockMutationMemory {
+        fn allocate_zeroed_table_frame(&mut self) -> Result<PhysAddr, MutationBackendError> {
+            Err(MutationBackendError::AllocationFailed)
+        }
+
+        fn release_table_frame(&mut self, _: PhysAddr) -> Result<(), MutationBackendError> {
+            Ok(())
+        }
+
+        fn read_entry(&self, table: PhysAddr, index: u16) -> Result<u64, MutationBackendError> {
+            Ok(self.entries[..self.len].iter()
+                .find(|(address, entry_index, _)| *address == table.get() && *entry_index == index)
+                .map(|(_, _, value)| *value)
+                .unwrap_or(0))
+        }
+
+        fn write_entry(
+            &mut self,
+            table: PhysAddr,
+            index: u16,
+            value: u64,
+        ) -> Result<(), MutationBackendError> {
+            if let Some(entry) = self.entries[..self.len].iter_mut()
+                .find(|(address, entry_index, _)| *address == table.get() && *entry_index == index)
+            {
+                entry.2 = value;
+            } else if self.len < self.entries.len() {
+                self.entries[self.len] = (table.get(), index, value);
+                self.len += 1;
+            } else {
+                return Err(MutationBackendError::WriteFailed);
+            }
+            Ok(())
+        }
+
+        fn invalidate_page(&mut self, _: VirtAddr) -> Result<(), MutationBackendError> {
+            self.invalidations += 1;
+            Ok(())
+        }
+    }
+
+    fn mapped_memory() -> MockMutationMemory {
+        MockMutationMemory {
+            entries: [
+                (0x1000, 0, 0x2000 | PRESENT | WRITABLE | USER),
+                (0x2000, 0, 0x3000 | PRESENT | WRITABLE | USER),
+                (0x3000, 0, 0x4000 | PRESENT | WRITABLE | USER),
+                (0x4000, 1, 0x9000 | PRESENT | USER | NO_EXECUTE),
+                (0, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0),
+            ],
+            len: 4,
+            invalidations: 0,
+        }
+    }
+
+    #[test]
+    fn unmap_clears_leaf_invalidates_and_returns_effective_permissions() {
+        let mut memory = mapped_memory();
+        let root = PhysAddr::new(0x1000).unwrap();
+        let address = VirtAddr::new(0x1000).unwrap();
+        let mut mapper = PageTableMapper::new(&mut memory, root);
+
+        let removed = mapper.unmap_4k(address).unwrap();
+        assert_eq!(removed.physical_address().get(), 0x9000);
+        assert!(!removed.permissions().writable);
+        assert!(removed.permissions().user_accessible);
+        assert!(!removed.permissions().executable);
+        assert_eq!(mapper.memory.read_entry(PhysAddr::new(0x4000).unwrap(), 1), Ok(0));
+        assert_eq!(mapper.memory.invalidations, 1);
+    }
+
+    #[test]
+    fn unmap_rejects_absent_leaf_without_invalidating() {
+        let mut memory = mapped_memory();
+        memory.entries[3].2 = 0;
+        let root = PhysAddr::new(0x1000).unwrap();
+        let address = VirtAddr::new(0x1000).unwrap();
+        let mut mapper = PageTableMapper::new(&mut memory, root);
+
+        assert_eq!(mapper.unmap_4k(address), Err(MappingTransactionError::NotMapped));
+        assert_eq!(mapper.memory.invalidations, 0);
+    }
+}
+
