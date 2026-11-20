@@ -927,6 +927,7 @@ pub enum MappingTransactionError {
     InvalidParentEntry,
     ParentPermissionConflict,
     RollbackFailed,
+    TlbInvalidationFailed(MutationBackendError),
 }
 
 #[derive(Clone, Copy)]
@@ -1028,7 +1029,7 @@ impl<'a, M: PageTableMutationMemory> PageTableMapper<'a, M> {
         if let Err(error) = self.memory.invalidate_page(mapping.virtual_address) {
             // The mapping is now visible. Do not free reachable page-table frames;
             // report the TLB failure so the caller can enter its recovery path.
-            return Err(MappingTransactionError::Backend(error));
+            return Err(MappingTransactionError::TlbInvalidationFailed(error));
         }
         Ok(())
     }
