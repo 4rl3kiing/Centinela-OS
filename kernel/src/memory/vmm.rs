@@ -928,7 +928,7 @@ pub enum MappingTransactionError {
     InvalidParentEntry,
     ParentPermissionConflict,
     RollbackFailed,
-    TlbInvalidationFailed(MutationBackendError),
+    TlbInvalidationFailed { error: MutationBackendError, removed: Option<PageMapping> },
 }
 
 #[derive(Clone, Copy)]
@@ -967,7 +967,7 @@ impl<'a, M: PageTableMutationMemory> PageTableMapper<'a, M> {
         let mut user_accessible = true;
         let mut executable = true;
 
-        for (depth, index) in path.into_iter().enumerate() {
+        for index in path {
             let raw = self.memory.read_entry(table, index)
                 .map_err(MappingTransactionError::Backend)?;
             if raw & PRESENT == 0 {
@@ -989,7 +989,6 @@ impl<'a, M: PageTableMutationMemory> PageTableMapper<'a, M> {
             }
             table = PhysAddr::new(next)
                 .map_err(|_| MappingTransactionError::InvalidParentEntry)?;
-            let _ = depth;
         }
 
         let raw = self.memory.read_entry(table, indices.pt)
@@ -1020,7 +1019,7 @@ impl<'a, M: PageTableMutationMemory> PageTableMapper<'a, M> {
         self.memory.write_entry(table, indices.pt, 0)
             .map_err(MappingTransactionError::Backend)?;
         self.memory.invalidate_page(virtual_address)
-            .map_err(MappingTransactionError::TlbInvalidationFailed)?;
+             .map_err(|error| MappingTransactionError::TlbInvalidationFailed { error, removed: Some(removed) })?;
         Ok(removed)
     }
 
@@ -1035,7 +1034,7 @@ impl<'a, M: PageTableMutationMemory> PageTableMapper<'a, M> {
             let raw = match self.memory.read_entry(table, index) {
                 Ok(value) => value,
                 Err(error) => {
-                    return self.rollback(created, created_len, MappingTransactionError::Backend(error));
+                    return self.rollback(mapping.virtual_address, created, created_len, MappingTransactionError::Backend(error));
                 }
             };
 
@@ -1105,13 +1104,14 @@ impl<'a, M: PageTableMutationMemory> PageTableMapper<'a, M> {
         if let Err(error) = self.memory.invalidate_page(mapping.virtual_address) {
             // The mapping is now visible. Do not free reachable page-table frames;
             // report the TLB failure so the caller can enter its recovery path.
-            return Err(MappingTransactionError::TlbInvalidationFailed(error));
+            return Err(MappingTransactionError::TlbInvalidationFailed { error, removed: None });
         }
         Ok(())
     }
 
     fn rollback(
         &mut self,
+        virtual_address: VirtAddr,
         created: [Option<CreatedTable>; 3],
         created_len: usize,
         cause: MappingTransactionError,
@@ -1124,6 +1124,10 @@ impl<'a, M: PageTableMutationMemory> PageTableMapper<'a, M> {
         }
         if clear_failed {
             // Some frames may still be reachable. Leak rather than risk use-after-free.
+            return Err(MappingTransactionError::RollbackFailed);
+        }
+        if self.memory.invalidate_page(virtual_address).is_err() {
+            // Page-walk caches may still reference detached tables. Leak them safely.
             return Err(MappingTransactionError::RollbackFailed);
         }
         for item in created[..created_len].iter().rev().flatten() {
