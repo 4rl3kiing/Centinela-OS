@@ -1059,7 +1059,7 @@ impl<'a, M: PageTableMutationMemory> PageTableMapper<'a, M> {
                     Ok(entry) => entry.raw(),
                     Err(_) => {
                         let _ = self.memory.release_table_frame(child);
-                        return self.rollback(created, created_len, MappingTransactionError::InvalidParentEntry);
+                        return self.rollback(mapping.virtual_address, created, created_len, MappingTransactionError::InvalidParentEntry);
                     }
                 };
                 if let Err(error) = self.memory.write_entry(table, index, parent_entry) {
@@ -1069,28 +1069,28 @@ impl<'a, M: PageTableMutationMemory> PageTableMapper<'a, M> {
                     } else {
                         MappingTransactionError::Backend(error)
                     };
-                    return self.rollback(created, created_len, cause);
+                    return self.rollback(mapping.virtual_address, created, created_len, cause);
                 }
                 created[created_len] = Some(CreatedTable { parent: table, index, child });
                 created_len += 1;
                 table = child;
             } else {
                 if raw & HUGE_PAGE != 0 {
-                    return self.rollback(created, created_len, MappingTransactionError::HugePageConflict);
+                    return self.rollback(mapping.virtual_address, created, created_len, MappingTransactionError::HugePageConflict);
                 }
                 if raw & RESERVED_HIGH_BITS != 0 {
-                    return self.rollback(created, created_len, MappingTransactionError::InvalidParentEntry);
+                    return self.rollback(mapping.virtual_address, created, created_len, MappingTransactionError::InvalidParentEntry);
                 }
                 if (mapping.permissions.user_accessible && raw & USER == 0)
                     || (mapping.permissions.writable && raw & WRITABLE == 0)
                     || (mapping.permissions.executable && raw & NO_EXECUTE != 0)
                 {
-                    return self.rollback(created, created_len, MappingTransactionError::ParentPermissionConflict);
+                    return self.rollback(mapping.virtual_address, created, created_len, MappingTransactionError::ParentPermissionConflict);
                 }
                 let next = raw & PHYSICAL_ADDRESS_MASK;
                 table = match PhysAddr::new(next) {
                     Ok(address) if next != 0 => address,
-                    _ => return self.rollback(created, created_len, MappingTransactionError::InvalidParentEntry),
+                    _ => return self.rollback(mapping.virtual_address, created, created_len, MappingTransactionError::InvalidParentEntry),
                 };
             }
         }
@@ -1099,14 +1099,14 @@ impl<'a, M: PageTableMutationMemory> PageTableMapper<'a, M> {
         let existing = match self.memory.read_entry(table, leaf_index) {
             Ok(value) => value,
             Err(error) => {
-                return self.rollback(created, created_len, MappingTransactionError::Backend(error));
+                return self.rollback(mapping.virtual_address, created, created_len, MappingTransactionError::Backend(error));
             }
         };
         if existing & PRESENT != 0 {
-            return self.rollback(created, created_len, MappingTransactionError::AlreadyMapped);
+            return self.rollback(mapping.virtual_address, created, created_len, MappingTransactionError::AlreadyMapped);
         }
         if let Err(error) = self.memory.write_entry(table, leaf_index, mapping.leaf_entry().raw()) {
-            return self.rollback(created, created_len, MappingTransactionError::Backend(error));
+            return self.rollback(mapping.virtual_address, created, created_len, MappingTransactionError::Backend(error));
         }
         if let Err(error) = self.memory.invalidate_page(mapping.virtual_address) {
             // The mapping is now visible. Do not free reachable page-table frames;
