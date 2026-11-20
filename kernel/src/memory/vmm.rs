@@ -271,6 +271,9 @@ impl PageTableEntry {
         physical: PhysAddr,
         user_accessible: bool,
     ) -> Result<Self, EntryError> {
+        if physical.0 == 0 {
+            return Err(EntryError::Address(AddressError::InvalidPageTableRoot));
+        }
         let mut raw = physical.0 | PRESENT | WRITABLE;
         if user_accessible {
             raw |= USER;
@@ -1018,8 +1021,12 @@ impl<'a, M: PageTableMutationMemory> PageTableMapper<'a, M> {
 
         self.memory.write_entry(table, indices.pt, 0)
             .map_err(MappingTransactionError::Backend)?;
-        self.memory.invalidate_page(virtual_address)
-             .map_err(|error| MappingTransactionError::TlbInvalidationFailed { error, removed: Some(removed) })?;
+        self.memory
+            .invalidate_page(virtual_address)
+            .map_err(|error| MappingTransactionError::TlbInvalidationFailed {
+                error,
+                removed: Some(removed),
+            })?;
         Ok(removed)
     }
 
@@ -1030,7 +1037,7 @@ impl<'a, M: PageTableMutationMemory> PageTableMapper<'a, M> {
         let mut created: [Option<CreatedTable>; 3] = [None; 3];
         let mut created_len = 0usize;
 
-        for (depth, index) in path.into_iter().enumerate() {
+        for index in path {
             let raw = match self.memory.read_entry(table, index) {
                 Ok(value) => value,
                 Err(error) => {
@@ -1068,7 +1075,7 @@ impl<'a, M: PageTableMutationMemory> PageTableMapper<'a, M> {
                 created_len += 1;
                 table = child;
             } else {
-                if (depth == 0 && raw & HUGE_PAGE != 0) || (raw & HUGE_PAGE != 0) {
+                if raw & HUGE_PAGE != 0 {
                     return self.rollback(created, created_len, MappingTransactionError::HugePageConflict);
                 }
                 if raw & RESERVED_HIGH_BITS != 0 {
