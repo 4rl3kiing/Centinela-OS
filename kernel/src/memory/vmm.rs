@@ -1160,6 +1160,7 @@ mod mutation_tests {
         entries: [(u64, u16, u64); 8],
         len: usize,
         invalidations: usize,
+        fail_invalidation: bool,
     }
 
     // SAFETY: This mock owns a fixed in-memory entry array, returns zero for
@@ -1201,7 +1202,11 @@ mod mutation_tests {
 
         fn invalidate_page(&mut self, _: VirtAddr) -> Result<(), MutationBackendError> {
             self.invalidations += 1;
-            Ok(())
+            if self.fail_invalidation {
+                Err(MutationBackendError::TlbInvalidationFailed)
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1216,6 +1221,7 @@ mod mutation_tests {
             ],
             len: 4,
             invalidations: 0,
+            fail_invalidation: false,
         }
     }
 
@@ -1233,6 +1239,27 @@ mod mutation_tests {
         assert!(!removed.permissions().executable);
         assert_eq!(mapper.memory.read_entry(PhysAddr::new(0x4000).unwrap(), 1), Ok(0));
         assert_eq!(mapper.memory.invalidations, 1);
+    }
+
+    #[test]
+    fn unmap_preserves_removed_frame_when_tlb_invalidation_fails() {
+        let mut memory = mapped_memory();
+        memory.fail_invalidation = true;
+        let root = PhysAddr::new(0x1000).unwrap();
+        let address = VirtAddr::new(0x1000).unwrap();
+        let mut mapper = PageTableMapper::new(&mut memory, root);
+
+        match mapper.unmap_4k(address) {
+            Err(MappingTransactionError::TlbInvalidationFailed {
+                error: MutationBackendError::TlbInvalidationFailed,
+                removed: Some(mapping),
+            }) => assert_eq!(mapping.physical_address().get(), 0x9000),
+            other => panic!("unexpected unmap result: {:?}", other),
+        }
+        assert_eq!(
+            mapper.memory.read_entry(PhysAddr::new(0x4000).unwrap(), 1),
+            Ok(0)
+        );
     }
 
     #[test]
