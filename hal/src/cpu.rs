@@ -3,6 +3,7 @@
 /// IA32_EFER model-specific register.
 const IA32_EFER: u32 = 0xC000_0080;
 const EFER_NXE: u64 = 1 << 11;
+const CR0_WP: u64 = 1 << 16;
 
 const CR4_UMIP: u64 = 1 << 11;
 const CR4_SMEP: u64 = 1 << 20;
@@ -11,6 +12,7 @@ const CR4_SMAP: u64 = 1 << 21;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuHardening {
     pub nx: bool,
+    pub write_protect: bool,
     pub umip: bool,
     pub smep: bool,
     pub smap: bool,
@@ -19,6 +21,7 @@ pub struct CpuHardening {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CpuHardeningError {
     NxUnsupported,
+    FeatureEnableFailed,
 }
 
 /// Detects supported CPU features and enables NXE, UMIP, SMEP and SMAP.
@@ -32,23 +35,23 @@ pub enum CpuHardeningError {
 /// failure to enable it aborts bootstrap.
 pub fn enable_boot_hardening() -> Result<CpuHardening, CpuHardeningError> {
     // SAFETY: CPUID is available on all x86_64 processors.
-    let basic = unsafe { core::arch::x86_64::__cpuid(0) };
+    let basic = core::arch::x86_64::__cpuid(0);
     let leaf7_supported = basic.eax >= 7;
     let leaf7 = if leaf7_supported {
         // SAFETY: The maximum basic leaf advertises leaf 7.
-        unsafe { core::arch::x86_64::__cpuid_count(7, 0) }
+        core::arch::x86_64::__cpuid_count(7, 0)
     } else {
         // No feature bits are advertised when the leaf is unavailable.
-        unsafe { core::arch::x86_64::__cpuid(0) }
+        core::arch::x86_64::__cpuid(0)
     };
 
     // SAFETY: Query the maximum supported extended CPUID leaf first.
-    let extended = unsafe { core::arch::x86_64::__cpuid(0x8000_0000) };
+    let extended = core::arch::x86_64::__cpuid(0x8000_0000);
     if extended.eax < 0x8000_0001 {
         return Err(CpuHardeningError::NxUnsupported);
     }
     // SAFETY: The maximum extended leaf confirms this leaf exists.
-    let extended_features = unsafe { core::arch::x86_64::__cpuid(0x8000_0001) };
+    let extended_features = core::arch::x86_64::__cpuid(0x8000_0001);
     let nx_supported = (extended_features.edx & (1 << 20)) != 0;
     if !nx_supported {
         return Err(CpuHardeningError::NxUnsupported);
@@ -79,6 +82,48 @@ pub fn enable_boot_hardening() -> Result<CpuHardening, CpuHardeningError> {
             options(nomem, nostack, preserves_flags)
         );
     }
+    let verified_efer_low: u32;
+    let verified_efer_high: u32;
+    // SAFETY: Read back the same privileged MSR to verify NXE became active.
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") IA32_EFER,
+            out("eax") verified_efer_low,
+            out("edx") verified_efer_high,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    let verified_efer = (u64::from(verified_efer_high) << 32) | u64::from(verified_efer_low);
+    if verified_efer & EFER_NXE == 0 {
+        return Err(CpuHardeningError::FeatureEnableFailed);
+    }
+
+    // Enable supervisor write protection so CR0.WP enforces read-only PTEs
+    // even while executing in ring 0.
+    let mut cr0: u64;
+    // SAFETY: Reading CR0 is a privileged operation in ring 0.
+    unsafe {
+        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+    }
+    cr0 |= CR0_WP;
+    // SAFETY: Preserve existing CR0 state and set only the architectural WP bit.
+    unsafe {
+        core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack, preserves_flags));
+    }
+    let verified_cr0: u64;
+    // SAFETY: Read back CR0 to confirm supervisor write protection is active.
+    unsafe {
+        core::arch::asm!(
+            "mov {}, cr0",
+            out(reg) verified_cr0,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    let write_protect = verified_cr0 & CR0_WP != 0;
+    if !write_protect {
+        return Err(CpuHardeningError::FeatureEnableFailed);
+    }
 
     let mut cr4: u64;
     // SAFETY: Reading CR4 is a privileged operation in ring 0.
@@ -103,12 +148,28 @@ pub fn enable_boot_hardening() -> Result<CpuHardening, CpuHardeningError> {
     unsafe {
         core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
     }
+    let verified_cr4: u64;
+    // SAFETY: Read back CR4 to confirm all advertised hardening bits were set.
+    unsafe {
+        core::arch::asm!(
+            "mov {}, cr4",
+            out(reg) verified_cr4,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    let verified_umip = umip && verified_cr4 & CR4_UMIP != 0;
+    let verified_smep = smep && verified_cr4 & CR4_SMEP != 0;
+    let verified_smap = smap && verified_cr4 & CR4_SMAP != 0;
+    if (umip && !verified_umip) || (smep && !verified_smep) || (smap && !verified_smap) {
+        return Err(CpuHardeningError::FeatureEnableFailed);
+    }
 
     Ok(CpuHardening {
         nx: true,
-        umip,
-        smep,
-        smap,
+        write_protect,
+        umip: verified_umip,
+        smep: verified_smep,
+        smap: verified_smap,
     })
 }
 
@@ -125,3 +186,76 @@ pub fn halt_forever() -> ! {
         }
     }
 }
+
+/// Errors returned by local TLB invalidation primitives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TlbError {
+    NonCanonicalAddress,
+}
+
+/// Invalidates one virtual page in the current logical processor's TLB.
+///
+/// This uses INVLPG, which also invalidates a matching global translation.
+/// It does not send IPIs or invalidate another CPU's TLB. Until an SMP
+/// shootdown controller exists, callers must restrict page-table mutation
+/// to the bootstrap CPU and must not expose the address space to other CPUs.
+///
+/// # Safety
+/// Must execute at CPL 0 with paging enabled. The caller must serialize page
+/// table mutation and ensure no concurrent CPU can use the affected address
+/// space.
+pub unsafe fn invalidate_page_local(virtual_address: u64) -> Result<(), TlbError> {
+    if !is_canonical_address(virtual_address) {
+        return Err(TlbError::NonCanonicalAddress);
+    }
+
+    // SAFETY: The caller guarantees privileged execution and serialization.
+    // INVLPG accepts any address within the page and invalidates its translation.
+    unsafe {
+        core::arch::asm!(
+            "invlpg [{}]",
+            in(reg) virtual_address,
+            options(nostack, preserves_flags)
+        );
+    }
+    Ok(())
+}
+
+/// Returns the physical base address of the currently active four-level page table.
+///
+/// CR3 may also contain PCID or cache-control flags in its low bits. Only the
+/// architectural physical-address field is returned. This function does not
+/// switch page tables or validate that the referenced root is HHDM-mapped.
+pub fn current_page_table_root() -> u64 {
+    let value: u64;
+    // SAFETY: Reading CR3 is a privileged, side-effect-free operation in ring 0.
+    unsafe {
+        core::arch::asm!(
+            "mov {}, cr3",
+            out(reg) value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    value & 0x000f_ffff_ffff_f000
+}
+
+
+const fn is_canonical_address(address: u64) -> bool {
+    let sign = (address >> 47) & 1;
+    let upper = address >> 48;
+    if sign == 0 { upper == 0 } else { upper == 0xffff }
+}
+
+#[cfg(test)]
+mod tlb_tests {
+    use super::is_canonical_address;
+
+    #[test]
+    fn canonicality_matches_four_level_paging() {
+        assert!(is_canonical_address(0x0000_7fff_ffff_ffff));
+        assert!(is_canonical_address(0xffff_8000_0000_0000));
+        assert!(!is_canonical_address(0x0000_8000_0000_0000));
+        assert!(!is_canonical_address(0xffff_7fff_ffff_ffff));
+    }
+}
+

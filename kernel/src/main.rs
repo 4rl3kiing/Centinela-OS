@@ -6,9 +6,14 @@ use core::mem::MaybeUninit;
 use core::panic::PanicInfo;
 use core::ptr::{addr_of, addr_of_mut};
 
-use centinela_hal::cpu::{enable_boot_hardening, halt_forever};
+use centinela_hal::cpu::{
+    CpuHardeningError, current_page_table_root, enable_boot_hardening, halt_forever,
+};
 use centinela_hal::serial::{init as serial_init, write as serial_write};
 use centinela_kernel::memory::pmm::{BITMAP_WORDS, LimineMemoryMapResponse, Pmm};
+use centinela_kernel::memory::vmm::{
+    BootPagingInfo, HhdmOffset, HhdmPageTableMemory, PageTableWalker, VirtAddr,
+};
 
 const LIMINE_COMMON_MAGIC: [u64; 2] = [0xc7b1_dd30_df4c_8b88, 0x0a82_e883_a194_f07b];
 
@@ -97,6 +102,7 @@ static mut LIMINE_REQUESTS: LimineRequests = LimineRequests {
 static mut FRAME_BITMAP: [u64; BITMAP_WORDS] = [0; BITMAP_WORDS];
 static mut ALLOCATED_BITMAP: [u64; BITMAP_WORDS] = [0; BITMAP_WORDS];
 static mut PMM_STATE: MaybeUninit<Pmm<'static>> = MaybeUninit::uninit();
+static mut BOOT_PAGING_INFO: MaybeUninit<BootPagingInfo> = MaybeUninit::uninit();
 
 fn initialize_memory() -> bool {
     // Limine sets the third base-revision field to zero when the requested
@@ -133,6 +139,72 @@ fn initialize_memory() -> bool {
     if hhdm_revision != 0 || hhdm_offset & 0xfff != 0 {
         serial_write("Centinela-OS: unsupported or invalid HHDM response.\r\n");
         return false;
+    }
+
+    let hhdm_offset = match HhdmOffset::new(hhdm_offset) {
+        Ok(offset) => offset,
+        Err(_) => {
+            serial_write("Centinela-OS: HHDM offset is not canonical.\r\n");
+            return false;
+        }
+    };
+    let paging_info = match BootPagingInfo::new(current_page_table_root(), hhdm_offset) {
+        Ok(info) => info,
+        Err(_) => {
+            serial_write("Centinela-OS: active CR3 root is invalid or not HHDM-addressable.\r\n");
+            return false;
+        }
+    };
+    // The Limine protocol guarantees that its page-table pages are in
+    // bootloader-reclaimable memory, which is mapped by the revision-5 HHDM.
+    // The reader checks each complete table frame against that map before use.
+    // SAFETY: Limine's response and entry pointers remain valid throughout boot;
+    // the requested and accepted base revision is 5 and the HHDM stays active.
+    let table_memory = match unsafe { HhdmPageTableMemory::new(hhdm_offset, memory_map) } {
+        Ok(memory) => memory,
+        Err(_) => {
+            serial_write("Centinela-OS: invalid HHDM page-table memory map.\r\n");
+            return false;
+        }
+    };
+    let walker = PageTableWalker::new(&table_memory, paging_info.root_physical());
+    let root_alias = match walker.translate(paging_info.root_virtual()) {
+        Ok(translation) => translation,
+        Err(_) => {
+            serial_write("Centinela-OS: active page-table root is not readable through HHDM.\r\n");
+            return false;
+        }
+    };
+    if root_alias.physical_address != paging_info.root_physical().get() {
+        serial_write("Centinela-OS: HHDM root translation mismatch.\r\n");
+        return false;
+    }
+
+    let kernel_entry = match VirtAddr::new(_start as *const () as usize as u64) {
+        Ok(address) => address,
+        Err(_) => {
+            serial_write("Centinela-OS: kernel entry virtual address is invalid.\r\n");
+            return false;
+        }
+    };
+    let entry_mapping = match walker.translate(kernel_entry) {
+        Ok(translation) => translation,
+        Err(_) => {
+            serial_write("Centinela-OS: kernel entry mapping could not be verified.\r\n");
+            return false;
+        }
+    };
+    if !entry_mapping.executable || entry_mapping.writable {
+        serial_write("Centinela-OS: kernel entry mapping violates RX permissions.\r\n");
+        return false;
+    }
+    serial_write("VMM bootstrap: Limine page-table frames validated through HHDM.\r\n");
+    serial_write("VMM bootstrap: HHDM root alias and kernel RX mapping verified.\r\n");
+
+    // Record the bootloader-owned paging root without switching CR3.
+    // The active page tables remain unchanged.
+    unsafe {
+        addr_of_mut!(BOOT_PAGING_INFO).write(MaybeUninit::new(paging_info));
     }
 
     // The linker exports physical load boundaries, including the PMM bitmap
@@ -193,12 +265,25 @@ pub extern "C" fn _start() -> ! {
     match enable_boot_hardening() {
         Ok(features) => {
             serial_write("CPU hardening: NXE enabled.\r\n");
-            if features.umip { serial_write("CPU hardening: UMIP enabled.\r\n"); }
-            if features.smep { serial_write("CPU hardening: SMEP enabled.\r\n"); }
-            if features.smap { serial_write("CPU hardening: SMAP enabled.\r\n"); }
+            if features.write_protect {
+                serial_write("CPU hardening: CR0.WP enabled.\r\n");
+            }
+            if features.umip {
+                serial_write("CPU hardening: UMIP enabled.\r\n");
+            }
+            if features.smep {
+                serial_write("CPU hardening: SMEP enabled.\r\n");
+            }
+            if features.smap {
+                serial_write("CPU hardening: SMAP enabled.\r\n");
+            }
         }
-        Err(_) => {
+        Err(CpuHardeningError::NxUnsupported) => {
             serial_write("Centinela-OS: mandatory NX support unavailable.\r\n");
+            halt_forever();
+        }
+        Err(CpuHardeningError::FeatureEnableFailed) => {
+            serial_write("Centinela-OS: CPU hardening register verification failed.\r\n");
             halt_forever();
         }
     }

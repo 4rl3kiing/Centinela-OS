@@ -1,9 +1,9 @@
 # Centinela-OS: kernel architecture baseline
 
-**Status:** Proposed baseline  
+**Status:** Migration target approved; staged implementation  
 **Target:** x86_64, legacy BIOS + UEFI  
 **Kernel language:** Rust (`no_std`)  
-**Kernel model:** Modular monolithic
+**Kernel model:** Capability-based hybrid microkernel (target); current bootstrap remains monolithic
 
 ## 1. Goals and non-goals
 
@@ -27,7 +27,7 @@
 
 ## 2. High-level architecture
 
-The initial design is a modular monolithic kernel. Core mechanisms execute in ring 0 to avoid unnecessary IPC/context-switch overhead. User applications and non-essential services execute in ring 3. Subsystems communicate through documented Rust interfaces; the syscall ABI is the controlled boundary between user mode and kernel mode.
+The approved target is a capability-based hybrid microkernel. Ring 0 is restricted to the minimum mechanisms required for protection and scheduling: CPU/interrupt entry, address-space and thread primitives, capability validation, IPC fast paths, and essential memory management. Drivers, filesystems, networking, device management, service management, and ordinary system services are intended to run as isolated Ring 3 processes. Services communicate through bounded, versioned IPC endpoints and transferred capabilities; shared memory is explicit, mapped with least privilege, and never an ambient authority. Performance-critical mechanisms may remain in kernel space only after a documented threat-model and benchmark review.\n\n**Migration status:** this is the target architecture, not a claim that Ring 3, scheduling, IPC, or user-space drivers already exist. The current Limine entry path, PMM, HAL, and security policy crates are retained as bootstrap foundations while the missing mechanisms are implemented in dependency order. No existing boot or memory path is to be removed until its replacement passes BIOS/UEFI QEMU tests.
 
 Logical layers:
 
@@ -40,7 +40,7 @@ Logical layers:
 7. **System interfaces** — syscall dispatch, VFS, IPC, executable loader.
 8. **User space** — init process, service manager, shell, system utilities, desktop/server services.
 
-These are logical boundaries, not a requirement to create a separate crate for every item on day one.
+These are logical boundaries, not a requirement to create a separate crate for every item on day one. The target privilege boundary is strict: only the microkernel mechanisms above execute in Ring 0; policy, protocol, and device services execute in Ring 3 wherever practical.
 
 ## 3. Boot strategy: BIOS and UEFI
 
@@ -165,7 +165,7 @@ Use a staged device strategy:
 5. Input and network devices.
 6. Physical-hardware drivers based on an explicit support matrix.
 
-Drivers must not be allowed to corrupt unrelated kernel state. A future user-space driver model can be considered after the core kernel is stable.
+Drivers are targeted for isolated Ring 3 processes. Until process isolation, IPC, restart supervision, resource capabilities, and IOMMU-backed DMA isolation are validated, drivers remain trusted bootstrap components; no driver is to be moved out of Ring 0 prematurely.
 
 ### 6.6 Storage and VFS
 

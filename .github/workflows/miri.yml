@@ -1,0 +1,33 @@
+name: Miri memory and policy checks
+
+on:
+  push:
+    branches: [main, "hardening/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: miri-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nightly Rust and Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Prepare Miri sysroot
+        run: cargo +nightly miri setup
+
+      - name: Run host-side tests under Miri
+        run: cargo +nightly miri test --workspace --lib --target x86_64-unknown-linux-gnu

@@ -151,19 +151,14 @@ impl<'a> Pmm<'a> {
         }
 
         let frame_count = self.frame_count();
-        for offset in 0..frame_count {
-            let frame = (self.allocation_hint + offset) % frame_count;
-            if !self.is_free(frame) {
-                continue;
-            }
+        let frame = self
+            .find_free_frame(self.allocation_hint, frame_count)
+            .or_else(|| self.find_free_frame(0, self.allocation_hint))?;
 
-            self.set_allocated(frame);
-            self.free_frames -= 1;
-            self.allocation_hint = (frame + 1) % frame_count;
-            return Some((frame as u64) * PAGE_SIZE);
-        }
-
-        None
+        self.set_allocated(frame);
+        self.free_frames -= 1;
+        self.allocation_hint = (frame + 1) % frame_count;
+        Some((frame as u64) * PAGE_SIZE)
     }
 
     /// Releases a frame previously returned by allocate_frame.
@@ -202,6 +197,34 @@ impl<'a> Pmm<'a> {
 
     fn frame_count(&self) -> usize {
         self.bitmap.len() * u64::BITS as usize
+    }
+
+    /// Finds a free frame in [start, end) using word-level bitmap scans.
+    fn find_free_frame(&self, start: usize, end: usize) -> Option<usize> {
+        if start >= end {
+            return None;
+        }
+
+        let mut word_index = start / u64::BITS as usize;
+        let last_word = (end - 1) / u64::BITS as usize;
+        while word_index <= last_word {
+            let word_start = word_index * u64::BITS as usize;
+            let first_bit = start.saturating_sub(word_start);
+            let end_bit = (end - word_start).min(u64::BITS as usize);
+            let lower_mask = u64::MAX << first_bit;
+            let upper_mask = if end_bit == u64::BITS as usize {
+                u64::MAX
+            } else {
+                (1_u64 << end_bit) - 1
+            };
+            let candidates = !self.bitmap[word_index] & lower_mask & upper_mask;
+            if candidates != 0 {
+                return Some(word_start + candidates.trailing_zeros() as usize);
+            }
+            word_index += 1;
+        }
+
+        None
     }
 
     fn is_free(&self, frame: usize) -> bool {
@@ -341,10 +364,68 @@ mod tests {
     }
 
     #[test]
+    fn allocation_scans_words_and_wraps_the_hint() {
+        let mut bitmap = [u64::MAX; 2];
+        let mut allocated = [0_u64; 2];
+        let mut pmm = Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
+        pmm.mark_free_range(1, 128);
+        pmm.allocation_hint = 127;
+
+        assert_eq!(pmm.allocate_frame(), Some(127 * PAGE_SIZE));
+        assert_eq!(pmm.allocate_frame(), Some(PAGE_SIZE));
+        assert_eq!(pmm.free_frames(), 125);
+    }
+
+    #[test]
     fn allocation_returns_none_when_no_frames_are_free() {
         let mut bitmap = [u64::MAX; 1];
         let mut allocated = [0_u64; 1];
         let mut pmm = Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
         assert_eq!(pmm.allocate_frame(), None);
+    }
+}
+
+#[cfg(kani)]
+mod verification {
+    use super::{PAGE_SIZE, Pmm, PmmError};
+
+    #[kani::proof]
+    fn one_allocate_and_free_preserves_frame_accounting() {
+        let start: u64 = kani::any();
+        let end: u64 = kani::any();
+        kani::assume(start <= end);
+        kani::assume(end <= 64);
+
+        let mut bitmap = [u64::MAX; 1];
+        let mut allocated = [0_u64; 1];
+        let mut pmm = match Pmm::new(&mut bitmap, &mut allocated) {
+            Ok(pmm) => pmm,
+            Err(_) => return,
+        };
+
+        pmm.mark_free_range(start, end);
+        pmm.reserve_range(0, 1);
+        let before = pmm.free_frames();
+        match pmm.allocate_frame() {
+            Some(frame) => {
+                assert!(before > 0);
+                assert_eq!(pmm.free_frames(), before - 1);
+                assert_eq!(frame % PAGE_SIZE, 0);
+                assert_eq!(pmm.free_frame(frame), Ok(()));
+                assert_eq!(pmm.free_frames(), before);
+            }
+            None => assert_eq!(before, 0),
+        }
+    }
+
+    #[kani::proof]
+    fn free_rejects_unaligned_addresses() {
+        let address: u64 = kani::any();
+        kani::assume(address & (PAGE_SIZE - 1) != 0);
+
+        let mut bitmap = [u64::MAX; 1];
+        let mut allocated = [0_u64; 1];
+        let mut pmm = Pmm::new(&mut bitmap, &mut allocated).expect("one-word bitmaps are valid");
+        assert_eq!(pmm.free_frame(address), Err(PmmError::FrameOutOfRange));
     }
 }
