@@ -22,8 +22,11 @@ pub trait TlbShootdownTransport {
     /// Invalidates the page on the calling CPU.
     fn invalidate_local(&mut self, address: VirtAddr) -> Result<(), Self::Error>;
 
-    /// Sends the shootdown IPI to one remote CPU. The handler must invalidate
-    /// the requested page and publish completion before acknowledging.
+    /// Sends the shootdown IPI to one remote CPU. The implementation must
+    /// publish preceding page-table writes before delivery (release ordering).
+    /// The handler must acquire those writes, invalidate the requested page,
+    /// and publish completion before acknowledging. Concurrent shootdowns
+    /// must not overwrite one another's request/acknowledgement state.
     fn send_shootdown_ipi(
         &mut self,
         cpu_id: usize,
@@ -31,8 +34,8 @@ pub trait TlbShootdownTransport {
     ) -> Result<(), Self::Error>;
 
     /// Waits for the specified CPU's acknowledgement. Implementations must
-    /// use a bounded timeout and must not report success before invalidation
-    /// has completed on that CPU.
+    /// use a bounded timeout and acquire the handler's completion publication;
+    /// it must not report success before invalidation has completed on that CPU.
     fn wait_for_ack(&mut self, cpu_id: usize) -> Result<(), Self::Error>;
 }
 
