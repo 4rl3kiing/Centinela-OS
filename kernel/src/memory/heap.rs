@@ -442,6 +442,19 @@ mod tests {
     struct HostPages {
         outstanding: usize,
         limit: usize,
+        /// Pages currently handed out, released on drop so tests that end
+        /// with live objects do not leak (Miri checks this).
+        live: Vec<usize>,
+    }
+
+    impl Drop for HostPages {
+        fn drop(&mut self) {
+            let layout = Layout::from_size_align(PAGE, PAGE).unwrap();
+            for &page in &self.live {
+                // SAFETY: Allocated in `alloc_page` with this layout.
+                unsafe { std::alloc::dealloc(page as *mut u8, layout) };
+            }
+        }
     }
 
     // SAFETY: Pages come from the system allocator with page alignment and
@@ -455,6 +468,7 @@ mod tests {
             // SAFETY: Non-zero size layout.
             let page = unsafe { std::alloc::alloc(layout) } as usize;
             self.outstanding += 1;
+            self.live.push(page);
             Some(page)
         }
         fn free_page(&mut self, page: usize) {
@@ -466,6 +480,7 @@ mod tests {
             // SAFETY: Allocated above with the same layout.
             unsafe { std::alloc::dealloc(page as *mut u8, layout) };
             self.outstanding -= 1;
+            self.live.retain(|&p| p != page);
         }
     }
 
@@ -485,6 +500,7 @@ mod tests {
             HostPages {
                 outstanding: 0,
                 limit,
+                live: Vec::new(),
             },
             Counter(7),
         ))
