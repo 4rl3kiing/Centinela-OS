@@ -8,6 +8,8 @@ extern crate alloc;
 // The isolation runtime drives real hardware; it only exists for the kernel
 // target (host builds of this binary are used solely for linting).
 #[cfg(target_os = "none")]
+mod clock;
+#[cfg(target_os = "none")]
 mod ioapic;
 #[cfg(target_os = "none")]
 mod iommu;
@@ -936,6 +938,7 @@ fn init_platform(
             .map(|physical| (&reader, physical))
     };
     power::init(rsdp);
+    clock::init(rsdp);
     iommu::init(memory, kernel_root, rsdp) && ioapic::init(memory, kernel_root, rsdp)
 }
 

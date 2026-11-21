@@ -16,6 +16,7 @@ REQUIRED_MESSAGES=(
     "Framebuffer console: online (readback verified)."
     "VMM hardening: HHDM sealed non-executable"
     "Power: ACPI S5 available"
+    "Clock: wall time "
     "Kernel heap: hardened slab allocator online (canaries, poisoning, randomized slots)."
     "CPU hardening: NXE enabled."
     "CPU hardening: CR0.WP enabled."

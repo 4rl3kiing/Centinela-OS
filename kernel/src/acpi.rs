@@ -234,6 +234,17 @@ pub fn find_s5(dsdt: &[u8]) -> Option<(u8, u8)> {
     None
 }
 
+/// CMOS index of the RTC century register from the FADT (0 = none).
+pub fn rtc_century_register<R: PhysicalReader>(reader: &R, rsdp: u64) -> u8 {
+    find_table(reader, rsdp, b"FACP")
+        .ok()
+        .and_then(|fadt| fadt.get(108).copied())
+        // Indexes 0x00-0x0d are the clock itself; anything past 0x7f does
+        // not exist in standard CMOS.
+        .filter(|&index| (0x0e..0x80).contains(&index))
+        .unwrap_or(0)
+}
+
 /// One DMA-remapping hardware unit (DRHD) from the DMAR table.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DrhdUnit {
