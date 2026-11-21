@@ -1,6 +1,6 @@
 [workspace]
-members = ["kernel", "hal", "security", "userland"]
-exclude = ["fuzz"]
+members = ["kernel", "hal", "security", "userland", "cfs"]
+exclude = ["fuzz", "tools/cfs-tool"]
 resolver = "3"
 
 [workspace.package]

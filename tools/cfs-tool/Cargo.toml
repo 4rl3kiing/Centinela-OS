@@ -1,0 +1,11 @@
+[package]
+name = "cfs-tool"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Host tool for Centinela CFS images: mkfs, fsck, ls, put, get"
+
+[dependencies]
+centinela-cfs = { path = "../../cfs" }
+
+[workspace]

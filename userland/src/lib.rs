@@ -6,6 +6,8 @@
 //! Syscall ABI: number in RAX; arguments in RDI, RSI, RDX, R10, R8, R9;
 //! result in RAX. RCX and R11 are clobbered by SYSCALL.
 
+pub mod nvme;
+
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_MAP_MEMORY: u64 = 10;
 pub const SYS_EXIT: u64 = 12;

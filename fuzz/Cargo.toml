@@ -10,10 +10,18 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 centinela-kernel = { path = "../kernel" }
+centinela-cfs = { path = "../cfs" }
 
 [[bin]]
 name = "pmm_memory_map"
 path = "fuzz_targets/pmm_memory_map.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cfs_mount"
+path = "fuzz_targets/cfs_mount.rs"
 test = false
 doc = false
 bench = false

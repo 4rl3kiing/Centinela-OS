@@ -35,7 +35,7 @@ use centinela_security::permissions::PagePermissions;
 const KERNEL_STACK_SIZE: usize = 16 * 1024;
 pub(crate) const USER_CODE_BASE: u64 = 0x0000_0000_0040_0000;
 pub(crate) const USER_STACK_TOP: u64 = 0x0000_7fff_0000_0000;
-const USER_STACK_PAGES: u64 = 4;
+const USER_STACK_PAGES: u64 = 64;
 /// Finds a kernel-half PML4 slot the bootloader left empty. With KASLR the
 /// kernel image and the HHDM move on every boot, so no fixed address is safe
 /// for device mappings; an empty top-level slot cannot collide with either.

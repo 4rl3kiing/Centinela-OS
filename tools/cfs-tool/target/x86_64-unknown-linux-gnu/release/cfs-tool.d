@@ -1,0 +1,1 @@
+/home/claude/centinela-os/tools/cfs-tool/target/x86_64-unknown-linux-gnu/release/cfs-tool: /home/claude/centinela-os/cfs/src/crc32c.rs /home/claude/centinela-os/cfs/src/lib.rs /home/claude/centinela-os/tools/cfs-tool/src/main.rs

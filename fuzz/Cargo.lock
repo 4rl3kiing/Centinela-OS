@@ -21,9 +21,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "centinela-cfs"
+version = "0.1.0"
+
+[[package]]
 name = "centinela-fuzz"
 version = "0.0.0"
 dependencies = [
+ "centinela-cfs",
  "centinela-kernel",
  "libfuzzer-sys",
 ]

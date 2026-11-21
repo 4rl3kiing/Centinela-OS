@@ -46,7 +46,7 @@ use centinela_kernel::elf::{self, ElfError};
 use centinela_security::permissions::PagePermissions;
 
 const MAX_TASKS: usize = 8;
-const ENDPOINT_COUNT: usize = 8;
+const ENDPOINT_COUNT: usize = 9;
 /// Interrupt vectors reserved for IRQs bound to Ring 3 drivers.
 pub(crate) const DEVICE_VECTOR_BASE: u64 = 0x24;
 const MAX_IRQ_ROUTES: usize = 4;
@@ -97,6 +97,8 @@ const ENDPOINT_FS: usize = 5;
 const ENDPOINT_NET: usize = 6;
 /// Capability broker that mints badged filesystem capabilities.
 const ENDPOINT_BROKER: usize = 7;
+/// Persistent storage service (NVMe + CFS).
+const ENDPOINT_STORAGE: usize = 8;
 
 /// Why a driver's device access was refused (always fatal for the task).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -272,6 +274,9 @@ struct TaskSpec {
     device: Option<DeviceGrant>,
     /// Start-up argument delivered in RCX (4th SysV argument of `_start`).
     arg: u64,
+    /// Badge minted on this task's initial SEND capabilities (0 = unbadged),
+    /// so a server can tell clients apart from their first request.
+    badge: u64,
     expect: Expect,
 }
 
@@ -1241,7 +1246,17 @@ fn spawn(
     for (slot, grant) in raw.iter_mut().zip(spec.endpoints) {
         if let Some((endpoint, rights)) = grant {
             *slot = endpoints
-                .insert(EndpointCap { endpoint, badge: 0 }, rights)
+                .insert(
+                    EndpointCap {
+                        endpoint,
+                        badge: if rights.contains(RECEIVE) {
+                            0
+                        } else {
+                            spec.badge
+                        },
+                    },
+                    rights,
+                )
                 .map_err(fail("capability grant failed"))?
                 .to_raw();
         }
@@ -1772,6 +1787,7 @@ const fn isolated(
         supervisor: None,
         device: None,
         arg: 0,
+        badge: 0,
         expect,
     }
 }
@@ -1798,6 +1814,7 @@ const fn init_client(
         supervisor: None,
         device: None,
         arg: 0,
+        badge: 0,
         expect,
     }
 }
@@ -1969,6 +1986,7 @@ pub fn run_self_test(
                 supervisor: None,
                 device: None,
                 arg: 0,
+                badge: 0,
                 expect,
             };
             let elf_tasks = [
@@ -2028,6 +2046,7 @@ pub fn run_self_test(
             supervisor: None,
             device: None,
             arg: 0,
+            badge: 0,
             expect: Expect::Service { restarts: 0 },
         },
         TaskSpec {
@@ -2043,6 +2062,7 @@ pub fn run_self_test(
             supervisor: Some(ENDPOINT_INIT),
             device: None,
             arg: 0,
+            badge: 0,
             expect: Expect::Service { restarts: 1 },
         },
         init_client(
@@ -2099,6 +2119,7 @@ pub fn run_self_test(
     let badges_ok = run_badge_scenario(memory, kernel_root, hhdm, &module);
     let network_ok = run_network_scenario(memory, kernel_root, hhdm, &module);
     let storage_ok = run_storage_scenario(memory, kernel_root, hhdm, &module);
+    let persistence_ok = run_persistence_scenario(memory, kernel_root, hhdm, &module);
     let ap_ok = ap_started && crate::smp::wait_done(0) && {
         let passed = AP_RESULT.load(core::sync::atomic::Ordering::Acquire);
         passed == AP_TASKS as u32 + 1
@@ -2114,6 +2135,7 @@ pub fn run_self_test(
         && scenario_passed == scenario.len()
         && drivers_ok
         && storage_ok
+        && persistence_ok
         && services_ok
         && badges_ok
         && network_ok
@@ -2232,6 +2254,7 @@ fn run_network_scenario(
                 mmio: Some(mmio),
             }),
             arg: MMIO_BASE,
+            badge: 0,
             expect: Expect::Exit(0),
         },
         TaskSpec {
@@ -2252,6 +2275,7 @@ fn run_network_scenario(
                 mmio: None,
             }),
             arg: 0,
+            badge: 0,
             expect: Expect::Device(DeviceViolation::NoDmaDomain),
         },
     ];
@@ -2318,6 +2342,7 @@ fn run_storage_scenario(
             mmio: Some((mmio.0, mmio.1.min(MMIO_LIMIT))),
         }),
         arg: MMIO_BASE,
+        badge: 0,
         expect: Expect::Exit(0),
     }];
     let outcomes = run_system(memory, kernel_root, hhdm, &tasks);
@@ -2338,6 +2363,88 @@ fn run_storage_scenario(
         }
     );
     passed == tasks.len() && blocked
+}
+
+/// Phase 7 persistence: a Ring 3 storage service (NVMe driver + CFS) mounts
+/// the volume, counts boots across reboots and serves badged clients.
+fn run_persistence_scenario(
+    memory: &mut HhdmFrameMemory<'_, '_>,
+    kernel_root: PhysAddr,
+    hhdm: HhdmOffset,
+    module: &dyn Fn(&str) -> Option<&'static [u8]>,
+) -> bool {
+    let mut writer = SerialWriter;
+    let (Some(storage), Some(client)) = (module("storage"), module("storage-client")) else {
+        serial_write("Centinela-OS: storage modules missing.\r\n");
+        return false;
+    };
+    let Some(controller) = crate::pci::find_class(0x01, 0x08, 0x02) else {
+        serial_write("Persistence: no NVMe controller present; scenario skipped.\r\n");
+        return true;
+    };
+    let Some(mmio) = crate::pci::mem_bar0(controller) else {
+        return false;
+    };
+    let client_task = |name, role, arg, badge| TaskSpec {
+        name,
+        role,
+        program: Image::Elf(client),
+        extra_syscalls: IPC_SYSCALLS,
+        endpoints: [Some((ENDPOINT_STORAGE, SEND)), None, None],
+        process: None,
+        manage_processes: false,
+        manage_memory: false,
+        priority: false,
+        supervisor: None,
+        device: None,
+        arg,
+        badge,
+        expect: Expect::Exit(0),
+    };
+    let tasks = [
+        TaskSpec {
+            name: "storage",
+            role: "Ring 3 storage: NVMe driver + CFS, files owned by badge",
+            program: Image::Elf(storage),
+            extra_syscalls: IPC_SYSCALLS
+                | (1 << Syscall::DmaAlloc as u8)
+                | (1 << Syscall::Sleep as u8),
+            endpoints: [Some((ENDPOINT_STORAGE, RECEIVE)), None, None],
+            process: None,
+            manage_processes: false,
+            manage_memory: false,
+            priority: true,
+            supervisor: None,
+            device: Some(DeviceGrant {
+                ports: [(0, 0), (0, 0)],
+                irq: None,
+                dma: Some(controller),
+                mmio: Some((mmio.0, mmio.1.min(MMIO_LIMIT))),
+            }),
+            arg: MMIO_BASE,
+            badge: 0,
+            expect: Expect::Service { restarts: 0 },
+        },
+        client_task("storage-client", "saves and reads back a note", 1, 0x501),
+        client_task(
+            "storage-fuzzer",
+            "malformed requests and another owner's file",
+            2,
+            0x502,
+        ),
+    ];
+    let outcomes = run_system(memory, kernel_root, hhdm, &tasks);
+    let passed = outcomes
+        .iter()
+        .flatten()
+        .filter(|outcome| report(outcome))
+        .count();
+    let _ = write!(
+        writer,
+        "Persistence: {passed}/{} storage service checks passed.\r\n",
+        tasks.len()
+    );
+    passed == tasks.len()
 }
 
 /// Identity and revocation: a broker mints badged filesystem capabilities;
@@ -2368,6 +2475,7 @@ fn run_badge_scenario(
         supervisor: None,
         device: None,
         arg,
+        badge: 0,
         expect,
     };
     let tenant = |name, role, arg, expect| {
@@ -2469,6 +2577,7 @@ fn run_services_scenario(
         supervisor: None,
         device: None,
         arg: 0,
+        badge: 0,
         expect,
     };
     let device_syscalls = (1 << Syscall::PortIo as u8) | (1 << Syscall::IrqAck as u8);
@@ -2568,6 +2677,7 @@ fn run_driver_scenario(
         supervisor: None,
         device,
         arg: 0,
+        badge: 0,
         expect,
     };
     let tasks = [

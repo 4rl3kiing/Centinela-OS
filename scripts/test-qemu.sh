@@ -24,6 +24,10 @@ REQUIRED_MESSAGES=(
     "SMP: 3 application processors online (isolated, parked"
     "IOMMU: DMA remapping enabled on 1 unit(s), deny-by-default"
     "Drivers: 5/5 Ring 3 driver checks passed"
+    "storage: welcome.txt written by the host tool: Hola desde el host"
+    "[task storage-client] storage-client: saved and read back nota.txt"
+    "[task storage-fuzzer] storage-fuzzer: 6/6 malformed requests refused"
+    "Persistence: 3/3 storage service checks passed."
     "Services: 5/5 checks passed"
     "Capabilities: 5/5 badge and revocation checks passed."
     "Network: 2/2 DMA driver checks passed; out-of-domain DMA blocked by the IOMMU."
@@ -54,7 +58,7 @@ REQUIRED_MESSAGES=(
     "[task hello] kernel pointer rejected with EFAULT"
     "Isolation: 12/12 tasks behaved as required; kernel still running."
     "Scheduler: preemptive time slicing verified (both CPU-bound tasks finished)."
-    "Boot modules: 13 verified by the boot chain."
+    "Boot modules: 15 verified by the boot chain."
     "[task elf-hello] hello from a Rust ELF loaded from a verified boot module"
     "[task elf-hello] mapped 2 zeroed anonymous RW pages with MapMemory"
     "ELF loader: refused elf-wx: segment both writable and executable (W^X); nothing was mapped or executed."
@@ -105,6 +109,17 @@ SHELL
 # Scratch disk for the NVMe driver scenario (contents are not preserved).
 NVME_IMAGE=build/nvme.img
 dd if=/dev/zero of="$NVME_IMAGE" bs=1M count=4 status=none
+# The NVMe disk is shared by every boot of this run: the host tool formats it
+# and stores a file, each boot's storage service increments a persistent boot
+# counter, and the host fsck checks the result at the end.
+CFS_TOOL=tools/cfs-tool/target/x86_64-unknown-linux-gnu/release/cfs-tool
+cargo build -q --release --manifest-path tools/cfs-tool/Cargo.toml --target x86_64-unknown-linux-gnu
+# The volume spans the disk minus its last 4 KiB (NVMe self-test block),
+# exactly what the storage service uses.
+"$CFS_TOOL" mkfs "$NVME_IMAGE" centinela 1023 >/dev/null
+printf 'Hola desde el host' >build/welcome.txt
+"$CFS_TOOL" put "$NVME_IMAGE" welcome.txt build/welcome.txt
+BOOTS_WITH_STORAGE=0
 
 # run_and_check MODE [extra required message...] -- QEMU ARGS...
 run_and_check() {
@@ -139,6 +154,7 @@ run_and_check() {
         || grep -F "Centinela-OS: " "$log" | grep -vF "Centinela-OS: Rust kernel entry reached." >/dev/null; then
         fail "$log" "$stderr" "Kernel reported a failure during $mode boot"
     fi
+    BOOTS_WITH_STORAGE=$((BOOTS_WITH_STORAGE + 1))
     echo "PASS: $mode boot reached every bootstrap milestone"
 }
 
@@ -253,3 +269,15 @@ if [[ "$bases" -lt 2 ]]; then
     exit 1
 fi
 echo "PASS: KASLR randomized the kernel base across boots ($bases distinct bases)"
+
+# Persistence: the disk written by every boot above must still be a clean
+# CFS volume for the host tool, and the boot counter must have survived
+# every reboot (one increment per boot, the screen boot included).
+"$CFS_TOOL" fsck "$NVME_IMAGE" || { echo "CFS fsck failed on the disk written by Centinela-OS" >&2; exit 1; }
+count=$("$CFS_TOOL" get "$NVME_IMAGE" boot-count)
+expected=$((BOOTS_WITH_STORAGE + 1))
+if [[ "$count" != "$expected" ]]; then
+    echo "Persistence check failed: boot-count is '$count', expected $expected" >&2
+    exit 1
+fi
+echo "PASS: CFS volume clean after $count boots; data persisted across reboots"

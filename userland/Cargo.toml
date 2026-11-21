@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+centinela-cfs = { path = "../cfs" }
 
 [lints]
 workspace = true
@@ -85,5 +86,17 @@ bench = false
 [[bin]]
 name = "nvme-driver"
 path = "src/bin/nvme_driver.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "storage"
+path = "src/bin/storage.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "storage-client"
+path = "src/bin/storage_client.rs"
 test = false
 bench = false
