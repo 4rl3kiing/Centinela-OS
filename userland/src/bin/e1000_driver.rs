@@ -163,6 +163,9 @@ pub extern "C" fn _start(_unused: u64, _unused2: u64, _unused3: u64, mmio: u64) 
     // Wait for the ARP reply from the gateway (any slot).
     let mut gateway = None;
     let found = wait_for(300, || {
+        // Re-arming the tail makes QEMU flush any frame it queued while the
+        // receiver was not ready (harmless on hardware: same value).
+        nic.write(RDT, DESCRIPTORS - 1);
         for index in 0..DESCRIPTORS as usize {
             if get(rx_ring, index * 16 + 12) & 1 == 0 {
                 continue;
