@@ -98,3 +98,30 @@ is a new attack surface, so each one starts in a denied state.
   handed out by init, are the next step.
 - The scheduler idles with `sti; hlt` only while a driver waits for
   hardware and non-service work remains, with a bound of 500 wake-ups.
+
+## Follow-up (2026-11-21, same day)
+
+The limits listed above were addressed in this order:
+
+1. **Badged endpoints and revocation.** Servers receive the sender's badge
+   in RDI. Only an unbadged minter capability can mint a badge, and badges
+   never change afterwards. `Revoke` removes every copy of a badge from
+   every task. ramfs keys files by badge, and a broker hands out badged
+   capabilities. Tested in CI: tenant isolation, revocation, and a refused
+   re-mint.
+2. **Per-device IOMMU domains.** VT-d second-level tables give each device
+   its own domain. `DmaAlloc` maps pages into both the driver and the
+   device domain. Device BARs are granted as user MMIO, which is never
+   freed as RAM. A Ring 3 e1000 driver exchanges ARP frames by DMA, and a
+   descriptor pointing outside its domain is blocked (the fault is
+   recorded).
+3. **Tasks on application processors.** The per-CPU entry blocks
+   (`SWAPGS`), the AP stacks and the AP descriptor tables now live in the
+   trampoline. Each CPU has its own task system, the PMM is shared behind
+   a lock, and console output takes a cross-CPU lock. CPU 1 runs its own
+   partition concurrently with the BSP.
+4. **KVM.** CI now runs the full boot suite under KVM as well as TCG.
+   Making it pass required wall-time based tests and a `Sleep` syscall
+   (drivers no longer busy-wait). The measured IPC round trip is about
+   2,700 TSC cycles under KVM, against 30,000–66,000 under TCG. Physical
+   hardware remains untested; see `docs/hardware-testing.md`.
