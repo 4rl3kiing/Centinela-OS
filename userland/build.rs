@@ -19,6 +19,7 @@ fn main() {
             ("broker", "link.ld"),
             ("badge-client", "link.ld"),
             ("e1000-driver", "link.ld"),
+            ("nvme-driver", "link.ld"),
         ] {
             println!("cargo:rustc-link-arg-bin={bin}=-T{manifest}/{script}");
             // Fixed-address static executable (ET_EXEC) from PIC code.
