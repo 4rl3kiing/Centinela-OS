@@ -160,10 +160,20 @@ core::arch::global_asm!(
     "    sub rsi, rdi",
     "    mov eax, 1",
     "    syscall",
-    "    mov r12d, 30000000",
+    // Spin for ~300 million TSC cycles of wall time (well over one 20 ms
+    // quantum on any CPU speed, emulated or hardware-virtualized), so the
+    // timer must preempt it; never yields.
+    "    rdtsc",
+    "    shl rdx, 32",
+    "    or rax, rdx",
+    "    mov r12, rax",
     ".Lworker_loop:",
-    "    dec r12",
-    "    jnz .Lworker_loop",
+    "    rdtsc",
+    "    shl rdx, 32",
+    "    or rax, rdx",
+    "    sub rax, r12",
+    "    cmp rax, 300000000",
+    "    jb .Lworker_loop",
     "    lea rdi, [rip + .Lworker_done_msg]",
     "    lea rsi, [rip + .Lworker_done_msg_end]",
     "    sub rsi, rdi",

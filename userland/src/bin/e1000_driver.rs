@@ -66,14 +66,21 @@ fn put_u64(base: *mut u8, offset: usize, value: u64) {
     put(base, offset, &value.to_le_bytes());
 }
 
+/// Polls `done` for up to ~800 million TSC cycles of wall time, so the
+/// timeout holds on emulated and hardware-virtualized CPUs alike.
 fn spin_until(mut done: impl FnMut() -> bool) -> bool {
-    (0..20_000_000u32).any(|_| {
-        let finished = done();
-        if !finished {
-            core::hint::spin_loop();
+    // SAFETY: RDTSC is unprivileged (CR4.TSD clear).
+    let start = unsafe { core::arch::x86_64::_rdtsc() };
+    loop {
+        if done() {
+            return true;
         }
-        finished
-    })
+        // SAFETY: As above.
+        if unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start) > 800_000_000 {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
 }
 
 #[unsafe(no_mangle)]
