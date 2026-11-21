@@ -16,6 +16,7 @@ REQUIRED_MESSAGES=(
     "CPU hardening: NXE enabled."
     "CPU hardening: CR0.WP enabled."
     "SMP: 3 application processors online (isolated, parked"
+    "IOMMU: DMA remapping enabled on 1 unit(s), deny-by-default"
     "Limine base revision 5 accepted."
     "VMM bootstrap: Limine page-table frames validated through HHDM."
     "VMM bootstrap: HHDM root alias and kernel RX mapping verified."
@@ -69,7 +70,7 @@ run_and_check() {
     local stderr="build/logs/qemu-$mode.stderr"
     : >"$log"
     set +e
-    timeout "$TIMEOUT_SECONDS" "$QEMU" -machine q35 -m 512M -smp 4 -display none -monitor none \
+    timeout "$TIMEOUT_SECONDS" "$QEMU" -machine q35 -m 512M -smp 4 -device intel-iommu -display none -monitor none \
         -serial "file:$log" -no-reboot -no-shutdown "$@" >"$stderr" 2>&1
     local status=$?
     set -e

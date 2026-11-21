@@ -5,6 +5,8 @@
 // The isolation runtime drives real hardware; it only exists for the kernel
 // target (host builds of this binary are used solely for linting).
 #[cfg(target_os = "none")]
+mod iommu;
+#[cfg(target_os = "none")]
 mod isolation;
 #[cfg(target_os = "none")]
 mod smp;
@@ -70,6 +72,7 @@ struct LimineRequests {
     memory_map: LimineRequest,
     executable_address: LimineRequest,
     modules: LimineRequest,
+    rsdp: LimineRequest,
     #[cfg(target_os = "none")]
     mp: smp::LimineMpRequest,
     end_marker: [u64; 2],
@@ -157,6 +160,17 @@ static mut LIMINE_REQUESTS: LimineRequests = LimineRequests {
             LIMINE_COMMON_MAGIC[1],
             0x3e7e_2797_02be_32af,
             0xca1c_4f3b_d128_0cee,
+        ],
+        revision: 0,
+        response: core::ptr::null_mut(),
+    },
+    // ACPI root pointer (HHDM virtual address in base revision 5): DMAR.
+    rsdp: LimineRequest {
+        id: [
+            LIMINE_COMMON_MAGIC[0],
+            LIMINE_COMMON_MAGIC[1],
+            0xc5e7_7b6b_397e_7b43,
+            0x2763_7845_accd_cf3c,
         ],
         revision: 0,
         response: core::ptr::null_mut(),
@@ -590,6 +604,9 @@ fn run_isolation(
     if !isolation::init_cpu_layer(memory, kernel_root, hhdm) {
         halt_forever();
     }
+    if !init_iommu(memory, kernel_root, hhdm) {
+        halt_forever();
+    }
     // SAFETY: BSP, IF=0, GDT/IDT loaded; the request lives in the Limine
     // request section and was answered before the kernel was entered.
     if !unsafe { smp::start(memory, kernel_root, &raw const LIMINE_REQUESTS.mp) } {
@@ -603,6 +620,66 @@ fn run_isolation(
     } else {
         serial_write("Centinela-OS: microkernel self-test failed.\r\n");
     }
+}
+
+/// True if `[start, end)` lies inside one ACPI memory-map region.
+#[cfg(target_os = "none")]
+fn in_acpi_memory(start: u64, end: u64) -> bool {
+    use centinela_kernel::memory::pmm::{LimineMemoryMapEntry, LimineMemoryMapResponse};
+    // SAFETY: Response written by Limine before entry; never reclaimed (the
+    // PMM only allocates USABLE frames).
+    let response = unsafe {
+        addr_of!(LIMINE_REQUESTS.memory_map.response)
+            .read_volatile()
+            .cast::<LimineMemoryMapResponse>()
+    };
+    if response.is_null() {
+        return false;
+    }
+    // SAFETY: Validated by the PMM during boot (count bounded, entries non-null).
+    let (count, entries) = unsafe { ((*response).entry_count, (*response).entries) };
+    (0..count.min(4096) as usize).any(|index| {
+        // SAFETY: `index < entry_count`.
+        let entry: *const LimineMemoryMapEntry = unsafe { entries.add(index).read() };
+        if entry.is_null() {
+            return false;
+        }
+        // SAFETY: Non-null Limine entry.
+        let entry = unsafe { entry.read() };
+        matches!(entry.entry_type, 2 | 3 | 8)
+            && entry.base <= start
+            && entry
+                .base
+                .checked_add(entry.length)
+                .is_some_and(|limit| end <= limit)
+    })
+}
+
+#[cfg(target_os = "none")]
+fn init_iommu(
+    memory: &mut HhdmFrameMemory<'_, '_>,
+    kernel_root: PhysAddr,
+    hhdm: HhdmOffset,
+) -> bool {
+    let base = hhdm.get();
+    // SAFETY: Response pointer written by Limine before entry.
+    let response =
+        unsafe { addr_of!(LIMINE_REQUESTS.rsdp.response).read_volatile() }.cast::<[u64; 2]>();
+    let reader = iommu::AcpiReader {
+        hhdm: base,
+        in_acpi_memory,
+    };
+    let rsdp = if response.is_null() {
+        None
+    } else {
+        // SAFETY: Limine RSDP response {revision, address}; the address is an
+        // HHDM virtual address in base revision 5.
+        let address = unsafe { (*response)[1] };
+        address
+            .checked_sub(base)
+            .map(|physical| (&reader, physical))
+    };
+    iommu::init(memory, kernel_root, rsdp)
 }
 
 #[cfg(not(target_os = "none"))]

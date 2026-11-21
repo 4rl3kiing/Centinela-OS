@@ -245,6 +245,10 @@ impl HhdmOffset {
         Ok(Self(offset))
     }
 
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
     pub const fn physical_to_virtual(self, physical: PhysAddr) -> Result<VirtAddr, AddressError> {
         match self.0.checked_add(physical.0) {
             Some(value) if is_canonical(value) => Ok(VirtAddr(value)),

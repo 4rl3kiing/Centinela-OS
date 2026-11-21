@@ -39,7 +39,7 @@ const USER_STACK_PAGES: u64 = 4;
 /// Finds a kernel-half PML4 slot the bootloader left empty. With KASLR the
 /// kernel image and the HHDM move on every boot, so no fixed address is safe
 /// for device mappings; an empty top-level slot cannot collide with either.
-fn free_kernel_slot_address(
+pub(crate) fn free_kernel_slot_address(
     memory: &HhdmFrameMemory<'_, '_>,
     kernel_root: PhysAddr,
 ) -> Option<u64> {
