@@ -7,6 +7,8 @@
 #[cfg(target_os = "none")]
 mod isolation;
 #[cfg(target_os = "none")]
+mod smp;
+#[cfg(target_os = "none")]
 mod system;
 #[cfg(target_os = "none")]
 mod user_programs;
@@ -68,6 +70,8 @@ struct LimineRequests {
     memory_map: LimineRequest,
     executable_address: LimineRequest,
     modules: LimineRequest,
+    #[cfg(target_os = "none")]
+    mp: smp::LimineMpRequest,
     end_marker: [u64; 2],
 }
 
@@ -156,6 +160,19 @@ static mut LIMINE_REQUESTS: LimineRequests = LimineRequests {
         ],
         revision: 0,
         response: core::ptr::null_mut(),
+    },
+    // Application processors stay in Limine's parking loop until released.
+    #[cfg(target_os = "none")]
+    mp: smp::LimineMpRequest {
+        id: [
+            LIMINE_COMMON_MAGIC[0],
+            LIMINE_COMMON_MAGIC[1],
+            0x95a6_7b81_9a1b_857e,
+            0xa0b6_1b72_3b6a_73e0,
+        ],
+        revision: 0,
+        response: core::ptr::null_mut(),
+        flags: 0,
     },
     end_marker: [0xadc0_e053_1bb1_0d03, 0x9572_709f_3176_4c62],
 };
@@ -510,6 +527,8 @@ extern "C" fn kernel_main() -> ! {
     // IF clear) and only supervisor mappings exist at this point.
     match unsafe { enable_boot_hardening() } {
         Ok(features) => {
+            #[cfg(target_os = "none")]
+            smp::record_bsp_hardening(features);
             serial_write("CPU hardening: NXE enabled.\r\n");
             if features.write_protect {
                 serial_write("CPU hardening: CR0.WP enabled.\r\n");
@@ -569,6 +588,11 @@ fn run_isolation(
     modules: &[(&'static str, &'static [u8])],
 ) {
     if !isolation::init_cpu_layer(memory, kernel_root, hhdm) {
+        halt_forever();
+    }
+    // SAFETY: BSP, IF=0, GDT/IDT loaded; the request lives in the Limine
+    // request section and was answered before the kernel was entered.
+    if !unsafe { smp::start(memory, kernel_root, &raw const LIMINE_REQUESTS.mp) } {
         halt_forever();
     }
     if system::run_self_test(memory, kernel_root, hhdm, modules) {

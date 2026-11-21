@@ -31,6 +31,10 @@ pub const IST_DOUBLE_FAULT: u8 = 1;
 pub const IST_NMI: u8 = 2;
 pub const IST_MACHINE_CHECK: u8 = 3;
 
+/// Application processors that receive their own GDT/TSS. CPUs beyond this
+/// bound are never released from the bootloader's parking loop.
+pub const MAX_APS: usize = 7;
+
 // Raw descriptors are consumed only by the freestanding runtime.
 #[cfg_attr(not(target_os = "none"), allow(dead_code))]
 const KERNEL_CODE: u64 = 0x00af_9a00_0000_ffff;
@@ -113,7 +117,7 @@ pub struct TssStacks {
 #[cfg(target_os = "none")]
 mod runtime {
     use super::*;
-    use core::ptr::{addr_of, addr_of_mut};
+    use core::ptr::addr_of_mut;
 
     // KPTI: the CPU reads the GDT and TSS on every ring transition, so they
     // live in the entry trampoline that stays mapped in task page tables.
@@ -128,6 +132,15 @@ mod runtime {
         base: u64,
     }
 
+    // Application processors get private descriptor tables: a TSS holds the
+    // per-CPU rsp0 and IST stacks and is marked busy by `ltr`, so sharing one
+    // between CPUs is architecturally invalid. They stay outside the KPTI
+    // trampoline while APs never run Ring 3 code (least exposure); move them
+    // into `.data.entry` before scheduling tasks on APs.
+    static mut AP_TSS: [TaskStateSegment; MAX_APS] = [const { TaskStateSegment::new() }; MAX_APS];
+    static mut AP_GDT: [[u64; 7]; MAX_APS] =
+        [[0, KERNEL_CODE, KERNEL_DATA, USER_DATA, USER_CODE, 0, 0]; MAX_APS];
+
     /// Installs the GDT and TSS and reloads every segment register.
     ///
     /// # Safety
@@ -136,21 +149,48 @@ mod runtime {
     /// and reserved for its purpose for the lifetime of the kernel.
     pub unsafe fn init(stacks: TssStacks) {
         // SAFETY: Single-threaded bootstrap; no other reference to TSS/GDT exists.
-        unsafe {
-            let tss = &mut *addr_of_mut!(TSS);
-            tss.rsp[0] = stacks.privilege0;
-            tss.ist[usize::from(IST_DOUBLE_FAULT) - 1] = stacks.double_fault;
-            tss.ist[usize::from(IST_NMI) - 1] = stacks.nmi;
-            tss.ist[usize::from(IST_MACHINE_CHECK) - 1] = stacks.machine_check;
+        unsafe { load(addr_of_mut!(GDT), addr_of_mut!(TSS), stacks) }
+    }
 
-            let (low, high) = tss_descriptor(addr_of!(TSS) as u64);
-            let gdt = &mut *addr_of_mut!(GDT);
-            gdt[5] = low;
-            gdt[6] = high;
+    /// Installs the private GDT/TSS of application processor `index`.
+    /// Returns `false` (and loads nothing) if `index` is out of range.
+    ///
+    /// # Safety
+    /// Same contract as [`init`], executed on the AP itself; each `index` must
+    /// be used by exactly one CPU, exactly once.
+    pub unsafe fn init_ap(index: usize, stacks: TssStacks) -> bool {
+        if index >= MAX_APS {
+            return false;
+        }
+        // SAFETY: Each index is owned by one AP (caller contract); raw element
+        // pointers avoid creating references to the whole shared arrays.
+        unsafe {
+            let gdt = (addr_of_mut!(AP_GDT) as *mut [u64; 7]).add(index);
+            let tss = (addr_of_mut!(AP_TSS) as *mut TaskStateSegment).add(index);
+            load(gdt, tss, stacks);
+        }
+        true
+    }
+
+    /// # Safety
+    /// `gdt` and `tss` must be valid, 'static, owned by the calling CPU.
+    unsafe fn load(gdt: *mut [u64; 7], tss: *mut TaskStateSegment, stacks: TssStacks) {
+        // SAFETY: Guaranteed by the caller.
+        unsafe {
+            let tss_ref = &mut *tss;
+            tss_ref.rsp[0] = stacks.privilege0;
+            tss_ref.ist[usize::from(IST_DOUBLE_FAULT) - 1] = stacks.double_fault;
+            tss_ref.ist[usize::from(IST_NMI) - 1] = stacks.nmi;
+            tss_ref.ist[usize::from(IST_MACHINE_CHECK) - 1] = stacks.machine_check;
+
+            let (low, high) = tss_descriptor(tss as u64);
+            let gdt_ref = &mut *gdt;
+            gdt_ref[5] = low;
+            gdt_ref[6] = high;
 
             let pointer = DescriptorTablePointer {
                 limit: (core::mem::size_of::<[u64; 7]>() - 1) as u16,
-                base: addr_of!(GDT) as u64,
+                base: gdt as u64,
             };
             core::arch::asm!(
                 "lgdt [{pointer}]",
@@ -190,7 +230,7 @@ mod runtime {
 }
 
 #[cfg(target_os = "none")]
-pub use runtime::{init, set_privilege0_stack};
+pub use runtime::{init, init_ap, set_privilege0_stack};
 
 #[cfg(test)]
 mod tests {

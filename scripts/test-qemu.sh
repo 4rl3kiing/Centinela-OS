@@ -6,7 +6,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 ISO="build/centinela-os.iso"
 QEMU="${QEMU:-qemu-system-x86_64}"
-TIMEOUT_SECONDS="${BOOT_TIMEOUT_SECONDS:-20}"
+TIMEOUT_SECONDS="${BOOT_TIMEOUT_SECONDS:-30}"
 test -f "$ISO" || { echo "ISO not found: $ISO (run scripts/build-iso.sh)" >&2; exit 1; }
 command -v "$QEMU" >/dev/null || { echo "QEMU not found: $QEMU" >&2; exit 1; }
 mkdir -p build/logs
@@ -15,6 +15,7 @@ REQUIRED_MESSAGES=(
     "Centinela-OS: Rust kernel entry reached."
     "CPU hardening: NXE enabled."
     "CPU hardening: CR0.WP enabled."
+    "SMP: 3 application processors online (isolated, parked"
     "Limine base revision 5 accepted."
     "VMM bootstrap: Limine page-table frames validated through HHDM."
     "VMM bootstrap: HHDM root alias and kernel RX mapping verified."
@@ -68,7 +69,7 @@ run_and_check() {
     local stderr="build/logs/qemu-$mode.stderr"
     : >"$log"
     set +e
-    timeout "$TIMEOUT_SECONDS" "$QEMU" -machine q35 -m 512M -display none -monitor none \
+    timeout "$TIMEOUT_SECONDS" "$QEMU" -machine q35 -m 512M -smp 4 -display none -monitor none \
         -serial "file:$log" -no-reboot -no-shutdown "$@" >"$stderr" 2>&1
     local status=$?
     set -e

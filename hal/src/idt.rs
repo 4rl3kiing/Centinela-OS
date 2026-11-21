@@ -356,23 +356,36 @@ mod runtime {
                     .unwrap_or(centinela_isr_unexpected as *const () as u64);
                 *entry = IdtEntry::interrupt_gate(address, ist_for_vector(vector as u64));
             }
+        }
+        // SAFETY: The table is fully built above.
+        unsafe { load() };
+    }
 
-            #[repr(C, packed)]
-            struct Pointer {
-                limit: u16,
-                base: u64,
-            }
-            let pointer = Pointer {
-                limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
-                base: addr_of!(IDT) as u64,
-            };
+    /// Loads the (already built) shared IDT on the calling CPU. Gates are
+    /// read-only after `init`, so every CPU can share one table.
+    ///
+    /// # Safety
+    /// CPL 0, interrupts disabled, after `init` has run on the BSP and after
+    /// this CPU loaded a GDT/TSS (gates reference IST slots).
+    pub unsafe fn load() {
+        #[repr(C, packed)]
+        struct Pointer {
+            limit: u16,
+            base: u64,
+        }
+        let pointer = Pointer {
+            limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
+            base: addr_of!(IDT) as u64,
+        };
+        // SAFETY: Guaranteed by the caller; IDT is a 'static table.
+        unsafe {
             core::arch::asm!("lidt [{}]", in(reg) &pointer, options(readonly, nostack, preserves_flags));
         }
     }
 }
 
 #[cfg(target_os = "none")]
-pub use runtime::init;
+pub use runtime::{init, load};
 
 #[cfg(test)]
 mod tests {
