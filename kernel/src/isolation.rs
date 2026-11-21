@@ -44,6 +44,8 @@ pub(crate) const TICK_MS: u32 = 10;
 /// Total CPU time a task may consume before the watchdog terminates it.
 pub(crate) const CPU_BUDGET_MS: u32 = 2_000;
 pub(crate) const CPU_BUDGET_TICKS: u32 = CPU_BUDGET_MS / TICK_MS;
+/// Time slice before a ready task is preempted in favour of another.
+pub(crate) const QUANTUM_TICKS: u32 = 2;
 /// Fallback reload if calibration fails (QEMU's 1 GHz bus / 16 ≈ 10 ms).
 const FALLBACK_INITIAL_COUNT: u32 = 625_000;
 

@@ -97,6 +97,87 @@ impl SyscallFrame {
     }
 }
 
+/// Complete saved user register state of a task that is not running.
+///
+/// Tasks leave the CPU by syscall (blocking IPC), by preemption or by
+/// termination; every resume goes through one IRETQ path that loads this
+/// context with fixed user selectors and RFLAGS.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UserContext {
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rbp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rip: u64,
+    pub rsp: u64,
+}
+
+impl UserContext {
+    /// Context of a task blocked in a syscall. RCX/R11 are clobbered by the
+    /// SYSCALL ABI and are zeroed so no kernel value is ever handed back.
+    pub const fn from_syscall(frame: &SyscallFrame) -> Self {
+        Self {
+            rax: frame.rax,
+            rbx: frame.rbx,
+            rcx: 0,
+            rdx: frame.rdx,
+            rsi: frame.rsi,
+            rdi: frame.rdi,
+            rbp: frame.rbp,
+            r8: frame.r8,
+            r9: frame.r9,
+            r10: frame.r10,
+            r11: 0,
+            r12: frame.r12,
+            r13: frame.r13,
+            r14: frame.r14,
+            r15: frame.r15,
+            rip: frame.rip,
+            rsp: frame.rsp,
+        }
+    }
+
+    /// Context of a task interrupted by the timer (every register is live).
+    pub const fn from_trap(frame: &crate::idt::TrapFrame) -> Self {
+        Self {
+            rax: frame.rax,
+            rbx: frame.rbx,
+            rcx: frame.rcx,
+            rdx: frame.rdx,
+            rsi: frame.rsi,
+            rdi: frame.rdi,
+            rbp: frame.rbp,
+            r8: frame.r8,
+            r9: frame.r9,
+            r10: frame.r10,
+            r11: frame.r11,
+            r12: frame.r12,
+            r13: frame.r13,
+            r14: frame.r14,
+            r15: frame.r15,
+            rip: frame.rip,
+            rsp: frame.rsp,
+        }
+    }
+
+    /// True when the context may be resumed in Ring 3.
+    pub const fn is_resumable(&self) -> bool {
+        self.rip < USER_ADDRESS_LIMIT && self.rsp <= USER_ADDRESS_LIMIT
+    }
+}
+
 #[cfg(target_os = "none")]
 mod runtime {
     use super::*;
@@ -156,9 +237,9 @@ mod runtime {
         "    pop rsp",
         "    sysretq",
         "",
-        // u64 centinela_resume_user(u64 *saved_rsp, const SyscallFrame *frame)
-        // Loads every user register from `frame` and enters Ring 3. Used both
-        // to start a task (fresh frame) and to resume one blocked in a syscall.
+        // u64 centinela_resume_user(u64 *saved_rsp, const UserContext *ctx)
+        // Builds an IRETQ frame (user SS/RSP, fixed RFLAGS, user CS/RIP),
+        // loads every general-purpose register from `ctx` and enters Ring 3.
         ".global centinela_resume_user",
         "centinela_resume_user:",
         "    push rbx",
@@ -168,25 +249,27 @@ mod runtime {
         "    push r14",
         "    push r15",
         "    mov [rdi], rsp",
-        "    mov rcx, [rsi + {off_rip}]",
-        "    mov r11, {user_rflags}",
-        "    mov rax, [rsi + {off_rax}]",
-        "    mov r9, [rsi + {off_r9}]",
-        "    mov r8, [rsi + {off_r8}]",
-        "    mov r10, [rsi + {off_r10}]",
-        "    mov rdx, [rsi + {off_rdx}]",
-        "    mov rdi, [rsi + {off_rdi}]",
-        "    mov rbp, [rsi + {off_rbp}]",
-        "    mov rbx, [rsi + {off_rbx}]",
-        "    mov r12, [rsi + {off_r12}]",
-        "    mov r13, [rsi + {off_r13}]",
-        "    mov r14, [rsi + {off_r14}]",
-        "    mov r15, [rsi + {off_r15}]",
-        // The frame lives in kernel memory, which stays mapped (supervisor)
-        // after the stack switch; RSI is loaded last because it is the base.
-        "    mov rsp, [rsi + {off_rsp}]",
-        "    mov rsi, [rsi + {off_rsi}]",
-        "    sysretq",
+        "    push {user_ss}",
+        "    push qword ptr [rsi + {c_rsp}]",
+        "    push {user_rflags}",
+        "    push {user_cs}",
+        "    push qword ptr [rsi + {c_rip}]",
+        "    mov rax, [rsi + {c_rax}]",
+        "    mov rbx, [rsi + {c_rbx}]",
+        "    mov rcx, [rsi + {c_rcx}]",
+        "    mov rdx, [rsi + {c_rdx}]",
+        "    mov rdi, [rsi + {c_rdi}]",
+        "    mov rbp, [rsi + {c_rbp}]",
+        "    mov r8, [rsi + {c_r8}]",
+        "    mov r9, [rsi + {c_r9}]",
+        "    mov r10, [rsi + {c_r10}]",
+        "    mov r11, [rsi + {c_r11}]",
+        "    mov r12, [rsi + {c_r12}]",
+        "    mov r13, [rsi + {c_r13}]",
+        "    mov r14, [rsi + {c_r14}]",
+        "    mov r15, [rsi + {c_r15}]",
+        "    mov rsi, [rsi + {c_rsi}]",
+        "    iretq",
         "",
         // ! centinela_resume_kernel(u64 saved_rsp, u64 result)
         ".global centinela_resume_kernel",
@@ -202,26 +285,30 @@ mod runtime {
         "    ret",
         entry = sym syscall_entry,
         user_rflags = const USER_RFLAGS,
-        off_rax = const core::mem::offset_of!(SyscallFrame, rax),
-        off_r9 = const core::mem::offset_of!(SyscallFrame, r9),
-        off_r8 = const core::mem::offset_of!(SyscallFrame, r8),
-        off_r10 = const core::mem::offset_of!(SyscallFrame, r10),
-        off_rdx = const core::mem::offset_of!(SyscallFrame, rdx),
-        off_rsi = const core::mem::offset_of!(SyscallFrame, rsi),
-        off_rdi = const core::mem::offset_of!(SyscallFrame, rdi),
-        off_rbp = const core::mem::offset_of!(SyscallFrame, rbp),
-        off_rbx = const core::mem::offset_of!(SyscallFrame, rbx),
-        off_r12 = const core::mem::offset_of!(SyscallFrame, r12),
-        off_r13 = const core::mem::offset_of!(SyscallFrame, r13),
-        off_r14 = const core::mem::offset_of!(SyscallFrame, r14),
-        off_r15 = const core::mem::offset_of!(SyscallFrame, r15),
-        off_rip = const core::mem::offset_of!(SyscallFrame, rip),
-        off_rsp = const core::mem::offset_of!(SyscallFrame, rsp),
+        user_ss = const crate::gdt::USER_DATA_SELECTOR as u64,
+        user_cs = const crate::gdt::USER_CODE_SELECTOR as u64,
+        c_rax = const core::mem::offset_of!(UserContext, rax),
+        c_rbx = const core::mem::offset_of!(UserContext, rbx),
+        c_rcx = const core::mem::offset_of!(UserContext, rcx),
+        c_rdx = const core::mem::offset_of!(UserContext, rdx),
+        c_rsi = const core::mem::offset_of!(UserContext, rsi),
+        c_rdi = const core::mem::offset_of!(UserContext, rdi),
+        c_rbp = const core::mem::offset_of!(UserContext, rbp),
+        c_r8 = const core::mem::offset_of!(UserContext, r8),
+        c_r9 = const core::mem::offset_of!(UserContext, r9),
+        c_r10 = const core::mem::offset_of!(UserContext, r10),
+        c_r11 = const core::mem::offset_of!(UserContext, r11),
+        c_r12 = const core::mem::offset_of!(UserContext, r12),
+        c_r13 = const core::mem::offset_of!(UserContext, r13),
+        c_r14 = const core::mem::offset_of!(UserContext, r14),
+        c_r15 = const core::mem::offset_of!(UserContext, r15),
+        c_rip = const core::mem::offset_of!(UserContext, rip),
+        c_rsp = const core::mem::offset_of!(UserContext, rsp),
     );
 
     unsafe extern "C" {
         fn centinela_syscall_entry();
-        fn centinela_resume_user(saved_rsp: *mut u64, frame: *const SyscallFrame) -> u64;
+        fn centinela_resume_user(saved_rsp: *mut u64, context: *const UserContext) -> u64;
         fn centinela_resume_kernel(saved_rsp: u64, result: u64) -> !;
     }
 
@@ -279,29 +366,29 @@ mod runtime {
         }
     }
 
-    /// Enters Ring 3 with the registers in `frame` and runs until the kernel
-    /// calls [`resume_kernel`]; returns the value passed to it.
+    /// Enters Ring 3 with the registers in `context` and runs until the
+    /// kernel calls [`resume_kernel`]; returns the value passed to it.
     ///
-    /// The return address is re-validated here so a corrupted frame can never
-    /// reach SYSRET with a non-user RIP.
+    /// The return address and stack are re-validated here so a corrupted
+    /// context can never reach IRETQ with a non-user RIP.
     ///
     /// # Safety
-    /// The active CR3 must map `frame.rip` (user, executable) and `frame.rsp`
-    /// (user, writable); `kernel_stack_top` must be a dedicated kernel stack
-    /// that is also installed as TSS.rsp0. `saved_rsp` must stay valid until
-    /// resumed.
+    /// The active CR3 must map `context.rip` (user, executable) and
+    /// `context.rsp` (user, writable); `kernel_stack_top` must be a dedicated
+    /// kernel stack that is also installed as TSS.rsp0. `saved_rsp` must stay
+    /// valid until resumed.
     pub unsafe fn resume_user(
         saved_rsp: *mut u64,
-        frame: &SyscallFrame,
+        context: &UserContext,
         kernel_stack_top: u64,
     ) -> Result<u64, ReturnFrameError> {
-        if frame.rip >= USER_ADDRESS_LIMIT || frame.rsp > USER_ADDRESS_LIMIT {
+        if !context.is_resumable() {
             return Err(ReturnFrameError::NonUserReturnAddress);
         }
         // SAFETY: Guaranteed by the caller; single CPU with IF=0.
         unsafe {
             core::ptr::addr_of_mut!(CENTINELA_SYSCALL_KERNEL_RSP).write(kernel_stack_top);
-            Ok(centinela_resume_user(saved_rsp, frame))
+            Ok(centinela_resume_user(saved_rsp, context))
         }
     }
 
@@ -331,6 +418,25 @@ mod tests {
         for flag in [1 << 8, 1 << 9, 1 << 10, 3 << 12, 1 << 14, 1 << 18] {
             assert_eq!(SYSCALL_FLAG_MASK & flag, flag);
         }
+    }
+
+    #[test]
+    fn syscall_context_never_returns_kernel_rcx_r11() {
+        use super::UserContext;
+        let frame = SyscallFrame {
+            rip: 0x40_0010,
+            rsp: 0x7fff_0000_0000,
+            rflags: 0x246,
+            ..SyscallFrame::default()
+        };
+        let context = UserContext::from_syscall(&frame);
+        assert_eq!((context.rcx, context.r11), (0, 0));
+        assert!(context.is_resumable());
+        let hostile = UserContext {
+            rip: USER_ADDRESS_LIMIT,
+            ..context
+        };
+        assert!(!hostile.is_resumable());
     }
 
     #[test]

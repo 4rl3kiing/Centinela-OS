@@ -19,7 +19,7 @@ use centinela_hal::cpu::{halt_forever, load_page_table_root, page_fault_address}
 use centinela_hal::gdt;
 use centinela_hal::idt::{TrapFrame, exception_name};
 use centinela_hal::serial::{SerialWriter, write as serial_write};
-use centinela_hal::syscall::{self, SyscallFrame};
+use centinela_hal::syscall::{self, SyscallFrame, UserContext};
 use centinela_kernel::ipc::{
     CallOutcome, Endpoint, IpcViolation, MAX_MESSAGE_WORDS, Message, MessageFlags,
     NOTICE_SERVICE_DIED, RECEIVE, SEND, STATUS_NO_RECEIVER, STATUS_OK, STATUS_PEER_DIED, TaskId,
@@ -38,8 +38,8 @@ use centinela_security::syscall_policy::{
 };
 
 use crate::isolation::{
-    CPU_BUDGET_TICKS, USER_CODE_BASE, USER_STACK_TOP, fatal_kernel_trap, map_task_image,
-    trap_stack_top,
+    CPU_BUDGET_TICKS, QUANTUM_TICKS, USER_CODE_BASE, USER_STACK_TOP, fatal_kernel_trap,
+    map_task_image, trap_stack_top,
 };
 use crate::user_programs;
 
@@ -105,11 +105,16 @@ enum Expect {
     Service {
         restarts: u32,
     },
+    /// Exits with this code after being preempted at least once.
+    ExitAfterPreemption(u64),
 }
 
 impl Expect {
-    fn matches(self, exit: TaskExit, restarts: u32) -> bool {
+    fn matches(self, exit: TaskExit, restarts: u32, preemptions: u32) -> bool {
         match (self, exit) {
+            (Self::ExitAfterPreemption(code), TaskExit::Exited(actual)) => {
+                code == actual && preemptions > 0
+            }
             (Self::Exit(code), TaskExit::Exited(actual)) => code == actual,
             (Self::Fault(vector), TaskExit::Fault { vector: actual, .. }) => vector == actual,
             (Self::PolicyDenied, TaskExit::Violation(SyscallViolation::DeniedByPolicy(_))) => true,
@@ -164,8 +169,11 @@ struct Task {
     processes: CapabilityTable<usize, 4>,
     /// Raw handle this task holds for the process capability it was granted.
     process_handle: Option<(usize, u64)>,
-    frame: SyscallFrame,
+    context: UserContext,
     ticks: u32,
+    /// Ticks used in the current time slice.
+    slice: u32,
+    preemptions: u32,
     /// True while this task holds a request it has not replied to.
     serving: bool,
     restarts: u32,
@@ -194,6 +202,8 @@ enum Event {
     Ended,
     /// The current task asked the kernel to restart this dormant slot.
     Restart(usize),
+    /// The current task's time slice expired; it stays ready.
+    Preempted,
 }
 
 struct System {
@@ -243,10 +253,19 @@ fn terminate(system: &mut System, exit: TaskExit) -> ! {
 /// Saves the caller's registers and leaves it in `state`.
 fn park(system: &mut System, frame: &SyscallFrame, state: TaskState, event: Event) -> ! {
     if let Some(task) = current_task(system) {
-        task.frame = *frame;
+        task.context = UserContext::from_syscall(frame);
         task.state = state;
     }
     leave_user(system, event)
+}
+
+fn another_task_ready(system: &System) -> bool {
+    system.tasks.iter().enumerate().any(|(index, task)| {
+        Some(index) != system.current
+            && task
+                .as_ref()
+                .is_some_and(|task| task.state == TaskState::Ready)
+    })
 }
 
 pub fn trap_handler(frame: &mut TrapFrame) {
@@ -256,12 +275,27 @@ pub fn trap_handler(frame: &mut TrapFrame) {
         TIMER_VECTOR => {
             apic::end_of_interrupt();
             if user_task && let Some(system) = system_state() {
-                let over_budget = current_task(system).is_some_and(|task| {
-                    task.ticks += 1;
-                    task.ticks > CPU_BUDGET_TICKS
-                });
+                let (over_budget, slice_over) =
+                    current_task(system).map_or((false, false), |task| {
+                        task.ticks += 1;
+                        task.slice += 1;
+                        (task.ticks > CPU_BUDGET_TICKS, task.slice >= QUANTUM_TICKS)
+                    });
                 if over_budget {
                     terminate(system, TaskExit::CpuBudgetExceeded);
+                }
+                // Preemption: switch only if someone else can use the CPU.
+                if slice_over && another_task_ready(system) {
+                    if let Some(task) = current_task(system) {
+                        task.context = UserContext::from_trap(frame);
+                        task.slice = 0;
+                        task.preemptions += 1;
+                        task.state = TaskState::Ready;
+                    }
+                    leave_user(system, Event::Preempted);
+                }
+                if slice_over && let Some(task) = current_task(system) {
+                    task.slice = 0;
                 }
             }
         }
@@ -400,7 +434,7 @@ fn deliver(receiver: &mut Task, status: u64, outgoing: &Outgoing, kernel_origin:
             Err(_) => 0,
         };
     }
-    let frame = &mut receiver.frame;
+    let frame = &mut receiver.context;
     frame.rax = status;
     frame.rsi = MessageFlags::delivered(outgoing.message.length() as u64, granted, kernel_origin);
     frame.rdx = words[0];
@@ -472,7 +506,7 @@ fn ipc_reply_wait(system: &mut System, frame: &mut SyscallFrame) {
     }
     if let Some(task) = current_task(system) {
         task.serving = false;
-        task.frame = *frame;
+        task.context = UserContext::from_syscall(frame);
         task.state = TaskState::BlockedReceive;
     }
     // A pending kernel notice is delivered at once instead of blocking.
@@ -556,10 +590,10 @@ fn spawn(
 
     let mut endpoints = CapabilityTable::new(table_id).map_err(|_| "capability table")?;
     let mut processes = CapabilityTable::new(table_id).map_err(|_| "capability table")?;
-    let mut frame = SyscallFrame {
+    let mut frame = UserContext {
         rip: USER_CODE_BASE,
         rsp: USER_STACK_TOP,
-        ..SyscallFrame::default()
+        ..UserContext::default()
     };
     let mut raw = [0u64; 2];
     for (slot, grant) in raw.iter_mut().zip(spec.endpoints) {
@@ -597,8 +631,10 @@ fn spawn(
         endpoints,
         processes,
         process_handle,
-        frame,
+        context: frame,
         ticks: 0,
+        slice: 0,
+        preemptions: 0,
         serving: false,
         restarts,
         exit: None,
@@ -647,6 +683,7 @@ struct Outcome {
     spec: TaskSpec,
     exit: Option<TaskExit>,
     restarts: u32,
+    preemptions: u32,
     reclaimed: bool,
 }
 
@@ -692,7 +729,7 @@ fn run_system(
         let Some(task) = system.tasks[next].as_ref() else {
             break;
         };
-        let (root, frame) = (task.root, task.frame);
+        let (root, context) = (task.root, task.context);
         let saved = core::ptr::addr_of_mut!(system.saved_kernel_rsp);
         let trap_top = trap_stack_top();
         // SAFETY: The task root shares the kernel half (code, stacks, tables
@@ -701,7 +738,7 @@ fn run_system(
         let started = unsafe {
             gdt::set_privilege0_stack(trap_top);
             load_page_table_root(root.get());
-            let result = syscall::resume_user(saved, &frame, trap_top);
+            let result = syscall::resume_user(saved, &context, trap_top);
             load_page_table_root(kernel_root.get());
             result
         };
@@ -719,10 +756,10 @@ fn run_system(
             Event::Restart(slot) => {
                 let result = restart(memory, kernel_root, system, slot, &mut outcomes);
                 if let Some(requester) = system.tasks[next].as_mut() {
-                    requester.frame.rax = result;
+                    requester.context.rax = result;
                 }
             }
-            Event::Blocked => {}
+            Event::Blocked | Event::Preempted => {}
         }
     }
 
@@ -739,6 +776,7 @@ fn run_system(
                     spec: dormant.spec,
                     exit: dormant.exit,
                     restarts: dormant.restarts,
+                    preemptions: 0,
                     reclaimed: true,
                 });
             }
@@ -784,6 +822,7 @@ fn start_task(
                 spec,
                 exit: None,
                 restarts,
+                preemptions: 0,
                 reclaimed: false,
             });
             false
@@ -886,6 +925,7 @@ fn reap_final(
         spec: task.spec,
         exit: task.exit,
         restarts: task.restarts,
+        preemptions: task.preemptions,
         reclaimed,
     });
 }
@@ -952,7 +992,11 @@ fn report(outcome: &Outcome) -> bool {
         );
         return false;
     };
-    let ok = outcome.spec.expect.matches(exit, outcome.restarts) && outcome.reclaimed;
+    let ok = outcome
+        .spec
+        .expect
+        .matches(exit, outcome.restarts, outcome.preemptions)
+        && outcome.reclaimed;
     let _ = write!(
         writer,
         "Isolation: task {} [{}]: ",
@@ -961,6 +1005,9 @@ fn report(outcome: &Outcome) -> bool {
     describe(exit, &mut writer);
     if outcome.restarts > 0 {
         let _ = write!(writer, " (restarted {}x)", outcome.restarts);
+    }
+    if outcome.preemptions > 0 {
+        let _ = write!(writer, " (preempted {}x)", outcome.preemptions);
     }
     let _ = write!(
         writer,
@@ -1122,6 +1169,41 @@ pub fn run_self_test(
     );
     let isolation_ok = passed == isolated_tasks.len();
 
+    // Preemption scenario: two CPU-bound tasks that never yield must both
+    // finish, interleaved by the timer.
+    let workers = [
+        isolated(
+            "worker-a",
+            "CPU-bound, never yields",
+            p::worker,
+            0,
+            Expect::ExitAfterPreemption(0),
+        ),
+        isolated(
+            "worker-b",
+            "CPU-bound, never yields",
+            p::worker,
+            0,
+            Expect::ExitAfterPreemption(0),
+        ),
+    ];
+    let outcomes = run_system(memory, kernel_root, hhdm, &workers);
+    let preemption_ok = outcomes
+        .iter()
+        .flatten()
+        .filter(|outcome| report(outcome))
+        .count()
+        == workers.len();
+    let _ = write!(
+        writer,
+        "Scheduler: preemptive time slicing {}.\r\n",
+        if preemption_ok {
+            "verified (both CPU-bound tasks finished)"
+        } else {
+            "FAILED"
+        }
+    );
+
     // Service-manager scenario. Slot 1 is the adder service whose process
     // capability init holds.
     let scenario = [
@@ -1201,5 +1283,5 @@ pub fn run_self_test(
         "Microkernel: {scenario_passed}/{} service-manager checks passed; kernel still running.\r\n",
         scenario.len()
     );
-    isolation_ok && scenario_passed == scenario.len()
+    isolation_ok && preemption_ok && scenario_passed == scenario.len()
 }

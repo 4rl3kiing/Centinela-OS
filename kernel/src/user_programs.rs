@@ -151,6 +151,37 @@ core::arch::global_asm!(
     ".global centinela_user_stack_overflow_end",
     "centinela_user_stack_overflow_end:",
     "",
+    // Worker: announces itself, burns CPU without any syscall, then exits.
+    ".balign 16",
+    ".global centinela_user_worker_start",
+    "centinela_user_worker_start:",
+    "    lea rdi, [rip + .Lworker_start_msg]",
+    "    lea rsi, [rip + .Lworker_start_msg_end]",
+    "    sub rsi, rdi",
+    "    mov eax, 1",
+    "    syscall",
+    "    mov r12d, 30000000",
+    ".Lworker_loop:",
+    "    dec r12",
+    "    jnz .Lworker_loop",
+    "    lea rdi, [rip + .Lworker_done_msg]",
+    "    lea rsi, [rip + .Lworker_done_msg_end]",
+    "    sub rsi, rdi",
+    "    mov eax, 1",
+    "    syscall",
+    "    xor edi, edi",
+    "    mov eax, 12",
+    "    syscall",
+    "    ud2",
+    ".Lworker_start_msg:",
+    "    .ascii \"started CPU-bound work\"",
+    ".Lworker_start_msg_end:",
+    ".Lworker_done_msg:",
+    "    .ascii \"finished CPU-bound work\"",
+    ".Lworker_done_msg_end:",
+    ".global centinela_user_worker_end",
+    "centinela_user_worker_end:",
+    "",
     // ---- Microkernel scenario (IPC: 13 = call, 14 = reply_wait) ----
     // Request: rsi = length, rdx = op, r10/r8 = operands. Reply: rax = status,
     // rsi = length, rdx = result. The endpoint handle arrives in rdi.
@@ -500,4 +531,9 @@ program!(
     amplify,
     centinela_user_amplify_start,
     centinela_user_amplify_end
+);
+program!(
+    worker,
+    centinela_user_worker_start,
+    centinela_user_worker_end
 );

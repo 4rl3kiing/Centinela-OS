@@ -31,6 +31,7 @@ REQUIRED_MESSAGES=(
     "[task hello] hello from an isolated Ring 3 task .[2J"
     "[task hello] kernel pointer rejected with EFAULT"
     "Isolation: 12/12 tasks behaved as required; kernel still running."
+    "Scheduler: preemptive time slicing verified (both CPU-bound tasks finished)."
     "[task client] init granted a SEND-only adder capability (no GRANT)"
     "[task client] service replied 40 + 2 = 42"
     "[task init] kernel reports adder-service died; policy: restart"
