@@ -2,7 +2,7 @@
 
 **Centinela-OS** is an experimental operating-system project built primarily in Rust. Its initial target is x86_64, with boot support for legacy BIOS and UEFI and intended use across desktop and server systems.
 
-The project has a freestanding Rust kernel with a Limine BIOS/UEFI boot path and an initial single-core physical memory manager. The last CPU-hardening change is being revalidated; do not treat it as production-qualified until the current branch CI passes.
+The project has a capability-based Rust microkernel that boots through Limine under BIOS and UEFI (with Secure Boot), runs drivers and services in Ring 3, and uses all CPUs. Everything is validated in QEMU only; it has not yet run on physical hardware and is not production-qualified. Version 1.0 targets the desktop (see ADR-0005).
 
 ## Initial technical decisions
 
@@ -13,7 +13,7 @@ The project has a freestanding Rust kernel with a Limine BIOS/UEFI boot path and
 - Kernel language: Rust, `no_std` in privileged code.
 - Initial binary target: `x86_64-unknown-none`.
 - Initial execution environments: QEMU first; physical hardware after repeatable virtual-machine validation.
-- Product scope: desktop and server foundations, developed incrementally.
+- Product scope: desktop first for version 1.0 (ADR-0005); server use builds on the same foundation.
 
 ## Engineering principles
 
@@ -54,6 +54,7 @@ The PMM is an initial single-core implementation. It is not yet a complete virtu
 - [ADR-0002: capability-based hybrid microkernel](docs/decisions/0002-hybrid-microkernel.md)
 - [ADR-0003: zero-trust layer isolation](docs/decisions/0003-layer-isolation-zero-trust.md)
 - [ADR-0004: SMP, IOMMU, Ring 3 drivers and first services](docs/decisions/0004-smp-iommu-drivers-services.md)
+- [ADR-0005: desktop-first roadmap to version 1.0](docs/decisions/0005-desktop-v1-roadmap.md)
 - [Hardware testing procedure](docs/hardware-testing.md)
 - [Layered security hardening implementation plan](docs/security/hardening-implementation-plan.md)
 
@@ -69,4 +70,10 @@ Bootstrap, PMM and hardening milestones passed under BIOS and UEFI in QEMU, with
 
 **Phases 3–5:** preemptive scheduling, ELF64 loading from BLAKE2b-pinned boot modules, KPTI, KASLR and UEFI Secure Boot (positive and wrong-key tests). Application processors boot confined and parked with verified hardening; VT-d DMA remapping is enabled deny-by-default; the I/O APIC routes IRQs only to Ring 3 drivers (UART, keyboard) as kernel-origin IPC notices, with port access mediated per call. A Ring 3 shell on the serial console drives a RAM filesystem and a loopback network service, and runs an IPC benchmark. See ADR-0004.
 
-Not yet implemented: tasks on application processors, per-device IOMMU mappings, interrupt remapping, badged endpoints, capability revocation trees, a physical NIC or disk driver, heap hardening, and testing on physical hardware.
+**After ADR-0004:** application processors run their own partitioned task systems (per-CPU entry blocks via SWAPGS, a locked shared frame allocator). Endpoints carry badges and the minter can revoke a badge system-wide; ramfs uses badges for per-tenant namespaces. VT-d gives each DMA-granted device its own domain, and a Ring 3 e1000 driver exchanges ARP frames through it. CI also runs the boot suite under KVM when the runner allows it.
+
+## Roadmap to 1.0 (desktop)
+
+Phases 6–12 are defined in ADR-0005: hardware bring-up with a framebuffer console, kernel heap, AMD-Vi and interrupt remapping (6); NVMe/AHCI, VFS and a journaled filesystem (7); processes from signed executables, threads, shared memory, Rust `std`, users (8); xHCI and USB input (9); compositor, toolkit and desktop applications (10); TCP/IP, TLS and real NIC drivers (11); installer, signed A/B updates, production keys and an external review (12).
+
+Not yet implemented: physical-hardware testing, a framebuffer console, a kernel heap allocator, AMD-Vi, interrupt remapping and MSI/MSI-X, storage drivers and a persistent filesystem, a TCP/IP stack, USB, graphics and a desktop.
