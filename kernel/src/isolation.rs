@@ -306,6 +306,11 @@ pub fn init_cpu_layer(
     // tops are page aligned; GDT before IDT before SYSCALL as required.
     unsafe {
         gdt::init(stacks);
+        // Per-CPU entry block 0 for the BSP (after the GDT: segment reloads
+        // clear the GS base).
+        if !syscall::init_cpu(0) {
+            return false;
+        }
         idt::init(crate::system::trap_handler);
         syscall::init(crate::system::syscall_handler);
         let per_ms = apic::calibrate(apic_virtual);

@@ -28,6 +28,7 @@ use centinela_hal::cpu::{
 };
 use centinela_hal::serial::{SerialWriter, init as serial_init, write as serial_write};
 use centinela_kernel::memory::hhdm_backend::HhdmFrameMemory;
+use centinela_kernel::memory::hhdm_backend::PmmLock;
 use centinela_kernel::memory::pmm::{BITMAP_WORDS, LimineMemoryMapResponse, Pmm};
 use centinela_kernel::memory::vmm::{
     BootPagingInfo, HhdmOffset, HhdmPageTableMemory, PageTableMemory, PageTableWalker, PhysAddr,
@@ -263,12 +264,12 @@ fn boot_modules(hhdm: HhdmOffset) -> ([(&'static str, &'static [u8]); MAX_MODULE
 // The bitmap itself is reserved automatically as part of the kernel BSS.
 static mut FRAME_BITMAP: [u64; BITMAP_WORDS] = [0; BITMAP_WORDS];
 static mut ALLOCATED_BITMAP: [u64; BITMAP_WORDS] = [0; BITMAP_WORDS];
-static mut PMM_STATE: MaybeUninit<Pmm<'static>> = MaybeUninit::uninit();
+static mut PMM_STATE: MaybeUninit<PmmLock<'static>> = MaybeUninit::uninit();
 static mut BOOT_PAGING_INFO: MaybeUninit<BootPagingInfo> = MaybeUninit::uninit();
 
 /// Validated boot memory state handed to the isolation layer.
 struct BootMemory {
-    pmm: &'static mut Pmm<'static>,
+    pmm: &'static PmmLock<'static>,
     hhdm: HhdmOffset,
     kernel_root: PhysAddr,
 }
@@ -420,14 +421,14 @@ fn initialize_memory() -> Option<BootMemory> {
     // Keep the initialized manager alive for subsequent kernel subsystems.
     // SAFETY: PMM_STATE is written exactly once during single-core bootstrap.
     unsafe {
-        addr_of_mut!(PMM_STATE).write(MaybeUninit::new(pmm));
+        addr_of_mut!(PMM_STATE).write(MaybeUninit::new(PmmLock::new(pmm)));
     }
 
     serial_write("PMM initialized: 4 KiB frames, 64 GiB address ceiling.\r\n");
     serial_write("PMM allocation/free self-test passed.\r\n");
     // SAFETY: PMM_STATE was initialized just above and is never moved; this
     // is the only reference handed out.
-    let pmm = unsafe { (*addr_of_mut!(PMM_STATE)).assume_init_mut() };
+    let pmm = unsafe { (*addr_of!(PMM_STATE)).assume_init_ref() };
     Some(BootMemory {
         pmm,
         hhdm: hhdm_offset,

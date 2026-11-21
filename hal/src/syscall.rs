@@ -186,50 +186,13 @@ mod runtime {
     static HANDLER: AtomicUsize = AtomicUsize::new(0);
 
     // KPTI trampoline data: everything the entry/exit stubs touch while the
-    // task's page tables are active lives in `.data.entry`.
-    /// Kernel stack top used by the entry stub (written before entering Ring 3).
-    #[unsafe(no_mangle)]
+    // task's page tables are active lives in `.data.entry`, one block per
+    // CPU. In kernel mode GS_BASE points at the CPU's block; in user mode the
+    // block address sits in KERNEL_GS_BASE and SWAPGS exchanges them on every
+    // ring transition. Tasks cannot read or change either MSR.
     #[unsafe(link_section = ".data.entry")]
-    static mut CENTINELA_SYSCALL_KERNEL_RSP: u64 = 0;
-    /// Scratch slot for the user RSP during the stack switch (single CPU, IF=0).
-    #[unsafe(no_mangle)]
-    #[unsafe(link_section = ".data.entry")]
-    static mut CENTINELA_SYSCALL_USER_RSP: u64 = 0;
-    /// Page-table root the kernel runs on (loaded on every entry from Ring 3).
-    #[unsafe(no_mangle)]
-    #[unsafe(link_section = ".data.entry")]
-    static mut CENTINELA_KERNEL_CR3: u64 = 0;
-    /// Page-table root of the task being entered/resumed.
-    #[unsafe(no_mangle)]
-    #[unsafe(link_section = ".data.entry")]
-    static mut CENTINELA_USER_CR3: u64 = 0;
-    /// Scratch register slot used before the CR3 switch on SYSCALL entry.
-    #[unsafe(no_mangle)]
-    #[unsafe(link_section = ".data.entry")]
-    static mut CENTINELA_ENTRY_SCRATCH: u64 = 0;
-    /// Registers of the task being resumed (read after CR3 already points at
-    /// the task's tables, so it must live in the trampoline).
-    #[unsafe(no_mangle)]
-    #[unsafe(link_section = ".data.entry")]
-    static mut CENTINELA_ENTRY_CONTEXT: UserContext = UserContext {
-        rax: 0,
-        rbx: 0,
-        rcx: 0,
-        rdx: 0,
-        rsi: 0,
-        rdi: 0,
-        rbp: 0,
-        r8: 0,
-        r9: 0,
-        r10: 0,
-        r11: 0,
-        r12: 0,
-        r13: 0,
-        r14: 0,
-        r15: 0,
-        rip: 0,
-        rsp: 0,
-    };
+    static mut PERCPU: [PerCpu; MAX_CPUS] = [const { PerCpu::new() }; MAX_CPUS];
+    static KERNEL_ROOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
     core::arch::global_asm!(
         ".pushsection .text.entry, \"ax\"",
@@ -237,13 +200,14 @@ mod runtime {
         "centinela_syscall_entry:",
         // IF is already clear (SFMASK). KPTI: switch to the kernel page
         // tables first, then to the kernel stack.
-        "    mov [rip + CENTINELA_ENTRY_SCRATCH], rax",
-        "    mov rax, [rip + CENTINELA_KERNEL_CR3]",
+        "    swapgs",
+        "    mov gs:[{p_scratch}], rax",
+        "    mov rax, gs:[{p_kcr3}]",
         "    mov cr3, rax",
-        "    mov rax, [rip + CENTINELA_ENTRY_SCRATCH]",
-        "    mov [rip + CENTINELA_SYSCALL_USER_RSP], rsp",
-        "    mov rsp, [rip + CENTINELA_SYSCALL_KERNEL_RSP]",
-        "    push qword ptr [rip + CENTINELA_SYSCALL_USER_RSP]",
+        "    mov rax, gs:[{p_scratch}]",
+        "    mov gs:[{p_ursp}], rsp",
+        "    mov rsp, gs:[{p_krsp}]",
+        "    push qword ptr gs:[{p_ursp}]",
         "    push r11",
         "    push rcx",
         "    push r15",
@@ -263,7 +227,7 @@ mod runtime {
         "    cld",
                 "    call {entry}",
         // Back to the task's page tables; the trap stack stays mapped.
-        "    mov rax, [rip + CENTINELA_USER_CR3]",
+        "    mov rax, gs:[{p_ucr3}]",
         "    mov cr3, rax",
         "    pop rax",
         "    pop r9",
@@ -283,6 +247,7 @@ mod runtime {
         // NMI and machine check use IST stacks, so nothing runs on the user
         // stack between this instruction and SYSRET.
         "    pop rsp",
+        "    swapgs",
         "    sysretq",
         "",
         // u64 centinela_resume_user(u64 *saved_rsp)
@@ -298,14 +263,15 @@ mod runtime {
         "    push r14",
         "    push r15",
         "    mov [rdi], rsp",
-        "    mov rsp, [rip + CENTINELA_SYSCALL_KERNEL_RSP]",
-        "    lea rsi, [rip + CENTINELA_ENTRY_CONTEXT]",
+        "    mov rsp, gs:[{p_krsp}]",
+        "    mov rsi, gs:[{p_self}]",
+        "    add rsi, {p_context}",
         "    push {user_ss}",
         "    push qword ptr [rsi + {c_rsp}]",
         "    push {user_rflags}",
         "    push {user_cs}",
         "    push qword ptr [rsi + {c_rip}]",
-        "    mov rax, [rip + CENTINELA_USER_CR3]",
+        "    mov rax, gs:[{p_ucr3}]",
         "    mov cr3, rax",
         "    mov rax, [rsi + {c_rax}]",
         "    mov rbx, [rsi + {c_rbx}]",
@@ -322,6 +288,7 @@ mod runtime {
         "    mov r14, [rsi + {c_r14}]",
         "    mov r15, [rsi + {c_r15}]",
         "    mov rsi, [rsi + {c_rsi}]",
+        "    swapgs",
         "    iretq",
         "",
         // ! centinela_resume_kernel(u64 saved_rsp, u64 result)
@@ -341,6 +308,13 @@ mod runtime {
         user_rflags = const USER_RFLAGS,
         user_ss = const crate::gdt::USER_DATA_SELECTOR as u64,
         user_cs = const crate::gdt::USER_CODE_SELECTOR as u64,
+        p_self = const core::mem::offset_of!(PerCpu, self_ptr),
+        p_scratch = const core::mem::offset_of!(PerCpu, scratch),
+        p_ursp = const core::mem::offset_of!(PerCpu, user_rsp),
+        p_krsp = const core::mem::offset_of!(PerCpu, kernel_rsp),
+        p_kcr3 = const core::mem::offset_of!(PerCpu, kernel_cr3),
+        p_ucr3 = const core::mem::offset_of!(PerCpu, user_cr3),
+        p_context = const core::mem::offset_of!(PerCpu, context),
         c_rax = const core::mem::offset_of!(UserContext, rax),
         c_rbx = const core::mem::offset_of!(UserContext, rbx),
         c_rcx = const core::mem::offset_of!(UserContext, rcx),
@@ -440,24 +414,90 @@ mod runtime {
         if !context.is_resumable() {
             return Err(ReturnFrameError::NonUserReturnAddress);
         }
-        // SAFETY: Guaranteed by the caller; single CPU with IF=0. The
-        // trampoline variables are only read by the stubs after these writes.
+        // SAFETY: Guaranteed by the caller; IF=0 and the block belongs to
+        // this CPU, so the stubs read these values only after the writes.
         unsafe {
-            core::ptr::addr_of_mut!(CENTINELA_SYSCALL_KERNEL_RSP).write(kernel_stack_top);
-            core::ptr::addr_of_mut!(CENTINELA_ENTRY_CONTEXT).write(*context);
-            core::ptr::addr_of_mut!(CENTINELA_USER_CR3).write(user_root);
+            let block = current();
+            (*block).kernel_rsp = kernel_stack_top;
+            (*block).context = *context;
+            (*block).user_cr3 = user_root;
             Ok(centinela_resume_user(saved_rsp))
         }
     }
 
     /// Records the page-table root every entry from Ring 3 switches to.
+    /// Must precede `init_cpu` on each CPU.
     ///
     /// # Safety
     /// `root` must map the whole kernel (it becomes the active root on every
     /// trap or syscall from user mode).
     pub unsafe fn set_kernel_root(root: u64) {
-        // SAFETY: Guaranteed by the caller; single CPU with IF=0.
-        unsafe { core::ptr::addr_of_mut!(CENTINELA_KERNEL_CR3).write(root) };
+        // Picked up by `init_cpu` on every CPU, which must run afterwards.
+        KERNEL_ROOT.store(root, Ordering::Release);
+    }
+
+    const IA32_GS_BASE: u32 = 0xc000_0101;
+    const IA32_KERNEL_GS_BASE: u32 = 0xc000_0102;
+
+    /// Binds per-CPU block `index` to the calling CPU (GS_BASE) and records
+    /// the kernel page-table root for its entry stubs. Returns false if the
+    /// index is out of range.
+    ///
+    /// # Safety
+    /// CPL 0, IF=0, after this CPU loaded its GDT (segment reloads clear the
+    /// GS base); each index used by exactly one CPU.
+    pub unsafe fn init_cpu(index: usize) -> bool {
+        if index >= MAX_CPUS {
+            return false;
+        }
+        // SAFETY: Each index is owned by one CPU (caller contract).
+        unsafe {
+            let block = (core::ptr::addr_of_mut!(PERCPU) as *mut PerCpu).add(index);
+            (*block).self_ptr = block as u64;
+            (*block).cpu_index = index as u64;
+            (*block).kernel_cr3 = KERNEL_ROOT.load(Ordering::Acquire);
+            write_msr(IA32_GS_BASE, block as u64);
+            write_msr(IA32_KERNEL_GS_BASE, 0);
+        }
+        true
+    }
+
+    /// The calling CPU's block (valid after `init_cpu`, in kernel mode).
+    fn current() -> *mut PerCpu {
+        let block: u64;
+        // SAFETY: Reads this CPU's self pointer through GS (kernel mode).
+        unsafe {
+            core::arch::asm!("mov {}, gs:[{off}]", out(reg) block,
+                off = const core::mem::offset_of!(PerCpu, self_ptr),
+                options(nostack, readonly, preserves_flags));
+        }
+        block as *mut PerCpu
+    }
+
+    /// Index of the calling CPU (0 = bootstrap processor).
+    pub fn cpu_index() -> usize {
+        let index: u64;
+        // SAFETY: As in `current`.
+        unsafe {
+            core::arch::asm!("mov {}, gs:[{off}]", out(reg) index,
+                off = const core::mem::offset_of!(PerCpu, cpu_index),
+                options(nostack, readonly, preserves_flags));
+        }
+        index as usize
+    }
+
+    /// Enables SYSCALL on an application processor (MSRs are per CPU).
+    ///
+    /// # Safety
+    /// CPL 0, IF=0, after `init` ran on the BSP and this CPU loaded its GDT.
+    pub unsafe fn init_ap() {
+        // SAFETY: Architectural MSRs at CPL 0.
+        unsafe {
+            write_msr(IA32_STAR, star_value());
+            write_msr(IA32_LSTAR, centinela_syscall_entry as *const () as u64);
+            write_msr(IA32_FMASK, SYSCALL_FLAG_MASK);
+            write_msr(IA32_EFER, read_msr(IA32_EFER) | EFER_SCE);
+        }
     }
 
     /// Abandons the current trap/syscall stack and returns `result` from the
@@ -473,7 +513,68 @@ mod runtime {
 }
 
 #[cfg(target_os = "none")]
-pub use runtime::{init, resume_kernel, resume_user, set_kernel_root};
+pub use runtime::{
+    cpu_index, init, init_ap, init_cpu, resume_kernel, resume_user, set_kernel_root,
+};
+
+/// Per-CPU blocks for the entry stubs (and a CPU index for the kernel).
+pub const MAX_CPUS: usize = 8;
+
+/// Entry-stub state of one CPU; lives in the KPTI trampoline.
+#[repr(C)]
+pub struct PerCpu {
+    self_ptr: u64,
+    scratch: u64,
+    user_rsp: u64,
+    kernel_rsp: u64,
+    kernel_cr3: u64,
+    user_cr3: u64,
+    cpu_index: u64,
+    context: UserContext,
+}
+
+/// Offsets the interrupt stubs (idt.rs) use through GS.
+pub const PERCPU_KERNEL_CR3: usize = core::mem::offset_of!(PerCpu, kernel_cr3);
+pub const PERCPU_USER_CR3: usize = core::mem::offset_of!(PerCpu, user_cr3);
+
+impl PerCpu {
+    pub const fn new() -> Self {
+        Self {
+            self_ptr: 0,
+            scratch: 0,
+            user_rsp: 0,
+            kernel_rsp: 0,
+            kernel_cr3: 0,
+            user_cr3: 0,
+            cpu_index: 0,
+            context: UserContext {
+                rax: 0,
+                rbx: 0,
+                rcx: 0,
+                rdx: 0,
+                rsi: 0,
+                rdi: 0,
+                rbp: 0,
+                r8: 0,
+                r9: 0,
+                r10: 0,
+                r11: 0,
+                r12: 0,
+                r13: 0,
+                r14: 0,
+                r15: 0,
+                rip: 0,
+                rsp: 0,
+            },
+        }
+    }
+}
+
+impl Default for PerCpu {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[cfg(test)]
 mod tests {

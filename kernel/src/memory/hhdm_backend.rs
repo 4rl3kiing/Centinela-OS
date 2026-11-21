@@ -5,6 +5,9 @@
 //! SMAP permanently armed (no STAC windows) and makes the kernel immune to a
 //! task remapping its buffers while the kernel is using them.
 
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use super::pmm::Pmm;
 use super::usercopy::PhysicalMemory;
 use super::vmm::{
@@ -12,19 +15,64 @@ use super::vmm::{
     PhysAddr, VirtAddr, WalkError,
 };
 
-/// Kernel-owned page tables and frames, accessed through the HHDM.
+/// The frame allocator shared by every CPU, behind a spin lock. Kernel code
+/// runs with interrupts disabled, so no handler can re-enter a held lock.
+pub struct PmmLock<'b> {
+    locked: AtomicBool,
+    pmm: UnsafeCell<Pmm<'b>>,
+}
+
+// SAFETY: Every access to the inner allocator goes through `with`, which
+// provides mutual exclusion with acquire/release ordering.
+unsafe impl Sync for PmmLock<'_> {}
+
+impl<'b> PmmLock<'b> {
+    pub const fn new(pmm: Pmm<'b>) -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            pmm: UnsafeCell::new(pmm),
+        }
+    }
+
+    /// Runs `f` with exclusive access to the allocator.
+    pub fn with<R>(&self, f: impl FnOnce(&mut Pmm<'b>) -> R) -> R {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        // SAFETY: The lock is held: no other reference to the allocator exists.
+        let result = f(unsafe { &mut *self.pmm.get() });
+        self.locked.store(false, Ordering::Release);
+        result
+    }
+}
+
+/// Kernel-owned page tables and frames, accessed through the HHDM. Each CPU
+/// uses its own instance over the shared, locked allocator; `net` counts the
+/// frames this instance allocated minus those it released (leak checks that
+/// stay exact while other CPUs allocate concurrently).
 pub struct HhdmFrameMemory<'p, 'b> {
     hhdm: HhdmOffset,
-    pmm: &'p mut Pmm<'b>,
+    pmm: &'p PmmLock<'b>,
+    net: i64,
 }
 
 impl<'p, 'b> HhdmFrameMemory<'p, 'b> {
     /// # Safety
     /// The HHDM must map every frame the PMM can return and every page-table
     /// frame passed to this backend, writable and for the backend's lifetime.
-    /// Access must be serialized (single CPU, interrupts disabled).
-    pub unsafe fn new(hhdm: HhdmOffset, pmm: &'p mut Pmm<'b>) -> Self {
-        Self { hhdm, pmm }
+    /// Page tables handed to one instance must not be mutated concurrently
+    /// through another (each address space belongs to one CPU).
+    pub unsafe fn new(hhdm: HhdmOffset, pmm: &'p PmmLock<'b>) -> Self {
+        Self { hhdm, pmm, net: 0 }
+    }
+
+    /// Frames allocated minus frames released through this instance.
+    pub fn net_allocated(&self) -> i64 {
+        self.net
     }
 
     fn alias(&self, physical: u64) -> Result<*mut u8, MutationBackendError> {
@@ -72,7 +120,7 @@ impl<'p, 'b> HhdmFrameMemory<'p, 'b> {
     }
 
     pub fn free_frames(&self) -> u64 {
-        self.pmm.free_frames()
+        self.pmm.with(|pmm| pmm.free_frames())
     }
 }
 
@@ -84,13 +132,17 @@ unsafe impl PageTableMutationMemory for HhdmFrameMemory<'_, '_> {
     fn allocate_zeroed_table_frame(&mut self) -> Result<PhysAddr, MutationBackendError> {
         let physical = self
             .pmm
-            .allocate_frame()
+            .with(|pmm| pmm.allocate_frame())
             .ok_or(MutationBackendError::AllocationFailed)?;
-        let frame = PhysAddr::new(physical).map_err(|_| MutationBackendError::AllocationFailed)?;
-        let Ok(alias) = self.alias(physical) else {
-            let _ = self.pmm.free_frame(physical);
+        let Ok(frame) = PhysAddr::new(physical) else {
+            let _ = self.pmm.with(|pmm| pmm.free_frame(physical));
             return Err(MutationBackendError::AllocationFailed);
         };
+        let Ok(alias) = self.alias(physical) else {
+            let _ = self.pmm.with(|pmm| pmm.free_frame(physical));
+            return Err(MutationBackendError::AllocationFailed);
+        };
+        self.net += 1;
         // SAFETY: The PMM transferred exclusive ownership; the HHDM maps it.
         unsafe { core::ptr::write_bytes(alias, 0, PAGE_SIZE as usize) };
         Ok(frame)
@@ -98,8 +150,10 @@ unsafe impl PageTableMutationMemory for HhdmFrameMemory<'_, '_> {
 
     fn release_table_frame(&mut self, frame: PhysAddr) -> Result<(), MutationBackendError> {
         self.pmm
-            .free_frame(frame.get())
-            .map_err(|_| MutationBackendError::ReleaseFailed)
+            .with(|pmm| pmm.free_frame(frame.get()))
+            .map_err(|_| MutationBackendError::ReleaseFailed)?;
+        self.net -= 1;
+        Ok(())
     }
 
     fn read_entry(&self, table: PhysAddr, index: u16) -> Result<u64, MutationBackendError> {
@@ -128,7 +182,9 @@ unsafe impl PageTableMutationMemory for HhdmFrameMemory<'_, '_> {
     }
 
     fn invalidate_page(&mut self, virtual_address: VirtAddr) -> Result<(), MutationBackendError> {
-        // SAFETY: CPL 0; single CPU, so local invalidation is complete.
+        // SAFETY: CPL 0. Local invalidation is complete because every task
+        // address space runs on exactly one CPU and the shared kernel half is
+        // only changed during boot, before application processors run tasks.
         unsafe { centinela_hal::cpu::invalidate_page_local(virtual_address.get()) }
             .map_err(|_| MutationBackendError::TlbInvalidationFailed)
     }

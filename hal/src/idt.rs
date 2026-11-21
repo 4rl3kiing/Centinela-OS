@@ -220,7 +220,8 @@ mod runtime {
         // kernel page tables before touching anything outside the trampoline.
         "    test qword ptr [rsp + 144], 3",
         "    jz 1f",
-        "    mov rax, [rip + CENTINELA_KERNEL_CR3]",
+        "    swapgs",
+        "    mov rax, gs:[{kcr3}]",
         "    mov cr3, rax",
         "1:",
         "    mov rdi, rsp",
@@ -229,8 +230,9 @@ mod runtime {
         // Returning to Ring 3: restore the task's page tables first.
         "    test qword ptr [rsp + 144], 3",
         "    jz 2f",
-        "    mov rax, [rip + CENTINELA_USER_CR3]",
+        "    mov rax, gs:[{ucr3}]",
         "    mov cr3, rax",
+        "    swapgs",
         "2:",
         "    pop rax",
         "    pop rbx",
@@ -251,6 +253,8 @@ mod runtime {
         "    iretq",
         ".popsection",
         entry = sym trap_entry,
+        kcr3 = const crate::syscall::PERCPU_KERNEL_CR3,
+        ucr3 = const crate::syscall::PERCPU_USER_CR3,
     );
 
     // Per-vector stubs: push a zero error code when the CPU does not, push the

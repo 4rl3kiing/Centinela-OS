@@ -1285,7 +1285,7 @@ fn run_system(
     specs: &[TaskSpec],
 ) -> [Option<Outcome>; MAX_TASKS] {
     let mut outcomes: [Option<Outcome>; MAX_TASKS] = [None; MAX_TASKS];
-    let frames_before = memory.free_frames();
+    let frames_before = memory.net_allocated();
     // SAFETY: Task tables and frames come from the PMM and are HHDM-mapped.
     let reader = unsafe { HhdmReader::new(hhdm) };
     // SAFETY: No task is running; nothing else references SYSTEM.
@@ -1402,7 +1402,7 @@ fn run_system(
     // SAFETY: No task is running; drop the system state.
     unsafe { *core::ptr::addr_of_mut!(SYSTEM) = None };
 
-    let reclaimed = memory.free_frames() == frames_before;
+    let reclaimed = memory.net_allocated() == frames_before;
     for outcome in outcomes.iter_mut().flatten() {
         outcome.reclaimed = outcome.reclaimed && reclaimed;
     }
