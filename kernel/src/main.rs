@@ -584,6 +584,8 @@ extern "C" fn kernel_main() -> ! {
     // SAFETY: The HHDM (base revision 5) maps every usable and bootloader-
     // reclaimable frame, including Limine's page tables; single CPU, IF=0.
     let mut memory = unsafe { HhdmFrameMemory::new(boot.hhdm, boot.pmm) };
+    #[cfg(target_os = "none")]
+    system::set_shared_pmm(boot.pmm);
     let (modules, module_count) = boot_modules(boot.hhdm);
     let mut writer = SerialWriter;
     let _ = core::fmt::Write::write_fmt(
@@ -614,7 +616,7 @@ fn run_isolation(
     }
     // SAFETY: BSP, IF=0, GDT/IDT loaded; the request lives in the Limine
     // request section and was answered before the kernel was entered.
-    if !unsafe { smp::start(memory, kernel_root, &raw const LIMINE_REQUESTS.mp) } {
+    if !unsafe { smp::start(&raw const LIMINE_REQUESTS.mp) } {
         halt_forever();
     }
     if system::run_self_test(memory, kernel_root, hhdm, modules) {

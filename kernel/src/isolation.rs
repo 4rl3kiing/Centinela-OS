@@ -211,8 +211,19 @@ fn verify_kpti(
 }
 
 /// Top of the kernel stack used for traps and syscalls from Ring 3.
+/// The calling CPU's trap stack (TSS.rsp0) top.
 pub(crate) fn trap_stack_top() -> u64 {
-    stack_bounds(addr_of!(TRAP_STACK)).1
+    match syscall::cpu_index() {
+        0 => stack_bounds(addr_of!(TRAP_STACK)).1,
+        cpu => crate::smp::trap_stack_top(cpu - 1),
+    }
+}
+
+/// APIC timer reload calibrated on the BSP, reused by every CPU.
+static TIMER_RELOAD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn timer_reload() -> u32 {
+    TIMER_RELOAD.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 fn stack_bounds(stack: *const GuardedStack) -> (u64, u64) {
@@ -258,7 +269,12 @@ pub fn init_cpu_layer(
     kernel_root: PhysAddr,
     hhdm: HhdmOffset,
 ) -> bool {
-    if !install_guard_pages(memory, kernel_root) {
+    // Every guard page, including the application processors' entry stacks
+    // in the trampoline, is removed before the trampoline is built from the
+    // kernel tables, so task page tables never map a guard page.
+    if !install_guard_pages(memory, kernel_root)
+        || !crate::smp::install_ap_guards(memory, kernel_root)
+    {
         serial_write("Centinela-OS: failed to install kernel stack guard pages.\r\n");
         return false;
     }
@@ -311,6 +327,7 @@ pub fn init_cpu_layer(
         if !syscall::init_cpu(0) {
             return false;
         }
+        centinela_hal::serial::enable_locking();
         idt::init(crate::system::trap_handler);
         syscall::init(crate::system::syscall_handler);
         let per_ms = apic::calibrate(apic_virtual);
@@ -318,6 +335,7 @@ pub fn init_cpu_layer(
             .map(|counts| (counts * u64::from(TICK_MS)).min(u64::from(u32::MAX)) as u32)
             .unwrap_or(FALLBACK_INITIAL_COUNT);
         apic::init(apic_virtual, reload);
+        TIMER_RELOAD.store(reload, core::sync::atomic::Ordering::Relaxed);
         let mut writer = SerialWriter;
         match per_ms {
             Some(counts) => {

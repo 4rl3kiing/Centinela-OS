@@ -21,6 +21,8 @@ REQUIRED_MESSAGES=(
     "Services: 5/5 checks passed"
     "Capabilities: 5/5 badge and revocation checks passed."
     "Network: 2/2 DMA driver checks passed; out-of-domain DMA blocked by the IOMMU."
+    "SMP: CPU 1 ran 5/5 tasks on its own scheduler"
+    "SMP: application processor 1 ran its own task partition concurrently with the BSP."
     "[task e1000-driver] e1000: link up; ARP reply from 10.0.2.2 at 52:55:0a:00:02:02"
     "[task shell] cat nota.txt: microkernel con capacidades"
     "[task shell] net: udp loopback echo 'ping' ok"

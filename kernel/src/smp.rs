@@ -9,60 +9,83 @@
 //!   IDT whose gates are all DPL 0;
 //! - each AP enables the same CPU hardening as the BSP (NX, WP, SMEP, SMAP,
 //!   UMIP) and the BSP verifies it matches — a weaker AP fails the boot;
-//! - APs then park with interrupts disabled. They never run Ring 3 code and
-//!   never touch shared kernel state, so the single-CPU invariants of the
-//!   scheduler and IPC layer still hold. Any NMI/#MC on an AP ends in the
-//!   fail-closed fatal trap path.
+//! - APs then sleep until the BSP hands one a task set (wake IPI). The AP
+//!   runs it with its own scheduler instance, timer, trap stack and per-CPU
+//!   entry block, concurrently with the BSP (partitioned multiprocessing:
+//!   tasks never migrate and IPC stays within a CPU's partition).
 //!
-//! The APs share the BSP's kernel page tables. Because they only execute this
-//! module's code and their own stacks, stale TLB entries on parked APs are
-//! harmless; TLB shootdown becomes mandatory before APs run tasks.
+//! TLB coherence without shootdowns: each task address space runs on exactly
+//! one CPU, and the shared kernel half is only modified during boot, before
+//! any AP runs tasks. Frame allocation goes through the locked shared PMM.
 
 use core::fmt::Write;
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use centinela_hal::apic;
 use centinela_hal::cpu::enable_boot_hardening;
 use centinela_hal::gdt::{self, MAX_APS, TssStacks};
 use centinela_hal::idt;
 use centinela_hal::serial::{SerialWriter, write as serial_write};
+use centinela_hal::syscall;
 use centinela_kernel::memory::hhdm_backend::HhdmFrameMemory;
 use centinela_kernel::memory::vmm::{PAGE_SIZE, PageTableMapper, PhysAddr, VirtAddr};
 
 const AP_STACK_SIZE: usize = 8 * 1024;
+const AP_TRAP_STACK_SIZE: usize = 16 * 1024;
+const AP_KERNEL_STACK_SIZE: usize = 64 * 1024;
 /// Spin iterations the BSP waits for APs before declaring bring-up failed.
 const BRING_UP_SPINS: u64 = 200_000_000;
 
 #[repr(C, align(4096))]
-struct ApStack {
+struct GuardedStack<const N: usize> {
     guard: [u8; PAGE_SIZE as usize],
-    stack: [u8; AP_STACK_SIZE],
+    stack: [u8; N],
 }
 
+impl<const N: usize> GuardedStack<N> {
+    const fn new() -> Self {
+        Self {
+            guard: [0; PAGE_SIZE as usize],
+            stack: [0; N],
+        }
+    }
+}
+
+type ApStack = GuardedStack<AP_STACK_SIZE>;
+
+/// Stacks the CPU itself switches to on ring transitions and critical
+/// exceptions: they must be mapped while a task's tables are active, so they
+/// live in the KPTI trampoline.
 #[repr(C)]
 struct ApStacks {
-    kernel: ApStack,
+    trap: GuardedStack<AP_TRAP_STACK_SIZE>,
     double_fault: ApStack,
     nmi: ApStack,
     machine_check: ApStack,
 }
 
 const fn ap_stacks() -> ApStacks {
-    const fn one() -> ApStack {
-        ApStack {
-            guard: [0; PAGE_SIZE as usize],
-            stack: [0; AP_STACK_SIZE],
-        }
-    }
     ApStacks {
-        kernel: one(),
-        double_fault: one(),
-        nmi: one(),
-        machine_check: one(),
+        trap: GuardedStack::new(),
+        double_fault: GuardedStack::new(),
+        nmi: GuardedStack::new(),
+        machine_check: GuardedStack::new(),
     }
 }
 
+#[unsafe(link_section = ".bss.entry")]
 static mut AP_STACKS: [ApStacks; MAX_APS] = [const { ap_stacks() }; MAX_APS];
+/// The stack each AP's kernel code (scheduler) runs on; kernel-only.
+static mut AP_KERNEL_STACKS: [GuardedStack<AP_KERNEL_STACK_SIZE>; MAX_APS] =
+    [const { GuardedStack::new() }; MAX_APS];
+/// Local APIC ID of each released AP (for wake IPIs).
+static AP_APIC_IDS: [AtomicU32; MAX_APS] = [const { AtomicU32::new(0) }; MAX_APS];
+
+/// Work handed to an AP: a function the AP runs on its own scheduler.
+pub(crate) type ApWork = fn(usize);
+static AP_WORK: [AtomicU64; MAX_APS] = [const { AtomicU64::new(0) }; MAX_APS];
+static AP_DONE: [AtomicU32; MAX_APS] = [const { AtomicU32::new(0) }; MAX_APS];
 /// Kernel stack top per AP index, read by the naked entry before any call.
 static mut AP_STACK_TOPS: [u64; MAX_APS] = [0; MAX_APS];
 
@@ -115,8 +138,21 @@ pub(crate) fn record_bsp_hardening(features: centinela_hal::cpu::CpuHardening) {
     BSP_HARDENING.store(hardening_bits(features) | 1 << 31, Ordering::Release);
 }
 
-fn stack_top(stack: *const ApStack) -> u64 {
-    stack as u64 + core::mem::size_of::<ApStack>() as u64
+fn stack_top<const N: usize>(stack: *const GuardedStack<N>) -> u64 {
+    stack as u64 + core::mem::size_of::<GuardedStack<N>>() as u64
+}
+
+/// Trap stack (TSS.rsp0) top of AP `index`.
+pub(crate) fn trap_stack_top(index: usize) -> u64 {
+    if index >= MAX_APS {
+        return 0;
+    }
+    // SAFETY: Address computation on a 'static array element.
+    unsafe {
+        stack_top(addr_of!(
+            (*(addr_of!(AP_STACKS) as *const ApStacks).add(index)).trap
+        ))
+    }
 }
 
 /// AP entry: Limine jumps here with RDI = this CPU's `LimineMpInfo`, on a
@@ -162,7 +198,7 @@ extern "C" fn ap_main(info: *const LimineMpInfo) -> ! {
         // SAFETY: Field projections of a valid 'static element.
         let tss = unsafe {
             TssStacks {
-                privilege0: stack_top(addr_of!((*stacks).kernel)),
+                privilege0: stack_top(addr_of!((*stacks).trap)),
                 double_fault: stack_top(addr_of!((*stacks).double_fault)),
                 nmi: stack_top(addr_of!((*stacks).nmi)),
                 machine_check: stack_top(addr_of!((*stacks).machine_check)),
@@ -170,10 +206,19 @@ extern "C" fn ap_main(info: *const LimineMpInfo) -> ! {
         };
         // SAFETY: CPL 0, IF=0, this AP owns `index`; IDT was built by the BSP.
         let loaded = unsafe { gdt::init_ap(index, tss) };
-        if loaded {
-            // SAFETY: GDT/TSS of this CPU are loaded.
-            unsafe { idt::load() };
+        // SAFETY: GDT loaded; per-CPU block index + 1 is this AP's alone.
+        let bound = loaded && unsafe { syscall::init_cpu(index + 1) };
+        if bound {
+            // SAFETY: GDT/TSS of this CPU are loaded; the BSP initialized the
+            // IDT, SYSCALL handler and local APIC mapping before releasing APs.
+            unsafe {
+                idt::load();
+                syscall::init_ap();
+                apic::init_local(crate::isolation::timer_reload());
+            }
+            AP_APIC_IDS[index].store(apic::local_id(), Ordering::Release);
             AP_ONLINE.fetch_add(1, Ordering::Release);
+            work_loop(index);
         } else {
             AP_REJECTED.fetch_add(1, Ordering::Release);
         }
@@ -186,17 +231,69 @@ extern "C" fn ap_main(info: *const LimineMpInfo) -> ! {
     }
 }
 
+/// Sleeps (interrupts on only inside HLT) until given work, runs it, repeats.
+fn work_loop(index: usize) -> ! {
+    loop {
+        let work = AP_WORK[index].swap(0, Ordering::AcqRel);
+        if work == 0 {
+            // SAFETY: Woken by the wake IPI or the local timer; both handlers
+            // only acknowledge the interrupt when no task system runs here.
+            unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) };
+            continue;
+        }
+        // SAFETY: Only `dispatch` stores this value, a valid `ApWork`.
+        let work: ApWork = unsafe { core::mem::transmute(work as usize) };
+        work(index);
+        AP_DONE[index].store(1, Ordering::Release);
+    }
+}
+
+/// Hands `work` to AP `index` and wakes it. Returns false if that AP is not
+/// online.
+pub(crate) fn dispatch(index: usize, work: ApWork) -> bool {
+    if index >= AP_ONLINE.load(Ordering::Acquire) as usize {
+        return false;
+    }
+    AP_DONE[index].store(0, Ordering::Release);
+    AP_WORK[index].store(work as usize as u64, Ordering::Release);
+    apic::send_ipi(
+        AP_APIC_IDS[index].load(Ordering::Acquire),
+        apic::WAKE_VECTOR as u8,
+    );
+    true
+}
+
+/// Waits (bounded) for AP `index` to finish its work.
+pub(crate) fn wait_done(index: usize) -> bool {
+    (0..2_000_000_000u64).any(|_| {
+        let done = AP_DONE[index].load(Ordering::Acquire) != 0;
+        if !done {
+            core::hint::spin_loop();
+        }
+        done
+    })
+}
+
 /// Unmaps the guard page below every AP stack in the shared kernel tables.
-fn install_ap_guards(memory: &mut HhdmFrameMemory<'_, '_>, kernel_root: PhysAddr) -> bool {
+/// Runs before the KPTI trampoline is built.
+pub(crate) fn install_ap_guards(
+    memory: &mut HhdmFrameMemory<'_, '_>,
+    kernel_root: PhysAddr,
+) -> bool {
     let mut mapper = PageTableMapper::new(memory, kernel_root);
     for index in 0..MAX_APS {
         // SAFETY: Address computation only.
         let stacks = unsafe { (addr_of_mut!(AP_STACKS) as *mut ApStacks).add(index) };
+        // SAFETY: As above.
+        let kernel = unsafe {
+            (addr_of_mut!(AP_KERNEL_STACKS) as *mut GuardedStack<AP_KERNEL_STACK_SIZE>).add(index)
+        };
         // `guard` is the first field (repr(C)), so each stack's base is its guard.
         // SAFETY: Field projections of a valid 'static element.
         let guards = unsafe {
             [
-                addr_of!((*stacks).kernel) as u64,
+                kernel as u64,
+                addr_of!((*stacks).trap) as u64,
                 addr_of!((*stacks).double_fault) as u64,
                 addr_of!((*stacks).nmi) as u64,
                 addr_of!((*stacks).machine_check) as u64,
@@ -220,11 +317,7 @@ fn install_ap_guards(memory: &mut HhdmFrameMemory<'_, '_>, kernel_root: PhysAddr
 /// # Safety
 /// BSP only, IF=0, after the BSP's GDT/IDT are loaded; `request` must be the
 /// Limine MP request with its response filled in by the bootloader.
-pub(crate) unsafe fn start(
-    memory: &mut HhdmFrameMemory<'_, '_>,
-    kernel_root: PhysAddr,
-    request: *const LimineMpRequest,
-) -> bool {
+pub(crate) unsafe fn start(request: *const LimineMpRequest) -> bool {
     // SAFETY: Caller guarantees the request is valid.
     let response = unsafe { core::ptr::read_volatile(addr_of!((*request).response)) }
         as *const LimineMpResponse;
@@ -232,10 +325,6 @@ pub(crate) unsafe fn start(
     if response.is_null() {
         serial_write("SMP: bootloader provided no MP response; BSP only.\r\n");
         return true;
-    }
-    if !install_ap_guards(memory, kernel_root) {
-        serial_write("Centinela-OS: failed to install AP stack guard pages.\r\n");
-        return false;
     }
     // SAFETY: Non-null Limine response (HHDM-mapped bootloader data).
     let (bsp_lapic, count, cpus) = unsafe {
@@ -269,9 +358,8 @@ pub(crate) unsafe fn start(
         }
         // SAFETY: Index owned by the BSP until the AP is released below.
         unsafe {
-            let stacks = addr_of!(AP_STACKS) as *const ApStacks;
-            (*addr_of_mut!(AP_STACK_TOPS))[index] =
-                stack_top(addr_of!((*stacks.add(index)).kernel));
+            let kernel = addr_of!(AP_KERNEL_STACKS) as *const GuardedStack<AP_KERNEL_STACK_SIZE>;
+            (*addr_of_mut!(AP_STACK_TOPS))[index] = stack_top(kernel.add(index));
             core::ptr::write_volatile(addr_of_mut!((*info).extra_argument), index as u64);
             // The release store publishes the stack table and argument before
             // the AP can observe its goto address.

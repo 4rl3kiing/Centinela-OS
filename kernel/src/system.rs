@@ -26,7 +26,7 @@ use centinela_kernel::ipc::{
     attenuate,
 };
 use centinela_kernel::memory::address_space::{create_task_root, destroy_user_address_space};
-use centinela_kernel::memory::hhdm_backend::{HhdmFrameMemory, HhdmReader};
+use centinela_kernel::memory::hhdm_backend::{HhdmFrameMemory, HhdmReader, PmmLock};
 use centinela_kernel::memory::usercopy::copy_from_user;
 use centinela_kernel::memory::vmm::{
     HhdmOffset, PAGE_SIZE, PageMapping, PageTableMapper, PageTableWalker, PhysAddr,
@@ -355,13 +355,36 @@ struct System {
     hhdm: HhdmOffset,
 }
 
-static mut SYSTEM: Option<System> = None;
+/// One task system per CPU (partitioned multiprocessing).
+static mut SYSTEMS: [Option<System>; centinela_hal::syscall::MAX_CPUS] =
+    [const { None }; centinela_hal::syscall::MAX_CPUS];
+
+fn system_slot() -> *mut Option<System> {
+    let cpu = centinela_hal::syscall::cpu_index().min(centinela_hal::syscall::MAX_CPUS - 1);
+    // SAFETY: Address computation on a 'static array element.
+    unsafe { (core::ptr::addr_of_mut!(SYSTEMS) as *mut Option<System>).add(cpu) }
+}
 
 fn system_state() -> Option<&'static mut System> {
-    // SAFETY: Single CPU; the kernel runs with IF=0, so the scheduler and the
-    // trap/syscall handlers never execute concurrently, and the scheduler
-    // re-borrows after every return from user mode.
-    unsafe { (*core::ptr::addr_of_mut!(SYSTEM)).as_mut() }
+    // SAFETY: Each CPU touches only its own slot. On a CPU the kernel runs
+    // with IF=0, so its scheduler and trap/syscall handlers never execute
+    // concurrently, and the scheduler re-borrows after every user-mode return.
+    unsafe { (*system_slot()).as_mut() }
+}
+
+/// The frame allocator shared with application processors.
+static SHARED_PMM: core::sync::atomic::AtomicPtr<PmmLock<'static>> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+static KERNEL_ROOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static HHDM_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Result of the AP partition: tasks that behaved as required, plus one.
+static AP_RESULT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+pub fn set_shared_pmm(pmm: &'static PmmLock<'static>) {
+    SHARED_PMM.store(
+        core::ptr::from_ref(pmm).cast_mut(),
+        core::sync::atomic::Ordering::Release,
+    );
 }
 
 fn current_task(system: &mut System) -> Option<&mut Task> {
@@ -435,6 +458,8 @@ pub fn trap_handler(frame: &mut TrapFrame) {
                 }
             }
         }
+        // Wake-up IPI for an application processor that was handed work.
+        centinela_hal::apic::WAKE_VECTOR => apic::end_of_interrupt(),
         // Spurious APIC/PIC deliveries carry no work and must not be EOI'd.
         SPURIOUS_VECTOR | PIC_SPURIOUS_VECTOR => {}
         // NMI, double fault and machine check signal platform or kernel
@@ -711,10 +736,11 @@ fn sys_write(task: &Task, reader: HhdmReader, address: u64, length: u64) -> u64 
             *byte = b'.';
         }
     }
-    let mut writer = SerialWriter;
-    let _ = write!(writer, "[task {}] ", task.spec.name);
-    serial_write(core::str::from_utf8(buffer).unwrap_or(""));
-    serial_write("\r\n");
+    centinela_hal::serial::console(|writer| {
+        let _ = write!(writer, "[task {}] ", task.spec.name);
+        let _ = writer.write_str(core::str::from_utf8(buffer).unwrap_or(""));
+        let _ = writer.write_str("\r\n");
+    });
     length
 }
 
@@ -1290,7 +1316,7 @@ fn run_system(
     let reader = unsafe { HhdmReader::new(hhdm) };
     // SAFETY: No task is running; nothing else references SYSTEM.
     unsafe {
-        *core::ptr::addr_of_mut!(SYSTEM) = Some(System {
+        *system_slot() = Some(System {
             tasks: [const { None }; MAX_TASKS],
             dormant: [None; MAX_TASKS],
             endpoints: [EndpointState::default(); ENDPOINT_COUNT],
@@ -1400,7 +1426,7 @@ fn run_system(
         }
     }
     // SAFETY: No task is running; drop the system state.
-    unsafe { *core::ptr::addr_of_mut!(SYSTEM) = None };
+    unsafe { *system_slot() = None };
 
     let reclaimed = memory.net_allocated() == frames_before;
     for outcome in outcomes.iter_mut().flatten() {
@@ -1646,6 +1672,11 @@ fn describe(exit: TaskExit, writer: &mut SerialWriter) {
 
 /// Prints and checks one outcome; returns true if it matches its expectation.
 fn report(outcome: &Outcome) -> bool {
+    // One outcome line is printed in pieces: hold the console across them.
+    centinela_hal::serial::console(|_| report_unlocked(outcome))
+}
+
+fn report_unlocked(outcome: &Outcome) -> bool {
     let mut writer = SerialWriter;
     let Some(exit) = outcome.exit else {
         let _ = write!(
@@ -1743,6 +1774,11 @@ pub fn run_self_test(
     modules: &[(&'static str, &'static [u8])],
 ) -> bool {
     use user_programs as p;
+    // Partitioned SMP: application processor 0 runs its own task set on its
+    // own scheduler while this CPU runs every other scenario.
+    KERNEL_ROOT.store(kernel_root.get(), core::sync::atomic::Ordering::Release);
+    HHDM_BASE.store(hhdm.get(), core::sync::atomic::Ordering::Release);
+    let ap_started = crate::smp::dispatch(0, run_ap_partition);
     let isolated_tasks = [
         isolated("hello", "none (benign)", p::hello, 0, Expect::Exit(0)),
         isolated(
@@ -2026,6 +2062,15 @@ pub fn run_self_test(
     let services_ok = run_services_scenario(memory, kernel_root, hhdm, &module);
     let badges_ok = run_badge_scenario(memory, kernel_root, hhdm, &module);
     let network_ok = run_network_scenario(memory, kernel_root, hhdm, &module);
+    let ap_ok = ap_started && crate::smp::wait_done(0) && {
+        let passed = AP_RESULT.load(core::sync::atomic::Ordering::Acquire);
+        passed == AP_TASKS as u32 + 1
+    };
+    let _ = write!(
+        writer,
+        "SMP: application processor 1 {} its own task partition concurrently with the BSP.\r\n",
+        if ap_ok { "ran" } else { "FAILED to run" }
+    );
     isolation_ok
         && preemption_ok
         && elf_ok
@@ -2034,6 +2079,79 @@ pub fn run_self_test(
         && services_ok
         && badges_ok
         && network_ok
+        && ap_ok
+}
+
+const AP_TASKS: usize = 5;
+
+/// Runs on an application processor: an independent task partition with its
+/// own scheduler, timer-driven preemption, trap stack and entry block.
+fn run_ap_partition(_ap: usize) {
+    use core::sync::atomic::Ordering;
+    use user_programs as p;
+    let (Ok(kernel_root), Ok(hhdm)) = (
+        PhysAddr::new(KERNEL_ROOT.load(Ordering::Acquire)),
+        HhdmOffset::new(HHDM_BASE.load(Ordering::Acquire)),
+    ) else {
+        return;
+    };
+    let pmm = SHARED_PMM.load(Ordering::Acquire);
+    if pmm.is_null() {
+        return;
+    }
+    // SAFETY: The PMM lock is 'static and shared safely; this CPU's tasks'
+    // page tables are touched only by this instance.
+    let mut memory = unsafe { HhdmFrameMemory::new(hhdm, &*pmm) };
+    let cpu = centinela_hal::syscall::cpu_index();
+    let tasks: [TaskSpec; AP_TASKS] = [
+        isolated(
+            "ap-worker-a",
+            "CPU-bound on an AP, never yields",
+            p::worker,
+            0,
+            Expect::ExitAfterPreemption(0),
+        ),
+        isolated(
+            "ap-worker-b",
+            "CPU-bound on an AP, never yields",
+            p::worker,
+            0,
+            Expect::ExitAfterPreemption(0),
+        ),
+        isolated(
+            "ap-hello",
+            "benign task on an AP",
+            p::hello,
+            0,
+            Expect::Exit(0),
+        ),
+        isolated(
+            "ap-read-kernel",
+            "read kernel memory from an AP",
+            p::read_kernel,
+            0,
+            Expect::Fault(14),
+        ),
+        isolated(
+            "ap-privileged",
+            "privileged instruction on an AP",
+            p::privileged,
+            0,
+            Expect::Fault(13),
+        ),
+    ];
+    let outcomes = run_system(&mut memory, kernel_root, hhdm, &tasks);
+    let passed = outcomes
+        .iter()
+        .flatten()
+        .filter(|outcome| report(outcome))
+        .count();
+    let mut writer = SerialWriter;
+    let _ = write!(
+        writer,
+        "SMP: CPU {cpu} ran {passed}/{AP_TASKS} tasks on its own scheduler (preemption, containment, reclamation).\r\n"
+    );
+    AP_RESULT.store(passed as u32 + 1, Ordering::Release);
 }
 
 /// A real DMA driver: the e1000 NIC is confined to its own IOMMU domain.

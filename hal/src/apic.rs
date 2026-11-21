@@ -192,6 +192,35 @@ mod runtime {
         write(REG_TIMER_INITIAL, initial_count);
     }
 
+    /// Starts the calling application processor's local APIC timer (the
+    /// MMIO window is the same virtual page on every CPU, each CPU reaching
+    /// its own local APIC through it).
+    ///
+    /// # Safety
+    /// CPL 0, IF=0, after `init` ran on the BSP and this CPU loaded the IDT.
+    pub unsafe fn init_local(initial_count: u32) {
+        write(REG_TPR, 0);
+        write(REG_LVT_LINT0, LVT_MASKED);
+        write(REG_LVT_ERROR, LVT_MASKED);
+        write(REG_SVR, SVR_ENABLE | SPURIOUS_VECTOR as u32);
+        write(REG_TIMER_DIVIDE, TIMER_DIVIDE_BY_16);
+        write(REG_LVT_TIMER, timer_lvt());
+        write(REG_TIMER_INITIAL, initial_count);
+    }
+
+    /// Sends a fixed-delivery IPI with `vector` to the CPU with `apic_id`.
+    pub fn send_ipi(apic_id: u32, vector: u8) {
+        write(0x310, apic_id << 24);
+        write(0x300, u32::from(vector) | 1 << 14);
+        // Wait until the local APIC accepted the command (delivery status).
+        for _ in 0..1_000_000 {
+            if read(0x300) & (1 << 12) == 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
     /// Local APIC ID of the calling CPU (xAPIC: bits 31:24 of register 0x20).
     pub fn local_id() -> u32 {
         read(0x20) >> 24
@@ -204,7 +233,12 @@ mod runtime {
 }
 
 #[cfg(target_os = "none")]
-pub use runtime::{calibrate, end_of_interrupt, init, local_id, physical_base};
+pub use runtime::{
+    calibrate, end_of_interrupt, init, init_local, local_id, physical_base, send_ipi,
+};
+
+/// Vector used to wake a parked application processor that was given work.
+pub const WAKE_VECTOR: u64 = 0x2e;
 
 #[cfg(test)]
 mod tests {

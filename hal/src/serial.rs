@@ -93,9 +93,57 @@ pub fn write(message: &str) {
     if !is_present() {
         return;
     }
-    for byte in message.bytes() {
-        write_byte(byte);
+    console(|_| {
+        for byte in message.bytes() {
+            write_byte(byte);
+        }
+    });
+}
+
+use core::sync::atomic::AtomicUsize;
+
+/// Set once per-CPU blocks exist; before that only the BSP runs.
+static SMP_READY: AtomicBool = AtomicBool::new(false);
+/// Console owner (CPU index + 1, 0 = free) and nesting depth.
+static OWNER: AtomicUsize = AtomicUsize::new(0);
+static DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+/// Enables console locking (call after the BSP's per-CPU block exists).
+pub fn enable_locking() {
+    SMP_READY.store(true, Ordering::Release);
+}
+
+/// Runs `f` holding the console, so a line from one CPU is never split by
+/// another. Re-entrant on the same CPU.
+#[cfg(target_os = "none")]
+pub fn console<R>(f: impl FnOnce(&mut SerialWriter) -> R) -> R {
+    if !SMP_READY.load(Ordering::Acquire) {
+        return f(&mut SerialWriter);
     }
+    let me = crate::syscall::cpu_index() + 1;
+    if OWNER.load(Ordering::Acquire) == me {
+        DEPTH.fetch_add(1, Ordering::Relaxed);
+    } else {
+        while OWNER
+            .compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        DEPTH.store(1, Ordering::Relaxed);
+    }
+    let result = f(&mut SerialWriter);
+    if DEPTH.fetch_sub(1, Ordering::Relaxed) == 1 {
+        OWNER.store(0, Ordering::Release);
+    }
+    result
+}
+
+/// Host builds have a single thread.
+#[cfg(not(target_os = "none"))]
+pub fn console<R>(f: impl FnOnce(&mut SerialWriter) -> R) -> R {
+    let _ = (&SMP_READY, &OWNER, &DEPTH);
+    f(&mut SerialWriter)
 }
 
 /// `core::fmt::Write` adapter for formatted diagnostics (for example panics).
@@ -105,5 +153,10 @@ impl core::fmt::Write for SerialWriter {
     fn write_str(&mut self, text: &str) -> core::fmt::Result {
         write(text);
         Ok(())
+    }
+
+    /// A whole formatted line is written under one console hold.
+    fn write_fmt(&mut self, args: core::fmt::Arguments<'_>) -> core::fmt::Result {
+        console(|writer| core::fmt::write(writer, args))
     }
 }

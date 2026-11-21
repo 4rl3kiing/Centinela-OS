@@ -134,10 +134,12 @@ mod runtime {
 
     // Application processors get private descriptor tables: a TSS holds the
     // per-CPU rsp0 and IST stacks and is marked busy by `ltr`, so sharing one
-    // between CPUs is architecturally invalid. They stay outside the KPTI
-    // trampoline while APs never run Ring 3 code (least exposure); move them
-    // into `.data.entry` before scheduling tasks on APs.
+    // between CPUs is architecturally invalid. APs run Ring 3 tasks, so the
+    // CPU reads these on ring transitions under task page tables: they live
+    // in the KPTI trampoline like the BSP's.
+    #[unsafe(link_section = ".data.entry")]
     static mut AP_TSS: [TaskStateSegment; MAX_APS] = [const { TaskStateSegment::new() }; MAX_APS];
+    #[unsafe(link_section = ".data.entry")]
     static mut AP_GDT: [[u64; 7]; MAX_APS] =
         [[0, KERNEL_CODE, KERNEL_DATA, USER_DATA, USER_CODE, 0, 0]; MAX_APS];
 
@@ -222,9 +224,15 @@ mod runtime {
     /// `top` must be a 16-byte aligned, mapped, kernel-only stack top, and no
     /// interrupt may currently be executing on the previous rsp0 stack.
     pub unsafe fn set_privilege0_stack(top: u64) {
-        // SAFETY: Guaranteed by the caller; single CPU with interrupts disabled.
+        let cpu = crate::syscall::cpu_index();
+        // SAFETY: Guaranteed by the caller; each CPU writes only its own TSS
+        // with interrupts disabled.
         unsafe {
-            (*addr_of_mut!(TSS)).rsp[0] = top;
+            if cpu == 0 {
+                (*addr_of_mut!(TSS)).rsp[0] = top;
+            } else if cpu <= MAX_APS {
+                (*(addr_of_mut!(AP_TSS) as *mut TaskStateSegment).add(cpu - 1)).rsp[0] = top;
+            }
         }
     }
 }
