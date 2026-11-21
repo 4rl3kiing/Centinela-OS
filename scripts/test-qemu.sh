@@ -22,6 +22,15 @@ REQUIRED_MESSAGES=(
     "PMM initialized: 4 KiB frames, 64 GiB address ceiling."
     "PMM allocation/free self-test passed."
     "Bootstrap milestone: memory map validated and PMM online."
+    "Isolation: kernel stacks protected by unmapped guard pages."
+    "Isolation: GDT/TSS loaded (IST for #DF, NMI, #MC; no I/O bitmap)."
+    "Isolation: IDT loaded; all gates DPL 0; Ring 0 faults fail closed."
+    "Isolation: SYSCALL gate armed (TF/IF/DF/AC/NT/IOPL masked)."
+    "Isolation: legacy PIC IRQs masked; APIC timer watchdog armed."
+    "[task hello] hello from an isolated Ring 3 task .[2J"
+    "[task hello] kernel pointer rejected with EFAULT"
+    "Isolation: 12/12 tasks behaved as required; kernel still running."
+    "Microkernel milestone: layer isolation verified; every hostile task contained."
 )
 
 fail() {
@@ -56,7 +65,7 @@ run_and_check() {
     done
     # Any kernel-reported failure or panic fails the run even if milestones passed.
     # Every "Centinela-OS: " line except the entry banner is an error report.
-    if grep -F "PANIC" "$log" >/dev/null \
+    if grep -E "PANIC|KERNEL TRAP|UNEXPECTED|LEAKED|could not run" "$log" >/dev/null \
         || grep -F "Centinela-OS: " "$log" | grep -vF "Centinela-OS: Rust kernel entry reached." >/dev/null; then
         fail "$log" "$stderr" "Kernel reported a failure during $mode boot"
     fi

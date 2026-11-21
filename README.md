@@ -9,7 +9,7 @@ The project has a freestanding Rust kernel with a Limine BIOS/UEFI boot path and
 - CPU architecture: x86_64.
 - Firmware boot: legacy BIOS and UEFI through a common boot protocol.
 - Bootloader/protocol candidate: Limine.
-- Kernel model: capability-based hybrid microkernel (migration target; current executable baseline remains a minimal monolithic bootstrap).
+- Kernel model: capability-based hybrid microkernel. The zero-trust layer-isolation foundation (Ring 3 tasks, syscall gate, per-task address spaces) is implemented; IPC, scheduler and user-space services are next.
 - Kernel language: Rust, `no_std` in privileged code.
 - Initial binary target: `x86_64-unknown-none`.
 - Initial execution environments: QEMU first; physical hardware after repeatable virtual-machine validation.
@@ -52,8 +52,13 @@ The PMM is an initial single-core implementation. It is not yet a complete virtu
 - [Kernel architecture and implementation roadmap](docs/architecture/overview.md)
 - [ADR-0001: x86_64, BIOS/UEFI, and boot strategy](docs/decisions/0001-platform-and-boot.md)
 - [ADR-0002: capability-based hybrid microkernel](docs/decisions/0002-hybrid-microkernel.md)
+- [ADR-0003: zero-trust layer isolation](docs/decisions/0003-layer-isolation-zero-trust.md)
 - [Layered security hardening implementation plan](docs/security/hardening-implementation-plan.md)
 
 ## Current status
 
-Bootstrap and initial PMM milestones passed: the kernel builds, produces a hybrid ISO, reaches its Rust entry point, validates the Limine memory map and exercises PMM allocation/free under BIOS and UEFI in QEMU. The hardening implementation branch passed formatting, Clippy, host unit tests, freestanding compilation, hybrid ISO generation, and BIOS/UEFI QEMU boot checks at commit `0c7bd37177271ad0e7f3fbb7ad8b8acc5e8c9f85` (including passing Miri, Kani and PMM fuzz smoke workflows). The microkernel migration is a target architecture, not an implemented runtime yet. VMM enforcement, scheduler, Ring 3, syscall dispatch, IPC, user-space services/drivers, KASLR, KPTI, heap hardening and IOMMU remain incomplete.
+Bootstrap, PMM and hardening milestones passed under BIOS and UEFI in QEMU, with Miri, Kani and fuzz workflows.
+
+**Microkernel foundation (zero-trust layer isolation):** GDT/TSS with IST stacks, IDT with fail-closed Ring 0 handling, guard pages on every kernel stack (including the kernel's own execution stack), per-task address spaces with a supervisor-only kernel half, a SYSCALL gate with policy plus capability authorization, validated user-memory copies that never dereference user addresses, and a local APIC watchdog. Every boot runs one benign and eleven hostile Ring 3 tasks; each attack (kernel memory reads, privileged instructions, port I/O, W^X and NX violations, spoofed interrupts, forbidden/unknown/uncapable syscalls, CPU monopolization, stack overflow) is contained, its memory reclaimed, and the kernel keeps running. See ADR-0003.
+
+Not yet implemented: IPC and capability transfer, scheduler, service restart, SMP, ELF loading, KASLR, KPTI, heap hardening and IOMMU.

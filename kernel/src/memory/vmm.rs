@@ -9,13 +9,17 @@ use centinela_security::permissions::PagePermissions;
 
 pub const PAGE_SIZE: u64 = 4096;
 const ADDRESS_BITS: u32 = 48;
-const PHYSICAL_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
+pub(crate) const PHYSICAL_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 const CR3_ADDRESS_MASK: u64 = PHYSICAL_ADDRESS_MASK;
 
-const PRESENT: u64 = 1 << 0;
-const WRITABLE: u64 = 1 << 1;
-const USER: u64 = 1 << 2;
+pub(crate) const PRESENT: u64 = 1 << 0;
+pub(crate) const WRITABLE: u64 = 1 << 1;
+pub(crate) const USER: u64 = 1 << 2;
+const WRITE_THROUGH: u64 = 1 << 3;
+const CACHE_DISABLE: u64 = 1 << 4;
 const NO_EXECUTE: u64 = 1 << 63;
+#[cfg(test)]
+pub(crate) const NO_EXECUTE_FOR_TESTS: u64 = NO_EXECUTE;
 /// Bits 52..62 are software-available or protection-key bits. Centinela never
 /// sets them, so any value here is treated as corruption (fail closed).
 const RESERVED_HIGH_BITS: u64 = 0x7ff0_0000_0000_0000;
@@ -75,6 +79,8 @@ pub struct PageMapping {
     virtual_address: VirtAddr,
     physical_address: PhysAddr,
     permissions: PagePermissions,
+    /// Strong-uncacheable device memory (PCD|PWT), for MMIO registers.
+    device: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,6 +91,7 @@ pub enum MappingError {
     /// User mappings of virtual page zero are refused so that kernel NULL
     /// dereferences can never reach attacker-controlled memory.
     NullPageUserMapping,
+    DeviceMappingOutsideKernelHalf,
     WriteExecuteViolation,
     UnreadablePageUnsupported,
 }
@@ -124,7 +131,34 @@ impl PageMapping {
             virtual_address,
             physical_address,
             permissions,
+            device: false,
         })
+    }
+
+    /// Kernel-only, writable, non-executable, uncacheable MMIO mapping.
+    /// Device registers can never be mapped into the user half this way.
+    pub const fn kernel_device(
+        virtual_address: u64,
+        physical_address: u64,
+    ) -> Result<Self, MappingError> {
+        if virtual_address < KERNEL_HALF_START {
+            return Err(MappingError::DeviceMappingOutsideKernelHalf);
+        }
+        let permissions = match PagePermissions::new(true, true, false, false) {
+            Ok(permissions) => permissions,
+            Err(_) => return Err(MappingError::WriteExecuteViolation),
+        };
+        match Self::new(virtual_address, physical_address, permissions) {
+            Ok(mapping) => Ok(Self {
+                device: true,
+                ..mapping
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub const fn is_device(self) -> bool {
+        self.device
     }
 
     pub const fn virtual_address(self) -> VirtAddr {
@@ -148,6 +182,9 @@ impl PageMapping {
         }
         if !self.permissions.executable() {
             raw |= NO_EXECUTE;
+        }
+        if self.device {
+            raw |= CACHE_DISABLE | WRITE_THROUGH;
         }
         PageTableEntry(raw)
     }
@@ -415,6 +452,22 @@ mod tests {
     }
 
     #[test]
+    fn device_mappings_are_kernel_only_uncached_and_non_executable() {
+        use super::{MappingError, PageMapping};
+        let device = PageMapping::kernel_device(0xffff_ffff_7000_0000, 0xfee0_0000).unwrap();
+        let entry = device.leaf_entry();
+        assert!(device.is_device());
+        assert!(!entry.is_user_accessible());
+        assert!(!entry.is_executable());
+        assert!(entry.is_writable());
+        assert_eq!(entry.raw() & 0x18, 0x18, "PCD and PWT must be set");
+        assert_eq!(
+            PageMapping::kernel_device(0x40_0000, 0xfee0_0000),
+            Err(MappingError::DeviceMappingOutsideKernelHalf)
+        );
+    }
+
+    #[test]
     fn hhdm_offset_must_be_aligned_upper_half() {
         assert_eq!(
             HhdmOffset::new(0x0000_0000_4000_0000),
@@ -509,7 +562,7 @@ mod verification {
     }
 }
 
-const HUGE_PAGE: u64 = 1 << 7;
+pub(crate) const HUGE_PAGE: u64 = 1 << 7;
 const PAGE_2M_MASK: u64 = 0x000f_ffff_ffe0_0000;
 const PAGE_1G_MASK: u64 = 0x000f_ffff_c000_0000;
 
@@ -1068,6 +1121,7 @@ impl<'a, M: PageTableMutationMemory> PageTableMapper<'a, M> {
             virtual_address,
             physical_address: physical,
             permissions,
+            device: raw & CACHE_DISABLE != 0,
         };
 
         self.memory

@@ -264,6 +264,31 @@ const fn is_canonical_address(address: u64) -> bool {
     }
 }
 
+/// Returns CR2, the linear address of the most recent page fault.
+pub fn page_fault_address() -> u64 {
+    let value: u64;
+    // SAFETY: Reading CR2 is side-effect free at CPL 0.
+    unsafe {
+        core::arch::asm!("mov {}, cr2", out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+/// Activates the page-table hierarchy rooted at `root_physical`.
+///
+/// Loading CR3 also flushes every non-global TLB entry.
+///
+/// # Safety
+/// `root_physical` must be a valid, 4 KiB aligned PML4 that maps the
+/// currently executing kernel code, stack and all data used afterwards.
+pub unsafe fn load_page_table_root(root_physical: u64) {
+    // SAFETY: Guaranteed by the caller. No `nomem`: switching address spaces
+    // must also be a compiler barrier.
+    unsafe {
+        core::arch::asm!("mov cr3, {}", in(reg) root_physical, options(nostack, preserves_flags));
+    }
+}
+
 #[cfg(test)]
 mod tlb_tests {
     use super::is_canonical_address;
