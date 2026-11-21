@@ -2,7 +2,7 @@ name: Kernel fuzz smoke tests
 
 on:
   push:
-    branches: ["hardening/**", "microkernel/**"]
+    branches: [main, "hardening/**", "microkernel/**"]
   pull_request:
     branches: [main]
   workflow_dispatch:

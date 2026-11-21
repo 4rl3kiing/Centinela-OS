@@ -26,6 +26,9 @@ use centinela_kernel::memory::vmm::{
     VirtAddr,
 };
 
+/// Link-time virtual base (linker/x86_64.ld); Limine slides the PIE kernel.
+const KERNEL_LINK_BASE: u64 = 0xffff_ffff_8000_0000;
+
 const LIMINE_COMMON_MAGIC: [u64; 2] = [0xc7b1_dd30_df4c_8b88, 0x0a82_e883_a194_f07b];
 
 #[repr(C)]
@@ -455,6 +458,13 @@ fn kernel_physical_range<M: PageTableMemory>(
         return None;
     }
     serial_write("Kernel image: physical range verified against page tables.\r\n");
+    let mut writer = SerialWriter;
+    let _ = core::fmt::Write::write_fmt(
+        &mut writer,
+        format_args!(
+            "Kernel image: KASLR virtual base {virtual_base:#x} (link base {KERNEL_LINK_BASE:#x}).\r\n"
+        ),
+    );
     Some((physical_base, physical_end))
 }
 

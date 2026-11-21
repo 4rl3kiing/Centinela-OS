@@ -4,8 +4,9 @@ target = "x86_64-unknown-none"
 [target.x86_64-unknown-none]
 linker = "rust-lld"
 rustflags = [
-  "-C", "code-model=kernel",
-  "-C", "relocation-model=static",
+  # Position-independent code: the kernel links as a PIE so Limine can apply
+  # KASLR; userland links the same code as fixed executables (build.rs).
+  "-C", "relocation-model=pic",
   "-C", "link-arg=--gc-sections",
   "-C", "link-arg=-z",
   "-C", "link-arg=max-page-size=0x1000",

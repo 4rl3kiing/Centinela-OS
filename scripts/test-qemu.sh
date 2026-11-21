@@ -19,6 +19,7 @@ REQUIRED_MESSAGES=(
     "VMM bootstrap: Limine page-table frames validated through HHDM."
     "VMM bootstrap: HHDM root alias and kernel RX mapping verified."
     "Kernel image: physical range verified against page tables."
+    "Kernel image: KASLR virtual base"
     "PMM initialized: 4 KiB frames, 64 GiB address ceiling."
     "PMM allocation/free self-test passed."
     "Bootstrap milestone: memory map validated and PMM online."
@@ -116,3 +117,11 @@ run_and_check uefi -- \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=build/OVMF_VARS.fd" \
     -cdrom "$ISO" -boot d
+
+# KASLR: the three boots must not all share one kernel virtual base.
+bases=$(grep -h -o "KASLR virtual base 0x[0-9a-f]*" build/logs/qemu-bios.log build/logs/qemu-bios-cpu-max.log build/logs/qemu-uefi.log | sort -u | wc -l)
+if [[ "$bases" -lt 2 ]]; then
+    echo "KASLR check failed: kernel virtual base did not change across boots" >&2
+    exit 1
+fi
+echo "PASS: KASLR randomized the kernel base across boots ($bases distinct bases)"

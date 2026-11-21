@@ -35,9 +35,18 @@ const KERNEL_STACK_SIZE: usize = 16 * 1024;
 pub(crate) const USER_CODE_BASE: u64 = 0x0000_0000_0040_0000;
 pub(crate) const USER_STACK_TOP: u64 = 0x0000_7fff_0000_0000;
 const USER_STACK_PAGES: u64 = 4;
-/// Kernel-only virtual address of the local APIC registers (PML4 slot 511,
-/// shared supervisor-only by every address space; outside HHDM and image).
-const APIC_MMIO_VIRTUAL: u64 = 0xffff_ffff_7000_0000;
+/// Finds a kernel-half PML4 slot the bootloader left empty. With KASLR the
+/// kernel image and the HHDM move on every boot, so no fixed address is safe
+/// for device mappings; an empty top-level slot cannot collide with either.
+fn free_kernel_slot_address(
+    memory: &HhdmFrameMemory<'_, '_>,
+    kernel_root: PhysAddr,
+) -> Option<u64> {
+    (256u16..511).rev().find_map(|slot| {
+        let entry = memory.read_entry(kernel_root, slot).ok()?;
+        (entry & 1 == 0).then_some(0xffff_0000_0000_0000 | (u64::from(slot) << 39))
+    })
+}
 /// Scheduler/watchdog tick length; the APIC timer is calibrated against the
 /// PIT so this is real time, not bus-clock dependent.
 pub(crate) const TICK_MS: u32 = 10;
@@ -122,7 +131,11 @@ pub fn init_cpu_layer(memory: &mut HhdmFrameMemory<'_, '_>, kernel_root: PhysAdd
     serial_write("Isolation: kernel stacks protected by unmapped guard pages.\r\n");
 
     let apic_physical = apic::physical_base();
-    let Ok(apic_mapping) = PageMapping::kernel_device(APIC_MMIO_VIRTUAL, apic_physical) else {
+    let Some(apic_virtual) = free_kernel_slot_address(memory, kernel_root) else {
+        serial_write("Centinela-OS: no free kernel slot for device mappings.\r\n");
+        return false;
+    };
+    let Ok(apic_mapping) = PageMapping::kernel_device(apic_virtual, apic_physical) else {
         return false;
     };
     if PageTableMapper::new(memory, kernel_root)
@@ -145,11 +158,11 @@ pub fn init_cpu_layer(memory: &mut HhdmFrameMemory<'_, '_>, kernel_root: PhysAdd
         gdt::init(stacks);
         idt::init(crate::system::trap_handler);
         syscall::init(crate::system::syscall_handler);
-        let per_ms = apic::calibrate(APIC_MMIO_VIRTUAL);
+        let per_ms = apic::calibrate(apic_virtual);
         let reload = per_ms
             .map(|counts| (counts * u64::from(TICK_MS)).min(u64::from(u32::MAX)) as u32)
             .unwrap_or(FALLBACK_INITIAL_COUNT);
-        apic::init(APIC_MMIO_VIRTUAL, reload);
+        apic::init(apic_virtual, reload);
         let mut writer = SerialWriter;
         match per_ms {
             Some(counts) => {

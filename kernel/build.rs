@@ -6,5 +6,8 @@ fn main() {
     println!("cargo:rerun-if-changed={script}");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none") {
         println!("cargo:rustc-link-arg-bin=centinela-kernel=-T{script}");
+        // Relocatable kernel: Limine picks a random virtual base (KASLR).
+        println!("cargo:rustc-link-arg-bin=centinela-kernel=-pie");
+        println!("cargo:rustc-link-arg-bin=centinela-kernel=--no-dynamic-linker");
     }
 }

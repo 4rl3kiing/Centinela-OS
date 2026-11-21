@@ -6,7 +6,10 @@ fn main() {
         println!("cargo:rerun-if-changed={manifest}/{script}");
     }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none") {
-        println!("cargo:rustc-link-arg-bin=elf-hello=-T{manifest}/link.ld");
-        println!("cargo:rustc-link-arg-bin=elf-wx=-T{manifest}/link-wx.ld");
+        for (bin, script) in [("elf-hello", "link.ld"), ("elf-wx", "link-wx.ld")] {
+            println!("cargo:rustc-link-arg-bin={bin}=-T{manifest}/{script}");
+            // Fixed-address static executable (ET_EXEC) from PIC code.
+            println!("cargo:rustc-link-arg-bin={bin}=-no-pie");
+        }
     }
 }

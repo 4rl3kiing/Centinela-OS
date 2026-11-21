@@ -7,20 +7,22 @@ KERNEL_LMA = 0x00100000;
 
 PHDRS
 {
-    text   PT_LOAD FLAGS(5);
-    rodata PT_LOAD FLAGS(4);
-    data   PT_LOAD FLAGS(6);
+    text    PT_LOAD FLAGS(5);
+    rodata  PT_LOAD FLAGS(4);
+    data    PT_LOAD FLAGS(6);
+    dynamic PT_DYNAMIC FLAGS(6);
 }
 
 SECTIONS
 {
     /* Limine chooses the physical load address; the kernel obtains it from
        the executable-address response. Only virtual bounds are exported. */
-    __kernel_virt_start = KERNEL_VMA;
     . = KERNEL_VMA;
 
     .text ALIGN(4K) : AT(KERNEL_LMA)
     {
+        /* Section-relative (not absolute) so it is relocated under KASLR. */
+        __kernel_virt_start = .;
         KEEP(*(.text._start))
         *(.text .text.*)
     } :text
@@ -33,18 +35,32 @@ SECTIONS
         *(.rodata .rodata.*)
     } :rodata
 
-    .data ALIGN(4K) : AT(ALIGN(LOADADDR(.rodata) + SIZEOF(.rodata), 4K))
+    /* Relocation tables Limine applies when it randomizes the base (KASLR). */
+    .rela.dyn : { *(.rela.dyn) *(.rela.*) } :rodata
+    .dynsym : { *(.dynsym) } :rodata
+    .dynstr : { *(.dynstr) } :rodata
+    .gnu.hash : { *(.gnu.hash) } :rodata
+    .hash : { *(.hash) } :rodata
+
+    .data ALIGN(4K) : AT(ALIGN(LOADADDR(.hash) + SIZEOF(.hash), 4K))
     {
         *(.data .data.*)
+        *(.data.rel.ro .data.rel.ro.*)
+        *(.got .got.*)
     } :data
 
-    .bss ALIGN(4K) (NOLOAD) : AT(ALIGN(LOADADDR(.data) + SIZEOF(.data), 4K))
+    .dynamic : AT(LOADADDR(.data) + SIZEOF(.data))
+    {
+        *(.dynamic)
+    } :data :dynamic
+
+    .bss ALIGN(4K) (NOLOAD) : AT(ALIGN(LOADADDR(.dynamic) + SIZEOF(.dynamic), 4K))
     {
         *(COMMON)
         *(.bss .bss.*)
+        __kernel_virt_end = .;
     } :data
 
-    __kernel_virt_end = ADDR(.bss) + SIZEOF(.bss);
 
     /DISCARD/ :
     {
