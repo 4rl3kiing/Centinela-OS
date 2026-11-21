@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 centinela-cfs = { path = "../cfs" }
+centinela-disk = { path = "../disk" }
 
 [lints]
 workspace = true
@@ -98,5 +99,11 @@ bench = false
 [[bin]]
 name = "storage-client"
 path = "src/bin/storage_client.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "installer"
+path = "src/bin/installer.rs"
 test = false
 bench = false

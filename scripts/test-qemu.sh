@@ -61,7 +61,7 @@ REQUIRED_MESSAGES=(
     "[task hello] kernel pointer rejected with EFAULT"
     "Isolation: 12/12 tasks behaved as required; kernel still running."
     "Scheduler: preemptive time slicing verified (both CPU-bound tasks finished)."
-    "Boot modules: 15 verified by the boot chain."
+    "Boot modules: 17 verified by the boot chain."
     "[task elf-hello] hello from a Rust ELF loaded from a verified boot module"
     "[task elf-hello] mapped 2 zeroed anonymous RW pages with MapMemory"
     "ELF loader: refused elf-wx: segment both writable and executable (W^X); nothing was mapped or executed."
@@ -284,3 +284,67 @@ if [[ "$count" != "$expected" ]]; then
     exit 1
 fi
 echo "PASS: CFS volume clean after $count boots; data persisted across reboots"
+
+# Installation: boot the installation media with an empty 256 MiB NVMe disk
+# and the QEMU-only install request, then boot that disk alone (UEFI, no
+# installation media) and check that the installed system comes up.
+INSTALL_DISK=build/install-disk.img
+rm -f "$INSTALL_DISK"
+truncate -s 256M "$INSTALL_DISK"
+install_boot() {
+    local mode="$1"; shift
+    local log="build/logs/qemu-$P$mode.log"
+    : >"$log"
+    cp "$OVMF_VARS" "build/OVMF_VARS.$mode.fd"
+    set +e
+    timeout "$TIMEOUT_SECONDS" "$QEMU" -machine q35 -m 512M -smp 2 "${ACCEL[@]}" -device intel-iommu,intremap=on \
+        -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
+        -drive "if=pflash,format=raw,file=build/OVMF_VARS.$mode.fd" \
+        -drive "file=$INSTALL_DISK,if=none,id=inst,format=raw" -device nvme,serial=install,drive=inst \
+        -display none -monitor none -serial "file:$log" -serial null \
+        -chardev "file,id=shellin-$mode,path=/dev/null,input-path=$SHELL_INPUT" -serial chardev:shellin-$mode \
+        -fw_cfg name=opt/centinela/poweroff,string=1 -no-reboot "$@" >/dev/null 2>&1
+    set -e
+    shift $#
+}
+expect_in() {
+    local log="$1"; shift
+    local message
+    for message in "$@"; do
+        grep -Fq -- "$message" "$log" || fail "$log" /dev/null "Missing in $(basename "$log"): $message"
+    done
+    if grep -E "PANIC|KERNEL TRAP|UNEXPECTED|LEAKED" "$log" >/dev/null; then
+        fail "$log" /dev/null "Kernel reported a failure in $(basename "$log")"
+    fi
+}
+install_boot install -cdrom "$ISO" -boot d -fw_cfg name=opt/centinela/install,string=1
+expect_in "build/logs/qemu-${P}install.log" \
+    "Installer: requested (blank target disk only)." \
+    "installer: GPT written (ESP 160 MiB" \
+    "installer: EFI system partition (FAT32) holds" \
+    "installer: installation complete" \
+    "Installer: done. Remove the installation media and reboot."
+echo "PASS: installer wrote GPT, FAT32 ESP and CFS system volume"
+
+# Host-side verification of what the installer wrote.
+sgdisk -v "$INSTALL_DISK" | grep -q "No problems found" || { sgdisk -v "$INSTALL_DISK"; echo "GPT verification failed" >&2; exit 1; }
+ESP_IMAGE=build/install-esp.img
+dd if="$INSTALL_DISK" of="$ESP_IMAGE" bs=512 skip=2048 count=$((160 * 2048)) status=none
+fsck.fat -n "$ESP_IMAGE" >/dev/null || { echo "fsck.fat found errors on the installed ESP" >&2; exit 1; }
+mtype -i "$ESP_IMAGE" ::/boot/limine/limine.conf | grep -q "module_string: storage" \
+    || { echo "installed limine.conf is missing or incomplete" >&2; exit 1; }
+cmp <(mtype -i "$ESP_IMAGE" ::/boot/centinela-kernel) build/iso-root/boot/centinela-kernel \
+    || { echo "installed kernel differs from the media" >&2; exit 1; }
+CFS_IMAGE=build/install-cfs.img
+dd if="$INSTALL_DISK" of="$CFS_IMAGE" bs=512 skip=$((2048 + 160 * 2048)) status=none
+"$CFS_TOOL" fsck "$CFS_IMAGE" >/dev/null || { echo "installed CFS volume failed fsck" >&2; exit 1; }
+"$CFS_TOOL" get "$CFS_IMAGE" install-info | grep -q "Instalado" || { echo "install-info missing" >&2; exit 1; }
+echo "PASS: host tools verify the installed disk (sgdisk, fsck.fat, mtype, cfs-tool)"
+
+install_boot installed
+expect_in "build/logs/qemu-${P}installed.log" \
+    "Centinela-OS: Rust kernel entry reached." \
+    "files on GPT partition 'Centinela system'; boot count now 1" \
+    "storage: install-info: Instalado por el instalador de Centinela-OS." \
+    "Microkernel milestone:"
+echo "PASS: the installed system boots from its own disk (UEFI) and mounts its CFS volume"

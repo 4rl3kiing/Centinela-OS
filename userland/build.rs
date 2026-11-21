@@ -21,6 +21,7 @@ fn main() {
             ("e1000-driver", "link.ld"),
             ("storage", "link.ld"),
             ("storage-client", "link.ld"),
+            ("installer", "link.ld"),
             ("nvme-driver", "link.ld"),
         ] {
             println!("cargo:rustc-link-arg-bin={bin}=-T{manifest}/{script}");

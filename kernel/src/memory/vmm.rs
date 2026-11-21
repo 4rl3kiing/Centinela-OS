@@ -17,8 +17,8 @@ pub(crate) const WRITABLE: u64 = 1 << 1;
 pub(crate) const USER: u64 = 1 << 2;
 const WRITE_THROUGH: u64 = 1 << 3;
 const CACHE_DISABLE: u64 = 1 << 4;
-/// Software bit (AVL): the frame is device memory, never owned RAM, so
-/// address-space teardown must not return it to the frame allocator.
+/// Software bit (AVL): the frame is lent (device memory or a boot module),
+/// never owned RAM, so address-space teardown must not free it.
 pub const DEVICE_MEMORY: u64 = 1 << 9;
 const NO_EXECUTE: u64 = 1 << 63;
 #[cfg(test)]
@@ -84,6 +84,9 @@ pub struct PageMapping {
     permissions: PagePermissions,
     /// Strong-uncacheable device memory (PCD|PWT), for MMIO registers.
     device: bool,
+    /// Frame lent to the address space (boot module, device memory): it is
+    /// never returned to the frame allocator at teardown.
+    borrowed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,6 +138,7 @@ impl PageMapping {
             physical_address,
             permissions,
             device: false,
+            borrowed: false,
         })
     }
 
@@ -154,6 +158,7 @@ impl PageMapping {
         match Self::new(virtual_address, physical_address, permissions) {
             Ok(mapping) => Ok(Self {
                 device: true,
+                borrowed: true,
                 ..mapping
             }),
             Err(error) => Err(error),
@@ -173,6 +178,26 @@ impl PageMapping {
         match Self::new(virtual_address, physical_address, permissions) {
             Ok(mapping) => Ok(Self {
                 device: true,
+                borrowed: true,
+                ..mapping
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// User read-only, non-executable, cacheable view of a frame the kernel
+    /// lends (e.g. a boot module); never freed with the address space.
+    pub const fn user_borrowed(
+        virtual_address: u64,
+        physical_address: u64,
+    ) -> Result<Self, MappingError> {
+        let permissions = match PagePermissions::new(true, false, false, true) {
+            Ok(permissions) => permissions,
+            Err(_) => return Err(MappingError::WriteExecuteViolation),
+        };
+        match Self::new(virtual_address, physical_address, permissions) {
+            Ok(mapping) => Ok(Self {
+                borrowed: true,
                 ..mapping
             }),
             Err(error) => Err(error),
@@ -206,7 +231,10 @@ impl PageMapping {
             raw |= NO_EXECUTE;
         }
         if self.device {
-            raw |= CACHE_DISABLE | WRITE_THROUGH | DEVICE_MEMORY;
+            raw |= CACHE_DISABLE | WRITE_THROUGH;
+        }
+        if self.borrowed {
+            raw |= DEVICE_MEMORY;
         }
         PageTableEntry(raw)
     }
@@ -1148,6 +1176,7 @@ impl<'a, M: PageTableMutationMemory> PageTableMapper<'a, M> {
             physical_address: physical,
             permissions,
             device: raw & CACHE_DISABLE != 0,
+            borrowed: raw & DEVICE_MEMORY != 0,
         };
 
         self.memory

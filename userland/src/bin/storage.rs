@@ -18,6 +18,8 @@
 #![no_main]
 
 use centinela_cfs::{BLOCK_SIZE, Block, BlockDevice, Error, Volume, format};
+use centinela_disk::gpt::{self, CFS_TYPE, MAX_PARTITIONS, Partition};
+use centinela_disk::{Sector, SectorDevice};
 use centinela_userland::nvme::Nvme;
 use centinela_userland::{FLAG_KERNEL_ORIGIN, Line, exit, pack, reply_and_wait, reply_wait, write};
 
@@ -36,8 +38,29 @@ static mut STAGED: [u8; STAGING] = [0; STAGING];
 
 struct Disk {
     nvme: Nvme,
+    /// First LBA of the volume (the CFS partition on an installed disk).
+    first: u64,
     blocks: u64,
     sectors_per_block: u64,
+}
+
+/// Raw 512-byte sector access for reading the partition table.
+struct Sectors<'a>(&'a mut Nvme);
+
+impl SectorDevice for Sectors<'_> {
+    fn sectors(&self) -> u64 {
+        self.0.blocks
+    }
+    fn read(&mut self, lba: u64, buffer: &mut Sector) -> Result<(), centinela_disk::Error> {
+        if self.0.transfer(false, lba, 1, 6) && self.0.read_page(6, 0, buffer) {
+            Ok(())
+        } else {
+            Err(centinela_disk::Error::Io)
+        }
+    }
+    fn write(&mut self, _: u64, _: &Sector) -> Result<(), centinela_disk::Error> {
+        Err(centinela_disk::Error::Io)
+    }
 }
 
 impl BlockDevice for Disk {
@@ -48,7 +71,7 @@ impl BlockDevice for Disk {
         if block >= self.blocks
             || !self.nvme.transfer(
                 false,
-                block * self.sectors_per_block,
+                self.first + block * self.sectors_per_block,
                 self.sectors_per_block as u16,
                 5,
             )
@@ -63,7 +86,7 @@ impl BlockDevice for Disk {
             || !self.nvme.write_page(5, 0, buffer)
             || !self.nvme.transfer(
                 true,
-                block * self.sectors_per_block,
+                self.first + block * self.sectors_per_block,
                 self.sectors_per_block as u16,
                 5,
             )
@@ -123,15 +146,35 @@ fn boot_count<D: BlockDevice>(volume: &mut Volume<'_, D>) -> Result<u64, Error> 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(endpoint: u64, _unused: u64, _unused2: u64, mmio: u64) -> ! {
     let mut model = Line::new();
-    let nvme = match Nvme::bring_up(mmio, &mut model) {
+    let mut nvme = match Nvme::bring_up(mmio, &mut model) {
         Ok(nvme) => nvme,
         Err((message, code)) => fail(message, code),
     };
     let sectors_per_block = (BLOCK_SIZE / nvme.block_size) as u64;
-    let device_blocks = nvme.blocks / sectors_per_block;
-    let blocks = (device_blocks - 1).min(MAX_VOLUME_BLOCKS);
+    // An installed disk carries a GPT with a CFS partition; a bare disk (the
+    // test harness, or a disk prepared with cfs-tool) is used whole, minus
+    // its last 4 KiB.
+    let mut partitions = [Partition::default(); MAX_PARTITIONS];
+    let system = if nvme.block_size == 512 {
+        gpt::read(&mut Sectors(&mut nvme), &mut partitions)
+            .ok()
+            .and_then(|count| {
+                partitions[..count]
+                    .iter()
+                    .find(|p| p.type_guid == CFS_TYPE)
+                    .copied()
+            })
+    } else {
+        None
+    };
+    let (first, blocks) = match system {
+        Some(partition) => (partition.first_lba, partition.sectors() / sectors_per_block),
+        None => (0, nvme.blocks / sectors_per_block - 1),
+    };
+    let blocks = blocks.min(MAX_VOLUME_BLOCKS);
     let mut disk = Disk {
         nvme,
+        first,
         blocks,
         sectors_per_block,
     };
@@ -186,9 +229,21 @@ pub extern "C" fn _start(endpoint: u64, _unused: u64, _unused2: u64, mmio: u64) 
         .number(sb.generation)
         .push(b", ")
         .number(volume.entries().len() as u64)
-        .push(b" files; boot count now ")
+        .push(if system.is_some() {
+            b" files on GPT partition 'Centinela system'"
+        } else {
+            b" files"
+        })
+        .push(b"; boot count now ")
         .number(count)
         .print();
+    let mut info = [0u8; 80];
+    if let Ok(length) = volume.read(0, b"install-info", 0, &mut info) {
+        Line::new()
+            .push(b"storage: install-info: ")
+            .push(info[..length].trim_ascii_end())
+            .print();
+    }
     let mut welcome = [0u8; 60];
     if let Ok(length) = volume.read(0, b"welcome.txt", 0, &mut welcome) {
         let shown = welcome[..length].trim_ascii_end();

@@ -87,6 +87,7 @@ struct LimineRequests {
     executable_address: LimineRequest,
     modules: LimineRequest,
     rsdp: LimineRequest,
+    cmdline: LimineRequest,
     framebuffer: LimineRequest,
     #[cfg(target_os = "none")]
     mp: smp::LimineMpRequest,
@@ -221,6 +222,17 @@ static mut LIMINE_REQUESTS: LimineRequests = LimineRequests {
             LIMINE_COMMON_MAGIC[1],
             0x9d58_27dc_d881_dd75,
             0xa314_8604_f6fa_b11b,
+        ],
+        revision: 0,
+        response: core::ptr::null_mut(),
+    },
+    // Kernel command line (the installer boot entry sets centinela.install).
+    cmdline: LimineRequest {
+        id: [
+            LIMINE_COMMON_MAGIC[0],
+            LIMINE_COMMON_MAGIC[1],
+            0x4b16_1536_e598_651e,
+            0xb390_ad4a_2f1f_303a,
         ],
         revision: 0,
         response: core::ptr::null_mut(),
@@ -871,6 +883,20 @@ fn run_isolation(
         serial_write("Centinela-OS: HHDM is still executable after sealing.\r\n");
         halt_forever();
     }
+    if let Some(wipe) = install_requested() {
+        serial_write(if wipe {
+            "Installer: requested from the boot menu (the target disk will be erased).\r\n"
+        } else {
+            "Installer: requested (blank target disk only).\r\n"
+        });
+        if system::run_installer(memory, kernel_root, hhdm, modules, wipe) {
+            serial_write("Installer: done. Remove the installation media and reboot.\r\n");
+        } else {
+            serial_write("Centinela-OS: installation failed; the disk may be incomplete.\r\n");
+        }
+        power::finish_boot();
+        return;
+    }
     if system::run_self_test(memory, kernel_root, hhdm, modules) {
         serial_write(
             "Microkernel milestone: Ring 3 init manages services through capability IPC \
@@ -880,6 +906,39 @@ fn run_isolation(
         serial_write("Centinela-OS: microkernel self-test failed.\r\n");
     }
     power::finish_boot();
+}
+
+/// Installation request: `centinela.install=nvme-wipe` (boot menu entry that
+/// warns the disk will be erased), `centinela.install=nvme` (blank disk
+/// only), or the QEMU-only fw_cfg file `opt/centinela/install` (blank only).
+/// Returns `Some(wipe_allowed)`.
+#[cfg(target_os = "none")]
+fn install_requested() -> Option<bool> {
+    // SAFETY: Response written by Limine before entry.
+    let response =
+        unsafe { addr_of!(LIMINE_REQUESTS.cmdline.response).read_volatile() }.cast::<[u64; 2]>();
+    let mut cmdline: &[u8] = &[];
+    if !response.is_null() {
+        // SAFETY: {revision, char *cmdline}; NUL-terminated, bounded here.
+        let pointer = unsafe { (*response)[1] } as *const u8;
+        if !pointer.is_null() {
+            let mut length = 0;
+            // SAFETY: Limine's string is NUL-terminated; capped at 1 KiB.
+            while length < 1024 && unsafe { pointer.add(length).read() } != 0 {
+                length += 1;
+            }
+            // SAFETY: `length` bytes were just read successfully.
+            cmdline = unsafe { core::slice::from_raw_parts(pointer, length) };
+        }
+    }
+    let has = |needle: &[u8]| cmdline.split(|&b| b == b' ').any(|word| word == needle);
+    if has(b"centinela.install=nvme-wipe") {
+        Some(true)
+    } else if has(b"centinela.install=nvme") || power::fw_cfg_has(b"opt/centinela/install") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// True if `[start, end)` lies inside one ACPI memory-map region.

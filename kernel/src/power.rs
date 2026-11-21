@@ -155,11 +155,16 @@ fn under_hypervisor() -> bool {
 
 /// QEMU fw_cfg: is the file `opt/centinela/poweroff` present?
 fn fw_cfg_requests_poweroff() -> bool {
+    fw_cfg_has(b"opt/centinela/poweroff")
+}
+
+/// QEMU fw_cfg: is the file `name` present? Always false on bare metal
+/// (only under a hypervisor that answers with the QEMU signature).
+pub(crate) fn fw_cfg_has(name: &[u8]) -> bool {
     const SELECT: u16 = 0x510;
     const DATA: u16 = 0x511;
     const SIGNATURE: u16 = 0x0000;
     const DIRECTORY: u16 = 0x0019;
-    const NAME: &[u8] = b"opt/centinela/poweroff";
     if !under_hypervisor() {
         return false;
     }
@@ -176,9 +181,9 @@ fn fw_cfg_requests_poweroff() -> bool {
         for byte in entry.iter_mut() {
             *byte = inb(DATA);
         }
-        let name = &entry[8..];
-        let length = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-        if &name[..length] == NAME {
+        let found = &entry[8..];
+        let length = found.iter().position(|&b| b == 0).unwrap_or(found.len());
+        if &found[..length] == name {
             return true;
         }
     }

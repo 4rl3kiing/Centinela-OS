@@ -42,13 +42,47 @@ grep -Fq "centinela-kernel#$KERNEL_B2SUM" "$CONFIG" || { echo "Kernel hash was n
 
 # User programs travel as boot modules, each pinned by its BLAKE2b hash.
 mkdir -p "$ISO_ROOT/boot/user"
-for module in elf-hello elf-wx uart-driver kbd-driver serial-service ramfs netsvc shell fs-fuzzer broker badge-client e1000-driver nvme-driver storage storage-client; do
+SYSTEM_MODULES="elf-hello elf-wx uart-driver kbd-driver serial-service ramfs netsvc shell fs-fuzzer broker badge-client e1000-driver nvme-driver storage storage-client"
+MODULE_LINES=""
+for module in $SYSTEM_MODULES installer; do
     source="$ROOT/target/x86_64-unknown-none/release/$module"
     test -f "$source" || { echo "Missing user module: $module" >&2; exit 1; }
     install -m 0644 "$source" "$ISO_ROOT/boot/user/$module"
     module_b2sum="$(b2sum "$ISO_ROOT/boot/user/$module" | cut -d' ' -f1)"
-    printf 'module_path: boot():/boot/user/%s#%s\nmodule_string: %s\n' "$module" "$module_b2sum" "$module" >>"$CONFIG"
+    line="$(printf 'module_path: boot():/boot/user/%s#%s\nmodule_string: %s' "$module" "$module_b2sum" "$module")"
+    [[ "$module" == installer ]] && INSTALLER_LINE="$line" || MODULE_LINES+="$line"$'\n'
 done
+
+# Installed system: the same entry and programs, without the installer.
+INSTALLED_CONFIG="$ROOT/build/installed-limine.conf"
+{ cat "$CONFIG"; printf '%s' "$MODULE_LINES"; } >"$INSTALLED_CONFIG"
+INSTALLED_EFI="$ROOT/build/installed-BOOTX64.EFI"
+install -m 0644 "$LIMINE_DIR/BOOTX64.EFI" "$INSTALLED_EFI"
+"$LIMINE_DIR/limine" enroll-config --quiet "$INSTALLED_EFI" "$(b2sum "$INSTALLED_CONFIG" | cut -d' ' -f1)"
+if [[ -n "${SB_SIGNING_KEY:-}" && -n "${SB_SIGNING_CERT:-}" ]]; then
+    sbsign --key "$SB_SIGNING_KEY" --cert "$SB_SIGNING_CERT" --output "$INSTALLED_EFI.signed" "$INSTALLED_EFI" >/dev/null
+    mv "$INSTALLED_EFI.signed" "$INSTALLED_EFI"
+fi
+PAYLOAD_ARGS=("EFI/BOOT/BOOTX64.EFI=$INSTALLED_EFI" "boot/limine/limine.conf=$INSTALLED_CONFIG" \
+    "boot/centinela-kernel=$ISO_ROOT/boot/centinela-kernel")
+for module in $SYSTEM_MODULES; do
+    PAYLOAD_ARGS+=("boot/user/$module=$ISO_ROOT/boot/user/$module")
+done
+python3 "$ROOT/scripts/pack-payload.py" "$ISO_ROOT/boot/user/install-payload" "${PAYLOAD_ARGS[@]}"
+PAYLOAD_LINE="$(printf 'module_path: boot():/boot/user/install-payload#%s\nmodule_string: install-payload' \
+    "$(b2sum "$ISO_ROOT/boot/user/install-payload" | cut -d' ' -f1)")"
+
+# Installation media: two entries. The first runs the live system; the
+# second installs it and states plainly that the disk will be erased.
+HEADER="$(sed '/^\//,$d' "$CONFIG")"
+BODY="$(sed '1,/^\//d' "$CONFIG")"
+{
+    printf '%s\n' "$HEADER"
+    printf '/Centinela-OS (probar sin instalar)\n%s\n%s%s\n%s\n\n' "$BODY" "$MODULE_LINES" "$INSTALLER_LINE" "$PAYLOAD_LINE"
+    printf '/Instalar Centinela-OS en el disco NVMe (BORRA TODO EL DISCO)\n%s\ncmdline: centinela.install=nvme-wipe\n%s%s\n%s\n' \
+        "$BODY" "$MODULE_LINES" "$INSTALLER_LINE" "$PAYLOAD_LINE"
+} >"$CONFIG.new"
+mv "$CONFIG.new" "$CONFIG"
 chmod 0644 "$CONFIG"
 
 # Bind the config to the bootloaders: enroll its BLAKE2b into the BIOS stage

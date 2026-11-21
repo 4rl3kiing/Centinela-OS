@@ -26,8 +26,6 @@ pub extern "C" fn _start(_unused: u64, _unused2: u64, _unused3: u64, mmio: u64) 
         Err((message, code)) => fail(message, code),
     };
     let block_size = nvme.block_size;
-    // The last LBA is reserved for this self-test (the storage service's
-    // volume ends before it).
     let test_lba = nvme.blocks - 1;
     let marker = b"Centinela-OS NVMe block written by a Ring 3 driver";
     let mut pattern = [0u8; 4096];
@@ -36,6 +34,11 @@ pub extern "C" fn _start(_unused: u64, _unused2: u64, _unused3: u64, mmio: u64) 
     }
     pattern[..marker.len()].copy_from_slice(marker);
     nvme.write_page(5, 0, &pattern[..block_size]);
+    // Non-destructive: save the block first and restore it afterwards (on
+    // an installed disk the last LBA holds the backup GPT header).
+    if !nvme.transfer(false, test_lba, 1, 4) {
+        fail("nvme: read failed", 12);
+    }
     if !nvme.transfer(true, test_lba, 1, 5) {
         fail("nvme: write failed", 11);
     }
@@ -46,6 +49,9 @@ pub extern "C" fn _start(_unused: u64, _unused2: u64, _unused3: u64, mmio: u64) 
     nvme.read_page(6, 0, &mut back[..block_size]);
     if back[..block_size] != pattern[..block_size] {
         fail("nvme: data read back differs from data written", 13);
+    }
+    if !nvme.transfer(true, test_lba, 1, 4) {
+        fail("nvme: restoring the test block failed", 14);
     }
     line.push(b"; namespace 1: ")
         .number(nvme.blocks)

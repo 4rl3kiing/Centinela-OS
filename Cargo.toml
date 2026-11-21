@@ -1,5 +1,5 @@
 [workspace]
-members = ["kernel", "hal", "security", "userland", "cfs"]
+members = ["kernel", "hal", "security", "userland", "cfs", "disk"]
 exclude = ["fuzz", "tools/cfs-tool"]
 resolver = "3"
 

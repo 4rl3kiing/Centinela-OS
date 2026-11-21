@@ -75,6 +75,8 @@ const HEAP_QUOTA_PAGES: u64 = 32;
 /// DMA window in a driver's address space, and its page quota.
 const DMA_BASE: u64 = 0x0000_6000_0000_0000;
 const DMA_QUOTA_PAGES: u64 = 16;
+/// Where a lent boot module appears in a task (read-only, NX).
+const MODULE_BASE: u64 = 0x0000_4000_0000_0000;
 /// Where a driver's device MMIO window is mapped, and its size limit.
 const MMIO_BASE: u64 = 0x0000_5000_0000_0000;
 const MMIO_LIMIT: u64 = 1 << 20;
@@ -277,6 +279,8 @@ struct TaskSpec {
     /// Badge minted on this task's initial SEND capabilities (0 = unbadged),
     /// so a server can tell clients apart from their first request.
     badge: u64,
+    /// Boot module lent read-only at MODULE_BASE; its length arrives in RSI.
+    module: Option<&'static [u8]>,
     expect: Expect,
 }
 
@@ -1049,6 +1053,29 @@ fn map_anonymous(memory: &mut HhdmFrameMemory<'_, '_>, task: &mut Task, pages: u
     base
 }
 
+/// Lends a boot module to a task: its own frames, read-only and NX, at
+/// MODULE_BASE. They are never freed with the task (borrowed mapping).
+fn map_module(memory: &mut HhdmFrameMemory<'_, '_>, root: PhysAddr, module: &[u8]) -> bool {
+    let hhdm = HHDM_BASE.load(core::sync::atomic::Ordering::Acquire);
+    let start = module.as_ptr() as u64;
+    if hhdm == 0
+        || !start.is_multiple_of(PAGE_SIZE)
+        || start < hhdm
+        || module.len() as u64 > 64 * 1024 * 1024
+    {
+        return false;
+    }
+    let physical = start - hhdm;
+    (0..(module.len() as u64).div_ceil(PAGE_SIZE)).all(|page| {
+        PageMapping::user_borrowed(MODULE_BASE + page * PAGE_SIZE, physical + page * PAGE_SIZE)
+            .is_ok_and(|mapping| {
+                PageTableMapper::new(&mut *memory, root)
+                    .map_4k(mapping)
+                    .is_ok()
+            })
+    })
+}
+
 /// Maps `pages` zeroed frames into the driver (RW, NX) and at the matching
 /// IOVA in its device domain. Returns (user address, IOVA) or (error, 0).
 fn map_dma(memory: &mut HhdmFrameMemory<'_, '_>, task: &mut Task, pages: u64) -> (u64, u64) {
@@ -1265,6 +1292,13 @@ fn spawn(
     frame.rsi = raw[1];
     frame.rdx = raw[2];
     frame.rcx = spec.arg;
+    if let Some(module) = spec.module {
+        if spec.endpoints[1].is_some() || !map_module(memory, root, module) {
+            let _ = destroy_user_address_space(memory, root);
+            return Err(SpawnError::Failed("boot module could not be lent"));
+        }
+        frame.rsi = module.len() as u64;
+    }
     let mut process_handle = None;
     if spec.process.is_some() && spec.endpoints[2].is_some() {
         let _ = destroy_user_address_space(memory, root);
@@ -1788,6 +1822,7 @@ const fn isolated(
         device: None,
         arg: 0,
         badge: 0,
+        module: None,
         expect,
     }
 }
@@ -1815,6 +1850,7 @@ const fn init_client(
         device: None,
         arg: 0,
         badge: 0,
+        module: None,
         expect,
     }
 }
@@ -1987,6 +2023,7 @@ pub fn run_self_test(
                 device: None,
                 arg: 0,
                 badge: 0,
+                module: None,
                 expect,
             };
             let elf_tasks = [
@@ -2047,6 +2084,7 @@ pub fn run_self_test(
             device: None,
             arg: 0,
             badge: 0,
+            module: None,
             expect: Expect::Service { restarts: 0 },
         },
         TaskSpec {
@@ -2063,6 +2101,7 @@ pub fn run_self_test(
             device: None,
             arg: 0,
             badge: 0,
+            module: None,
             expect: Expect::Service { restarts: 1 },
         },
         init_client(
@@ -2255,6 +2294,7 @@ fn run_network_scenario(
             }),
             arg: MMIO_BASE,
             badge: 0,
+            module: None,
             expect: Expect::Exit(0),
         },
         TaskSpec {
@@ -2276,6 +2316,7 @@ fn run_network_scenario(
             }),
             arg: 0,
             badge: 0,
+            module: None,
             expect: Expect::Device(DeviceViolation::NoDmaDomain),
         },
     ];
@@ -2343,6 +2384,7 @@ fn run_storage_scenario(
         }),
         arg: MMIO_BASE,
         badge: 0,
+        module: None,
         expect: Expect::Exit(0),
     }];
     let outcomes = run_system(memory, kernel_root, hhdm, &tasks);
@@ -2363,6 +2405,65 @@ fn run_storage_scenario(
         }
     );
     passed == tasks.len() && blocked
+}
+
+/// Installs Centinela-OS on the NVMe disk with the Ring 3 installer.
+/// `wipe` allows overwriting a disk that is not blank (explicit boot entry).
+pub fn run_installer(
+    memory: &mut HhdmFrameMemory<'_, '_>,
+    kernel_root: PhysAddr,
+    hhdm: HhdmOffset,
+    modules: &[(&'static str, &'static [u8])],
+    wipe: bool,
+) -> bool {
+    KERNEL_ROOT.store(kernel_root.get(), core::sync::atomic::Ordering::Release);
+    HHDM_BASE.store(hhdm.get(), core::sync::atomic::Ordering::Release);
+    let module = |name: &str| {
+        modules
+            .iter()
+            .find(|(module, _)| *module == name)
+            .map(|(_, bytes)| *bytes)
+    };
+    let (Some(installer), Some(payload)) = (module("installer"), module("install-payload")) else {
+        serial_write("Centinela-OS: installer or install payload missing from the boot media.\r\n");
+        return false;
+    };
+    let Some(controller) = crate::pci::find_class(0x01, 0x08, 0x02) else {
+        serial_write("Centinela-OS: no NVMe disk to install on.\r\n");
+        return false;
+    };
+    let Some(mmio) = crate::pci::mem_bar0(controller) else {
+        return false;
+    };
+    let tasks = [TaskSpec {
+        name: "installer",
+        role: "Ring 3 installer: GPT, FAT32 ESP and CFS on NVMe",
+        program: Image::Elf(installer),
+        extra_syscalls: (1 << Syscall::DmaAlloc as u8) | (1 << Syscall::Sleep as u8),
+        endpoints: [None, None, None],
+        process: None,
+        manage_processes: false,
+        manage_memory: false,
+        priority: false,
+        supervisor: None,
+        device: Some(DeviceGrant {
+            ports: [(0, 0), (0, 0)],
+            irq: None,
+            dma: Some(controller),
+            mmio: Some((mmio.0, mmio.1.min(MMIO_LIMIT))),
+        }),
+        arg: u64::from(wipe),
+        badge: 0,
+        module: Some(payload),
+        expect: Expect::Exit(0),
+    }];
+    let outcomes = run_system(memory, kernel_root, hhdm, &tasks);
+    outcomes
+        .iter()
+        .flatten()
+        .filter(|outcome| report(outcome))
+        .count()
+        == 1
 }
 
 /// Phase 7 persistence: a Ring 3 storage service (NVMe driver + CFS) mounts
@@ -2399,6 +2500,7 @@ fn run_persistence_scenario(
         device: None,
         arg,
         badge,
+        module: None,
         expect: Expect::Exit(0),
     };
     let tasks = [
@@ -2423,6 +2525,7 @@ fn run_persistence_scenario(
             }),
             arg: MMIO_BASE,
             badge: 0,
+            module: None,
             expect: Expect::Service { restarts: 0 },
         },
         client_task("storage-client", "saves and reads back a note", 1, 0x501),
@@ -2476,6 +2579,7 @@ fn run_badge_scenario(
         device: None,
         arg,
         badge: 0,
+        module: None,
         expect,
     };
     let tenant = |name, role, arg, expect| {
@@ -2578,6 +2682,7 @@ fn run_services_scenario(
         device: None,
         arg: 0,
         badge: 0,
+        module: None,
         expect,
     };
     let device_syscalls = (1 << Syscall::PortIo as u8) | (1 << Syscall::IrqAck as u8);
@@ -2678,6 +2783,7 @@ fn run_driver_scenario(
         device,
         arg: 0,
         badge: 0,
+        module: None,
         expect,
     };
     let tasks = [
