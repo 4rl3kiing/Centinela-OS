@@ -4,4 +4,5 @@
 //! Narrow, audited interfaces for privileged CPU and device operations.
 
 pub mod cpu;
+pub mod entropy;
 pub mod serial;

@@ -11,8 +11,9 @@ pub enum Capability {
     ManageProcesses = 4,
     ManageMemory = 5,
     LoadDrivers = 6,
-    SystemAdministration = 7,
 }
+
+const VALID_CAPABILITY_BITS: u64 = (1 << 7) - 1;
 
 /// A compact set of granted capabilities.
 ///
@@ -25,7 +26,7 @@ impl CapabilitySet {
     pub const EMPTY: Self = Self(0);
 
     pub const fn from_bits(bits: u64) -> Self {
-        Self(bits)
+        Self(bits & VALID_CAPABILITY_BITS)
     }
 
     pub const fn bits(self) -> u64 {
@@ -57,7 +58,7 @@ mod tests {
 
         assert!(set.contains(Capability::ReadConsole));
         assert!(set.contains(Capability::AccessNetwork));
-        assert!(!set.contains(Capability::SystemAdministration));
+        assert!(!set.contains(Capability::ManageProcesses));
 
         set.revoke(Capability::AccessNetwork);
         assert!(!set.contains(Capability::AccessNetwork));

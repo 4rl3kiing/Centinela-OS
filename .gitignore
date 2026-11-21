@@ -4,3 +4,6 @@
 *.img
 *.qcow2
 *.log
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/

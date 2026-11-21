@@ -98,35 +98,40 @@ impl<'a> Pmm<'a> {
             return Err(PmmError::NullMemoryMap);
         }
 
+        let kernel_end = align_up(kernel_physical_end, PAGE_SIZE)
+            .ok_or(PmmError::InvalidKernelRange)?
+            / PAGE_SIZE;
+
+        // Pass 1: validate the complete map before touching allocator state,
+        // so a malformed map can never leave a half-initialized allocator.
+        for index in 0..response.entry_count as usize {
+            // SAFETY: The caller guarantees a readable entry pointer array
+            // with entry_count elements.
+            let entry = unsafe { Self::read_entry(response, index) }?;
+            if entry.length != 0 {
+                entry
+                    .base
+                    .checked_add(entry.length)
+                    .ok_or(PmmError::InvalidMemoryRegion)?;
+            }
+        }
+
         self.bitmap.fill(u64::MAX);
         self.allocated.fill(0);
         self.free_frames = 0;
         self.allocation_hint = 1;
 
+        // Pass 2: release usable frames. Arithmetic was validated in pass 1.
         for index in 0..response.entry_count as usize {
-            // SAFETY: The caller guarantees a readable entry pointer array
-            // with entry_count elements.
-            let entry_pointer = unsafe { response.entries.add(index).read() };
-            if entry_pointer.is_null() {
-                return Err(PmmError::NullMemoryMapEntry);
-            }
-
-            // SAFETY: The caller guarantees every entry pointer is readable.
-            let entry = unsafe { &*entry_pointer };
-            if entry.length == 0 {
+            // SAFETY: Same contract as pass 1.
+            let entry = unsafe { Self::read_entry(response, index) }?;
+            if entry.length == 0 || entry.entry_type != LIMINE_MEMMAP_USABLE {
                 continue;
             }
-
-            let region_end = entry
-                .base
-                .checked_add(entry.length)
-                .ok_or(PmmError::InvalidMemoryRegion)?;
-
-            if entry.entry_type != LIMINE_MEMMAP_USABLE {
+            let region_end = entry.base.saturating_add(entry.length);
+            let Some(start) = align_up(entry.base, PAGE_SIZE) else {
                 continue;
-            }
-
-            let start = align_up(entry.base, PAGE_SIZE).ok_or(PmmError::InvalidMemoryRegion)?;
+            };
             let end = region_end.min(MAX_PHYSICAL_ADDRESS) & !(PAGE_SIZE - 1);
             if start < end {
                 self.mark_free_range(start / PAGE_SIZE, end / PAGE_SIZE);
@@ -136,13 +141,28 @@ impl<'a> Pmm<'a> {
         // Keep physical frame zero unavailable and reserve the complete kernel
         // load image, including its zero-initialized BSS.
         self.reserve_range(0, 1);
-        let kernel_start = kernel_physical_start / PAGE_SIZE;
-        let kernel_end = align_up(kernel_physical_end, PAGE_SIZE)
-            .ok_or(PmmError::InvalidKernelRange)?
-            / PAGE_SIZE;
-        self.reserve_range(kernel_start, kernel_end);
+        self.reserve_range(kernel_physical_start / PAGE_SIZE, kernel_end);
 
         Ok(())
+    }
+
+    /// Reads one memory-map entry by value.
+    ///
+    /// # Safety
+    /// `index` must be below `response.entry_count`, and the pointer array and
+    /// the pointed-to entry must be readable as required by
+    /// `initialize_from_limine`.
+    unsafe fn read_entry(
+        response: &LimineMemoryMapResponse,
+        index: usize,
+    ) -> Result<LimineMemoryMapEntry, PmmError> {
+        // SAFETY: Guaranteed by this function's contract.
+        let entry_pointer = unsafe { response.entries.add(index).read() };
+        if entry_pointer.is_null() {
+            return Err(PmmError::NullMemoryMapEntry);
+        }
+        // SAFETY: Guaranteed by this function's contract.
+        Ok(unsafe { entry_pointer.read() })
     }
 
     pub fn allocate_frame(&mut self) -> Option<u64> {
@@ -151,19 +171,14 @@ impl<'a> Pmm<'a> {
         }
 
         let frame_count = self.frame_count();
-        for offset in 0..frame_count {
-            let frame = (self.allocation_hint + offset) % frame_count;
-            if !self.is_free(frame) {
-                continue;
-            }
+        let frame = self
+            .find_free_frame(self.allocation_hint, frame_count)
+            .or_else(|| self.find_free_frame(0, self.allocation_hint))?;
 
-            self.set_allocated(frame);
-            self.free_frames -= 1;
-            self.allocation_hint = (frame + 1) % frame_count;
-            return Some((frame as u64) * PAGE_SIZE);
-        }
-
-        None
+        self.set_allocated(frame);
+        self.free_frames -= 1;
+        self.allocation_hint = (frame + 1) % frame_count;
+        Some((frame as u64) * PAGE_SIZE)
     }
 
     /// Releases a frame previously returned by allocate_frame.
@@ -202,6 +217,34 @@ impl<'a> Pmm<'a> {
 
     fn frame_count(&self) -> usize {
         self.bitmap.len() * u64::BITS as usize
+    }
+
+    /// Finds a free frame in [start, end) using word-level bitmap scans.
+    fn find_free_frame(&self, start: usize, end: usize) -> Option<usize> {
+        if start >= end {
+            return None;
+        }
+
+        let mut word_index = start / u64::BITS as usize;
+        let last_word = (end - 1) / u64::BITS as usize;
+        while word_index <= last_word {
+            let word_start = word_index * u64::BITS as usize;
+            let first_bit = start.saturating_sub(word_start);
+            let end_bit = (end - word_start).min(u64::BITS as usize);
+            let lower_mask = u64::MAX << first_bit;
+            let upper_mask = if end_bit == u64::BITS as usize {
+                u64::MAX
+            } else {
+                (1_u64 << end_bit) - 1
+            };
+            let candidates = !self.bitmap[word_index] & lower_mask & upper_mask;
+            if candidates != 0 {
+                return Some(word_start + candidates.trailing_zeros() as usize);
+            }
+            word_index += 1;
+        }
+
+        None
     }
 
     fn is_free(&self, frame: usize) -> bool {
@@ -341,10 +384,100 @@ mod tests {
     }
 
     #[test]
+    fn allocation_scans_words_and_wraps_the_hint() {
+        let mut bitmap = [u64::MAX; 2];
+        let mut allocated = [0_u64; 2];
+        let mut pmm = Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
+        pmm.mark_free_range(1, 128);
+        pmm.allocation_hint = 127;
+
+        assert_eq!(pmm.allocate_frame(), Some(127 * PAGE_SIZE));
+        assert_eq!(pmm.allocate_frame(), Some(PAGE_SIZE));
+        assert_eq!(pmm.free_frames(), 125);
+    }
+
+    #[test]
+    fn malformed_map_leaves_allocator_state_untouched() {
+        let mut bitmap = [u64::MAX; 4];
+        let mut allocated = [0_u64; 4];
+        let mut pmm = Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
+        pmm.mark_free_range(1, 8);
+        let usable = LimineMemoryMapEntry {
+            base: 0,
+            length: 256 * PAGE_SIZE,
+            entry_type: super::LIMINE_MEMMAP_USABLE,
+        };
+        let overflowing = LimineMemoryMapEntry {
+            base: u64::MAX - PAGE_SIZE,
+            length: 2 * PAGE_SIZE,
+            entry_type: 3,
+        };
+        let entries = [
+            &usable as *const LimineMemoryMapEntry,
+            &overflowing as *const LimineMemoryMapEntry,
+        ];
+        let response = LimineMemoryMapResponse {
+            revision: 0,
+            entry_count: entries.len() as u64,
+            entries: entries.as_ptr(),
+        };
+
+        // SAFETY: response, entries, and both entries remain valid for this call.
+        let result = unsafe { pmm.initialize_from_limine(&response, 2 * PAGE_SIZE, 4 * PAGE_SIZE) };
+        assert_eq!(result, Err(PmmError::InvalidMemoryRegion));
+        assert_eq!(pmm.free_frames(), 7);
+    }
+
+    #[test]
     fn allocation_returns_none_when_no_frames_are_free() {
         let mut bitmap = [u64::MAX; 1];
         let mut allocated = [0_u64; 1];
         let mut pmm = Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
         assert_eq!(pmm.allocate_frame(), None);
+    }
+}
+
+#[cfg(kani)]
+mod verification {
+    use super::{PAGE_SIZE, Pmm, PmmError};
+
+    #[kani::proof]
+    fn one_allocate_and_free_preserves_frame_accounting() {
+        let start: u64 = kani::any();
+        let end: u64 = kani::any();
+        kani::assume(start <= end);
+        kani::assume(end <= 64);
+
+        let mut bitmap = [u64::MAX; 1];
+        let mut allocated = [0_u64; 1];
+        let mut pmm = match Pmm::new(&mut bitmap, &mut allocated) {
+            Ok(pmm) => pmm,
+            Err(_) => return,
+        };
+
+        pmm.mark_free_range(start, end);
+        pmm.reserve_range(0, 1);
+        let before = pmm.free_frames();
+        match pmm.allocate_frame() {
+            Some(frame) => {
+                assert!(before > 0);
+                assert_eq!(pmm.free_frames(), before - 1);
+                assert_eq!(frame % PAGE_SIZE, 0);
+                assert_eq!(pmm.free_frame(frame), Ok(()));
+                assert_eq!(pmm.free_frames(), before);
+            }
+            None => assert_eq!(before, 0),
+        }
+    }
+
+    #[kani::proof]
+    fn free_rejects_unaligned_addresses() {
+        let address: u64 = kani::any();
+        kani::assume(address & (PAGE_SIZE - 1) != 0);
+
+        let mut bitmap = [u64::MAX; 1];
+        let mut allocated = [0_u64; 1];
+        let mut pmm = Pmm::new(&mut bitmap, &mut allocated).expect("one-word bitmaps are valid");
+        assert_eq!(pmm.free_frame(address), Err(PmmError::FrameOutOfRange));
     }
 }
