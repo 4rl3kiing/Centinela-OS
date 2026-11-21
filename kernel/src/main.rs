@@ -64,7 +64,24 @@ struct LimineRequests {
     hhdm: LimineRequest,
     memory_map: LimineRequest,
     executable_address: LimineRequest,
+    modules: LimineRequest,
     end_marker: [u64; 2],
+}
+
+#[repr(C)]
+struct LimineModuleResponse {
+    revision: u64,
+    module_count: u64,
+    modules: *const *const LimineFile,
+}
+
+#[repr(C)]
+struct LimineFile {
+    revision: u64,
+    address: *const u8,
+    size: u64,
+    path: *const u8,
+    string: *const u8,
 }
 
 unsafe extern "C" {
@@ -125,8 +142,84 @@ static mut LIMINE_REQUESTS: LimineRequests = LimineRequests {
         revision: 0,
         response: core::ptr::null_mut(),
     },
+    // User programs (ELF) arrive as boot modules whose BLAKE2b hashes are
+    // pinned in limine.conf, so Limine refuses tampered images.
+    modules: LimineRequest {
+        id: [
+            LIMINE_COMMON_MAGIC[0],
+            LIMINE_COMMON_MAGIC[1],
+            0x3e7e_2797_02be_32af,
+            0xca1c_4f3b_d128_0cee,
+        ],
+        revision: 0,
+        response: core::ptr::null_mut(),
+    },
     end_marker: [0xadc0_e053_1bb1_0d03, 0x9572_709f_3176_4c62],
 };
+
+const MAX_MODULES: usize = 8;
+const MAX_MODULE_SIZE: u64 = 16 * 1024 * 1024;
+const MAX_MODULE_NAME: usize = 32;
+
+/// Boot modules, validated as untrusted input: count, address range, size
+/// and name length are all bounded before any slice is created.
+fn boot_modules(hhdm: HhdmOffset) -> ([(&'static str, &'static [u8]); MAX_MODULES], usize) {
+    let mut modules: [(&'static str, &'static [u8]); MAX_MODULES] = [("", &[]); MAX_MODULES];
+    // SAFETY: Reads a bootloader-populated pointer without creating a
+    // reference to the mutable request structure.
+    let response = unsafe {
+        addr_of!(LIMINE_REQUESTS.modules.response)
+            .read_volatile()
+            .cast::<LimineModuleResponse>()
+    };
+    if response.is_null() {
+        return (modules, 0);
+    }
+    // SAFETY: Limine keeps the response valid during boot.
+    let (count, list) = unsafe { ((*response).module_count, (*response).modules) };
+    if list.is_null() {
+        return (modules, 0);
+    }
+    let hhdm_base = hhdm.physical_to_virtual(PhysAddr::new(0).unwrap_or_else(|_| halt_forever()));
+    let Ok(hhdm_base) = hhdm_base else {
+        return (modules, 0);
+    };
+    let mut found = 0;
+    for index in 0..(count as usize).min(MAX_MODULES) {
+        // SAFETY: `index` < module_count; Limine provides that many pointers.
+        let file = unsafe { list.add(index).read() };
+        if file.is_null() {
+            continue;
+        }
+        // SAFETY: Limine file structures stay valid during boot.
+        let (address, size, string) = unsafe { ((*file).address, (*file).size, (*file).string) };
+        let start = address as u64;
+        let in_hhdm = start >= hhdm_base.get() && start.checked_add(size).is_some();
+        if address.is_null() || !in_hhdm || size == 0 || size > MAX_MODULE_SIZE || string.is_null()
+        {
+            continue;
+        }
+        let mut length = 0;
+        // SAFETY: Bounded scan of a NUL-terminated string Limine provided.
+        while length < MAX_MODULE_NAME && unsafe { string.add(length).read() } != 0 {
+            length += 1;
+        }
+        // SAFETY: `length` bytes were just read; module memory is
+        // EXECUTABLE_AND_MODULES (never handed out by the PMM) and HHDM-mapped.
+        let (name, bytes) = unsafe {
+            (
+                core::slice::from_raw_parts(string, length),
+                core::slice::from_raw_parts(address, size as usize),
+            )
+        };
+        let Ok(name) = core::str::from_utf8(name) else {
+            continue;
+        };
+        modules[found] = (name, bytes);
+        found += 1;
+    }
+    (modules, found)
+}
 
 // A 64 GiB physical-address ceiling uses two 2 MiB bitmaps at 4 KiB granularity.
 // The bitmap itself is reserved automatically as part of the kernel BSS.
@@ -443,16 +536,32 @@ extern "C" fn kernel_main() -> ! {
     // SAFETY: The HHDM (base revision 5) maps every usable and bootloader-
     // reclaimable frame, including Limine's page tables; single CPU, IF=0.
     let mut memory = unsafe { HhdmFrameMemory::new(boot.hhdm, boot.pmm) };
-    run_isolation(&mut memory, boot.kernel_root, boot.hhdm);
+    let (modules, module_count) = boot_modules(boot.hhdm);
+    let mut writer = SerialWriter;
+    let _ = core::fmt::Write::write_fmt(
+        &mut writer,
+        format_args!("Boot modules: {module_count} verified by the boot chain.\r\n"),
+    );
+    run_isolation(
+        &mut memory,
+        boot.kernel_root,
+        boot.hhdm,
+        &modules[..module_count],
+    );
     halt_forever()
 }
 
 #[cfg(target_os = "none")]
-fn run_isolation(memory: &mut HhdmFrameMemory<'_, '_>, kernel_root: PhysAddr, hhdm: HhdmOffset) {
+fn run_isolation(
+    memory: &mut HhdmFrameMemory<'_, '_>,
+    kernel_root: PhysAddr,
+    hhdm: HhdmOffset,
+    modules: &[(&'static str, &'static [u8])],
+) {
     if !isolation::init_cpu_layer(memory, kernel_root) {
         halt_forever();
     }
-    if system::run_self_test(memory, kernel_root, hhdm) {
+    if system::run_self_test(memory, kernel_root, hhdm, modules) {
         serial_write(
             "Microkernel milestone: Ring 3 init manages services through capability IPC \
              and attenuated grants; every hostile task contained.\r\n",
@@ -463,7 +572,13 @@ fn run_isolation(memory: &mut HhdmFrameMemory<'_, '_>, kernel_root: PhysAddr, hh
 }
 
 #[cfg(not(target_os = "none"))]
-fn run_isolation(_: &mut HhdmFrameMemory<'_, '_>, _: PhysAddr, _: HhdmOffset) {}
+fn run_isolation(
+    _: &mut HhdmFrameMemory<'_, '_>,
+    _: PhysAddr,
+    _: HhdmOffset,
+    _: &[(&'static str, &'static [u8])],
+) {
+}
 
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {

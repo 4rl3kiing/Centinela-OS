@@ -17,3 +17,7 @@ dependencies = [
 [[package]]
 name = "centinela-security"
 version = "0.1.0"
+
+[[package]]
+name = "centinela-userland"
+version = "0.1.0"

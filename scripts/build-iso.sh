@@ -39,6 +39,16 @@ CONFIG="$ISO_ROOT/boot/limine/limine.conf"
 sed "s|^path: boot():/boot/centinela-kernel\$|path: boot():/boot/centinela-kernel#$KERNEL_B2SUM|" \
     "$ROOT/boot/limine.conf" >"$CONFIG"
 grep -Fq "centinela-kernel#$KERNEL_B2SUM" "$CONFIG" || { echo "Kernel hash was not injected into limine.conf" >&2; exit 1; }
+
+# User programs travel as boot modules, each pinned by its BLAKE2b hash.
+mkdir -p "$ISO_ROOT/boot/user"
+for module in elf-hello elf-wx; do
+    source="$ROOT/target/x86_64-unknown-none/release/$module"
+    test -f "$source" || { echo "Missing user module: $module" >&2; exit 1; }
+    install -m 0644 "$source" "$ISO_ROOT/boot/user/$module"
+    module_b2sum="$(b2sum "$ISO_ROOT/boot/user/$module" | cut -d' ' -f1)"
+    printf 'module_path: boot():/boot/user/%s#%s\nmodule_string: %s\n' "$module" "$module_b2sum" "$module" >>"$CONFIG"
+done
 chmod 0644 "$CONFIG"
 
 # Bind the config to the bootloaders: enroll its BLAKE2b into the BIOS stage

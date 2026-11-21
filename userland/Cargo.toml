@@ -1,0 +1,23 @@
+[package]
+name = "centinela-userland"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "elf-hello"
+path = "src/bin/elf_hello.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "elf-wx"
+path = "src/bin/elf_wx.rs"
+test = false
+bench = false

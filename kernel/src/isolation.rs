@@ -184,6 +184,25 @@ pub(crate) fn fatal_kernel_trap(frame: &TrapFrame) -> ! {
     halt_forever()
 }
 
+/// Maps the user stack below `USER_STACK_TOP` (the page under it stays
+/// unmapped, so overflow faults the task).
+pub(crate) fn map_user_stack(
+    memory: &mut HhdmFrameMemory<'_, '_>,
+    root: PhysAddr,
+) -> Result<(), &'static str> {
+    let rw = PagePermissions::new(true, true, false, true).map_err(|_| "W^X")?;
+    for index in 0..USER_STACK_PAGES {
+        map_user_page(
+            memory,
+            root,
+            USER_STACK_TOP - (index + 1) * PAGE_SIZE,
+            rw,
+            None,
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn map_task_image(
     memory: &mut HhdmFrameMemory<'_, '_>,
     root: PhysAddr,
@@ -191,7 +210,7 @@ pub(crate) fn map_task_image(
 ) -> Result<(), &'static str> {
     let rx = PagePermissions::new(true, false, true, true).map_err(|_| "W^X")?;
     let rw = PagePermissions::new(true, true, false, true).map_err(|_| "W^X")?;
-    map_user_page(memory, root, USER_CODE_BASE, rx, Some(program))?;
+    map_user_page(memory, root, USER_CODE_BASE, rx, Some((0, program)))?;
     for index in 0..USER_STACK_PAGES {
         map_user_page(
             memory,
@@ -208,21 +227,22 @@ pub(crate) fn map_task_image(
 /// Allocates a zeroed frame (optionally filled with `contents`) and maps it.
 /// On failure the frame is released here; frames already mapped are
 /// reclaimed by `destroy_user_address_space`.
-fn map_user_page(
+pub(crate) fn map_user_page(
     memory: &mut HhdmFrameMemory<'_, '_>,
     root: PhysAddr,
     address: u64,
     permissions: PagePermissions,
-    contents: Option<&[u8]>,
+    contents: Option<(usize, &[u8])>,
 ) -> Result<(), &'static str> {
     // Frames are zeroed on allocation, so no stale data reaches the task.
     let frame = memory
         .allocate_zeroed_table_frame()
         .map_err(|_| "out of memory for task page")?;
     let mapped = (|| {
-        if let Some(bytes) = contents {
+        if let Some((offset, bytes)) = contents {
             // SAFETY: Freshly allocated frame, not yet mapped anywhere.
-            unsafe { memory.write_frame(frame, bytes) }.map_err(|_| "page copy failed")?;
+            unsafe { memory.write_frame_at(frame, offset, bytes) }
+                .map_err(|_| "page copy failed")?;
         }
         let mapping =
             PageMapping::new(address, frame.get(), permissions).map_err(|_| "invalid mapping")?;

@@ -47,10 +47,25 @@ impl<'p, 'b> HhdmFrameMemory<'p, 'b> {
         frame: PhysAddr,
         bytes: &[u8],
     ) -> Result<(), MutationBackendError> {
-        if bytes.len() > PAGE_SIZE as usize {
-            return Err(MutationBackendError::WriteFailed);
+        // SAFETY: Same contract as `write_frame_at`.
+        unsafe { self.write_frame_at(frame, 0, bytes) }
+    }
+
+    /// Copies `bytes` into a caller-owned frame starting at `offset`.
+    ///
+    /// # Safety
+    /// Same as [`Self::write_frame`].
+    pub unsafe fn write_frame_at(
+        &mut self,
+        frame: PhysAddr,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), MutationBackendError> {
+        match offset.checked_add(bytes.len()) {
+            Some(end) if end <= PAGE_SIZE as usize => {}
+            _ => return Err(MutationBackendError::WriteFailed),
         }
-        let destination = self.alias(frame.get())?;
+        let destination = self.alias(frame.get() + offset as u64)?;
         // SAFETY: Exclusive frame, HHDM-mapped per the constructor contract.
         unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len()) };
         Ok(())

@@ -1,5 +1,5 @@
 [workspace]
-members = ["kernel", "hal", "security"]
+members = ["kernel", "hal", "security", "userland"]
 exclude = ["fuzz"]
 resolver = "3"
 

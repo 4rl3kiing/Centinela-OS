@@ -39,15 +39,22 @@ use centinela_security::syscall_policy::{
 
 use crate::isolation::{
     CPU_BUDGET_TICKS, QUANTUM_TICKS, USER_CODE_BASE, USER_STACK_TOP, fatal_kernel_trap,
-    map_task_image, trap_stack_top,
+    map_task_image, map_user_page, map_user_stack, trap_stack_top,
 };
 use crate::user_programs;
+use centinela_kernel::elf::{self, ElfError};
+use centinela_security::permissions::PagePermissions;
 
 const MAX_TASKS: usize = 8;
 const ENDPOINT_COUNT: usize = 2;
 /// Kernel-enforced ceiling on restarts per service, whatever init requests.
 const MAX_RESTARTS: u32 = 3;
 const MAX_WRITE_LENGTH: u64 = 256;
+/// Anonymous-memory window (above ELF images, below the stack).
+const HEAP_BASE: u64 = 0x0000_7000_0000_0000;
+/// Anonymous pages a task may map in total.
+const HEAP_QUOTA_PAGES: u64 = 32;
+const ENOMEM: u64 = (-12_i64) as u64;
 const EFAULT: u64 = (-14_i64) as u64;
 const EINVAL: u64 = (-22_i64) as u64;
 const ENOSYS: u64 = (-38_i64) as u64;
@@ -75,6 +82,8 @@ pub enum TaskExit {
     CpuBudgetExceeded,
     /// Still blocked in IPC when the system shut down (normal for services).
     Stopped,
+    /// The ELF loader refused the image; nothing was executed.
+    LoadRejected(ElfError),
 }
 
 impl TaskExit {
@@ -88,6 +97,7 @@ impl TaskExit {
             Self::BadReturnAddress => 4,
             Self::CpuBudgetExceeded => 5,
             Self::Stopped => 6,
+            Self::LoadRejected(_) => 7,
         }
     }
 }
@@ -107,6 +117,8 @@ enum Expect {
     },
     /// Exits with this code after being preempted at least once.
     ExitAfterPreemption(u64),
+    /// The loader must refuse the image for this reason.
+    LoadRejected(ElfError),
 }
 
 impl Expect {
@@ -127,23 +139,36 @@ impl Expect {
             }
             (Self::CpuBudgetExceeded, TaskExit::CpuBudgetExceeded) => true,
             (Self::Ipc(expected), TaskExit::Ipc(actual)) => expected == actual,
+            (Self::LoadRejected(expected), TaskExit::LoadRejected(actual)) => expected == actual,
             (Self::Service { restarts: expected }, TaskExit::Stopped) => expected == restarts,
             _ => false,
         }
     }
 }
 
+/// Where a task's code comes from.
+#[derive(Clone, Copy)]
+pub enum Image {
+    /// Position-independent test code mapped at `USER_CODE_BASE`.
+    Flat(fn() -> &'static [u8]),
+    /// A static ELF64 executable (from a hashed boot module), parsed and
+    /// validated before anything is mapped.
+    Elf(&'static [u8]),
+}
+
 #[derive(Clone, Copy)]
 struct TaskSpec {
     name: &'static str,
     role: &'static str,
-    program: fn() -> &'static [u8],
+    program: Image,
     extra_syscalls: u64,
     /// Endpoint capabilities granted at start; raw handles arrive in RDI, RSI.
     endpoints: [Option<(usize, Rights)>; 2],
     /// Process capability (CONTROL) over this task slot; raw handle in RDX.
     process: Option<usize>,
     manage_processes: bool,
+    /// Grants ManageMemory (needed for MapMemory).
+    manage_memory: bool,
     /// Scheduled before ordinary tasks (init and services).
     priority: bool,
     /// Endpoint that receives a kernel notice when this task dies.
@@ -174,6 +199,9 @@ struct Task {
     /// Ticks used in the current time slice.
     slice: u32,
     preemptions: u32,
+    /// Next free address and pages used in the anonymous-memory window.
+    heap_next: u64,
+    heap_pages: u64,
     /// True while this task holds a request it has not replied to.
     serving: bool,
     restarts: u32,
@@ -204,6 +232,8 @@ enum Event {
     Restart(usize),
     /// The current task's time slice expired; it stays ready.
     Preempted,
+    /// The current task asked for this many anonymous pages.
+    MapMemory(u64),
 }
 
 struct System {
@@ -346,6 +376,7 @@ pub fn syscall_handler(frame: &mut SyscallFrame) {
         Ok(Syscall::IpcCall) => ipc_call(system, frame),
         Ok(Syscall::IpcReplyWait) => ipc_reply_wait(system, frame),
         Ok(Syscall::CreateProcess) => process_restart(system, frame),
+        Ok(Syscall::MapMemory) => map_memory_request(system, frame),
         Ok(_) => frame.rax = ENOSYS,
     }
     if frame.sanitize_for_sysret().is_err() {
@@ -568,6 +599,98 @@ fn process_restart(system: &mut System, frame: &mut SyscallFrame) {
     }
 }
 
+/// `MapMemory(pages)`: zeroed, writable, never-executable anonymous pages at
+/// a kernel-chosen address, within a per-task quota. Allocation happens in
+/// the scheduler (which owns the frame allocator), so the request parks.
+fn map_memory_request(system: &mut System, frame: &mut SyscallFrame) {
+    let pages = frame.rdi;
+    let Some(task) = current_task(system) else {
+        return;
+    };
+    if pages == 0 || pages > HEAP_QUOTA_PAGES {
+        frame.rax = EINVAL;
+    } else if task.heap_pages + pages > HEAP_QUOTA_PAGES {
+        frame.rax = ENOMEM;
+    } else {
+        park(system, frame, TaskState::Ready, Event::MapMemory(pages));
+    }
+}
+
+fn map_anonymous(memory: &mut HhdmFrameMemory<'_, '_>, task: &mut Task, pages: u64) -> u64 {
+    let Ok(rw) = PagePermissions::new(true, true, false, true) else {
+        return EINVAL;
+    };
+    let base = task.heap_next;
+    for index in 0..pages {
+        if map_user_page(memory, task.root, base + index * PAGE_SIZE, rw, None).is_err() {
+            return ENOMEM;
+        }
+        task.heap_next += PAGE_SIZE;
+        task.heap_pages += 1;
+    }
+    base
+}
+
+fn elf_error_text(error: ElfError) -> &'static str {
+    match error {
+        ElfError::Truncated => "truncated image",
+        ElfError::BadMagic => "not an ELF image",
+        ElfError::Unsupported => "unsupported ELF type, class or machine",
+        ElfError::BadProgramHeaders => "invalid program header table",
+        ElfError::TooManySegments => "too many segments",
+        ElfError::SegmentOutOfBounds => "segment outside the file",
+        ElfError::SegmentOutsideUserWindow => "segment outside the user window",
+        ElfError::MisalignedSegment => "misaligned segment",
+        ElfError::OverlappingSegments => "overlapping segments",
+        ElfError::WritableAndExecutable => "segment both writable and executable (W^X)",
+        ElfError::EntryNotExecutable => "entry point outside executable code",
+        ElfError::TooLarge => "image exceeds the page limit",
+        ElfError::NoLoadableSegments => "no loadable segments",
+    }
+}
+
+/// Maps a validated ELF plan page by page; returns the entry point.
+fn map_elf(
+    memory: &mut HhdmFrameMemory<'_, '_>,
+    root: PhysAddr,
+    image: &[u8],
+    plan: &elf::LoadPlan,
+) -> Result<u64, &'static str> {
+    for segment in plan.segments() {
+        let permissions = PagePermissions::new(true, segment.writable, segment.executable, true)
+            .map_err(|_| "W^X")?;
+        let file_start = segment.vaddr;
+        let file_end = segment.vaddr + segment.file_size;
+        let mut page = segment.page_start;
+        while page < segment.page_end {
+            // File bytes overlapping this page; the rest stays zero (bss).
+            let copy_start = file_start.max(page);
+            let copy_end = file_end.min(page + PAGE_SIZE);
+            let contents = if copy_start < copy_end {
+                let offset = (segment.file_offset + (copy_start - file_start)) as usize;
+                let length = (copy_end - copy_start) as usize;
+                let bytes = image
+                    .get(offset..offset + length)
+                    .ok_or("segment outside the file")?;
+                Some(((copy_start - page) as usize, bytes))
+            } else {
+                None
+            };
+            map_user_page(memory, root, page, permissions, contents)?;
+            page += PAGE_SIZE;
+        }
+    }
+    Ok(plan.entry)
+}
+
+/// Why a task could not be created.
+#[derive(Clone, Copy, Debug)]
+enum SpawnError {
+    /// The ELF loader refused the image (a containment event).
+    Rejected(ElfError),
+    Failed(&'static str),
+}
+
 /// Builds a task's address space and initial register state.
 fn spawn(
     memory: &mut HhdmFrameMemory<'_, '_>,
@@ -575,24 +698,44 @@ fn spawn(
     spec: TaskSpec,
     table_id: u32,
     restarts: u32,
-) -> Result<Task, &'static str> {
-    let program = (spec.program)();
-    if program.is_empty() || program.len() > PAGE_SIZE as usize {
-        return Err("program does not fit in one page");
-    }
+) -> Result<Task, SpawnError> {
+    // Validate an ELF image completely before allocating anything.
+    let elf_plan = match spec.program {
+        Image::Elf(bytes) => Some(elf::plan(bytes).map_err(SpawnError::Rejected)?),
+        Image::Flat(program) => {
+            let program = program();
+            if program.is_empty() || program.len() > PAGE_SIZE as usize {
+                return Err(SpawnError::Failed("program does not fit in one page"));
+            }
+            None
+        }
+    };
     let (root, report) = create_user_address_space(memory, kernel_root)
-        .map_err(|_| "address space creation failed")?;
+        .map_err(|_| SpawnError::Failed("address space creation failed"))?;
     report_user_strip(report.user_bits_stripped);
-    if let Err(reason) = map_task_image(memory, root, program) {
-        let _ = destroy_user_address_space(memory, root);
-        return Err(reason);
-    }
+    let mapped = match (spec.program, elf_plan) {
+        (Image::Elf(bytes), Some(plan)) => map_elf(memory, root, bytes, &plan)
+            .and_then(|entry| map_user_stack(memory, root).map(|()| entry)),
+        (Image::Flat(program), _) => {
+            map_task_image(memory, root, program()).map(|()| USER_CODE_BASE)
+        }
+        _ => Err("inconsistent image"),
+    };
+    let entry = match mapped {
+        Ok(entry) => entry,
+        Err(reason) => {
+            let _ = destroy_user_address_space(memory, root);
+            return Err(SpawnError::Failed(reason));
+        }
+    };
 
-    let mut endpoints = CapabilityTable::new(table_id).map_err(|_| "capability table")?;
-    let mut processes = CapabilityTable::new(table_id).map_err(|_| "capability table")?;
+    let fail = |reason| move |_| SpawnError::Failed(reason);
+    let mut endpoints = CapabilityTable::new(table_id).map_err(fail("capability table"))?;
+    let mut processes = CapabilityTable::new(table_id).map_err(fail("capability table"))?;
+    // RSP ≡ 8 (mod 16) at entry, as after a call, per the SysV ABI.
     let mut frame = UserContext {
-        rip: USER_CODE_BASE,
-        rsp: USER_STACK_TOP,
+        rip: entry,
+        rsp: USER_STACK_TOP - 8,
         ..UserContext::default()
     };
     let mut raw = [0u64; 2];
@@ -600,7 +743,7 @@ fn spawn(
         if let Some((endpoint, rights)) = grant {
             *slot = endpoints
                 .insert(endpoint, rights)
-                .map_err(|_| "capability grant failed")?
+                .map_err(fail("capability grant failed"))?
                 .to_raw();
         }
     }
@@ -610,7 +753,7 @@ fn spawn(
     if let Some(target) = spec.process {
         let handle = processes
             .insert(target, Rights::CONTROL)
-            .map_err(|_| "process capability grant failed")?
+            .map_err(fail("process capability grant failed"))?
             .to_raw();
         frame.rdx = handle;
         process_handle = Some((target, handle));
@@ -621,6 +764,9 @@ fn spawn(
     capabilities.grant(Capability::WriteConsole);
     if spec.manage_processes {
         capabilities.grant(Capability::ManageProcesses);
+    }
+    if spec.manage_memory {
+        capabilities.grant(Capability::ManageMemory);
     }
     Ok(Task {
         spec,
@@ -635,6 +781,8 @@ fn spawn(
         ticks: 0,
         slice: 0,
         preemptions: 0,
+        heap_next: HEAP_BASE,
+        heap_pages: 0,
         serving: false,
         restarts,
         exit: None,
@@ -759,6 +907,11 @@ fn run_system(
                     requester.context.rax = result;
                 }
             }
+            Event::MapMemory(pages) => {
+                if let Some(task) = system.tasks[next].as_mut() {
+                    task.context.rax = map_anonymous(memory, task, pages);
+                }
+            }
             Event::Blocked | Event::Preempted => {}
         }
     }
@@ -811,7 +964,24 @@ fn start_task(
             system.tasks[index] = Some(task);
             true
         }
-        Err(reason) => {
+        Err(SpawnError::Rejected(error)) => {
+            let mut writer = SerialWriter;
+            let _ = write!(
+                writer,
+                "ELF loader: refused {}: {}; nothing was mapped or executed.\r\n",
+                spec.name,
+                elf_error_text(error)
+            );
+            outcomes[index] = Some(Outcome {
+                spec,
+                exit: Some(TaskExit::LoadRejected(error)),
+                restarts,
+                preemptions: 0,
+                reclaimed: true,
+            });
+            false
+        }
+        Err(SpawnError::Failed(reason)) => {
             let mut writer = SerialWriter;
             let _ = write!(
                 writer,
@@ -978,6 +1148,13 @@ fn describe(exit: TaskExit, writer: &mut SerialWriter) {
         TaskExit::BadReturnAddress => write!(writer, "terminated: invalid return address"),
         TaskExit::CpuBudgetExceeded => write!(writer, "terminated: CPU budget exceeded"),
         TaskExit::Stopped => write!(writer, "still serving at shutdown"),
+        TaskExit::LoadRejected(error) => {
+            write!(
+                writer,
+                "refused by the ELF loader: {}",
+                elf_error_text(error)
+            )
+        }
     };
 }
 
@@ -1032,11 +1209,12 @@ const fn isolated(
     TaskSpec {
         name,
         role,
-        program,
+        program: Image::Flat(program),
         extra_syscalls,
         endpoints: [None, None],
         process: None,
         manage_processes: false,
+        manage_memory: false,
         priority: false,
         supervisor: None,
         expect,
@@ -1055,11 +1233,12 @@ const fn init_client(
     TaskSpec {
         name,
         role,
-        program,
+        program: Image::Flat(program),
         extra_syscalls: IPC_SYSCALLS,
         endpoints: [Some((ENDPOINT_INIT, SEND)), None],
         process: None,
         manage_processes: false,
+        manage_memory: false,
         priority: false,
         supervisor: None,
         expect,
@@ -1071,6 +1250,7 @@ pub fn run_self_test(
     memory: &mut HhdmFrameMemory<'_, '_>,
     kernel_root: PhysAddr,
     hhdm: HhdmOffset,
+    modules: &[(&'static str, &'static [u8])],
 ) -> bool {
     use user_programs as p;
     let isolated_tasks = [
@@ -1204,13 +1384,73 @@ pub fn run_self_test(
         }
     );
 
+    // ELF scenario: user programs come from hashed boot modules. One is a
+    // benign Rust program; the other deliberately has a W+X segment.
+    let module = |name: &str| {
+        modules
+            .iter()
+            .find(|(module, _)| *module == name)
+            .map(|(_, bytes)| *bytes)
+    };
+    let elf_ok = match (module("elf-hello"), module("elf-wx")) {
+        (Some(hello), Some(wx)) => {
+            let elf_task = |name, role, bytes, expect| TaskSpec {
+                name,
+                role,
+                program: Image::Elf(bytes),
+                extra_syscalls: 1 << Syscall::MapMemory as u8,
+                endpoints: [None, None],
+                process: None,
+                manage_processes: false,
+                manage_memory: true,
+                priority: false,
+                supervisor: None,
+                expect,
+            };
+            let elf_tasks = [
+                elf_task(
+                    "elf-hello",
+                    "Rust ELF from a verified boot module",
+                    hello,
+                    Expect::Exit(0),
+                ),
+                elf_task(
+                    "elf-wx",
+                    "ELF with a writable+executable segment",
+                    wx,
+                    Expect::LoadRejected(ElfError::WritableAndExecutable),
+                ),
+            ];
+            let outcomes = run_system(memory, kernel_root, hhdm, &elf_tasks);
+            outcomes
+                .iter()
+                .flatten()
+                .filter(|outcome| report(outcome))
+                .count()
+                == elf_tasks.len()
+        }
+        _ => {
+            serial_write("Centinela-OS: required ELF boot modules are missing.\r\n");
+            false
+        }
+    };
+    let _ = write!(
+        writer,
+        "ELF loader: {}.\r\n",
+        if elf_ok {
+            "verified (Rust ELF ran; W+X image refused)"
+        } else {
+            "FAILED"
+        }
+    );
+
     // Service-manager scenario. Slot 1 is the adder service whose process
     // capability init holds.
     let scenario = [
         TaskSpec {
             name: "init",
             role: "Ring 3 service manager: directory + restart policy",
-            program: p::init,
+            program: Image::Flat(p::init),
             extra_syscalls: IPC_SYSCALLS | (1 << Syscall::CreateProcess as u8),
             endpoints: [
                 Some((ENDPOINT_INIT, RECEIVE)),
@@ -1218,6 +1458,7 @@ pub fn run_self_test(
             ],
             process: Some(1),
             manage_processes: true,
+            manage_memory: false,
             priority: true,
             supervisor: None,
             expect: Expect::Service { restarts: 0 },
@@ -1225,11 +1466,12 @@ pub fn run_self_test(
         TaskSpec {
             name: "adder-service",
             role: "Ring 3 service supervised by init",
-            program: p::adder_service,
+            program: Image::Flat(p::adder_service),
             extra_syscalls: IPC_SYSCALLS,
             endpoints: [Some((ENDPOINT_ADDER, RECEIVE)), None],
             process: None,
             manage_processes: false,
+            manage_memory: false,
             priority: true,
             supervisor: Some(ENDPOINT_INIT),
             expect: Expect::Service { restarts: 1 },
@@ -1283,5 +1525,5 @@ pub fn run_self_test(
         "Microkernel: {scenario_passed}/{} service-manager checks passed; kernel still running.\r\n",
         scenario.len()
     );
-    isolation_ok && preemption_ok && scenario_passed == scenario.len()
+    isolation_ok && preemption_ok && elf_ok && scenario_passed == scenario.len()
 }
