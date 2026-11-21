@@ -2098,6 +2098,7 @@ pub fn run_self_test(
     let services_ok = run_services_scenario(memory, kernel_root, hhdm, &module);
     let badges_ok = run_badge_scenario(memory, kernel_root, hhdm, &module);
     let network_ok = run_network_scenario(memory, kernel_root, hhdm, &module);
+    let storage_ok = run_storage_scenario(memory, kernel_root, hhdm, &module);
     let ap_ok = ap_started && crate::smp::wait_done(0) && {
         let passed = AP_RESULT.load(core::sync::atomic::Ordering::Acquire);
         passed == AP_TASKS as u32 + 1
@@ -2112,6 +2113,7 @@ pub fn run_self_test(
         && elf_ok
         && scenario_passed == scenario.len()
         && drivers_ok
+        && storage_ok
         && services_ok
         && badges_ok
         && network_ok
@@ -2270,6 +2272,68 @@ fn run_network_scenario(
             // The fault is only produced once the driver reaches its
             // out-of-domain descriptor; an earlier failure means "untested",
             // not "DMA escaped".
+            "not observed (no IOMMU fault recorded)"
+        }
+    );
+    passed == tasks.len() && blocked
+}
+
+/// Phase 7 storage: a Ring 3 NVMe driver confined to its own IOMMU domain
+/// writes and reads back a block and has an out-of-domain read refused.
+fn run_storage_scenario(
+    memory: &mut HhdmFrameMemory<'_, '_>,
+    kernel_root: PhysAddr,
+    hhdm: HhdmOffset,
+    module: &dyn Fn(&str) -> Option<&'static [u8]>,
+) -> bool {
+    let mut writer = SerialWriter;
+    let Some(image) = module("nvme-driver") else {
+        serial_write("Centinela-OS: NVMe driver module missing.\r\n");
+        return false;
+    };
+    let Some(controller) = crate::pci::find_class(0x01, 0x08, 0x02) else {
+        serial_write("Storage: no NVMe controller present; storage scenario skipped.\r\n");
+        return true;
+    };
+    let Some(mmio) = crate::pci::mem_bar0(controller) else {
+        serial_write("Centinela-OS: NVMe controller has no memory BAR.\r\n");
+        return false;
+    };
+    let faults_before = crate::iommu::faults_seen();
+    let tasks = [TaskSpec {
+        name: "nvme-driver",
+        role: "Ring 3 NVMe driver: MMIO BAR + IOMMU-confined DMA",
+        program: Image::Elf(image),
+        extra_syscalls: (1 << Syscall::DmaAlloc as u8) | (1 << Syscall::Sleep as u8),
+        endpoints: [None, None, None],
+        process: None,
+        manage_processes: false,
+        manage_memory: false,
+        priority: false,
+        supervisor: None,
+        device: Some(DeviceGrant {
+            ports: [(0, 0), (0, 0)],
+            irq: None,
+            dma: Some(controller),
+            mmio: Some((mmio.0, mmio.1.min(MMIO_LIMIT))),
+        }),
+        arg: MMIO_BASE,
+        expect: Expect::Exit(0),
+    }];
+    let outcomes = run_system(memory, kernel_root, hhdm, &tasks);
+    let passed = outcomes
+        .iter()
+        .flatten()
+        .filter(|outcome| report(outcome))
+        .count();
+    let blocked = crate::iommu::faults_seen() > faults_before;
+    let _ = write!(
+        writer,
+        "Storage: {passed}/{} NVMe driver checks passed; out-of-domain DMA {}.\r\n",
+        tasks.len(),
+        if blocked {
+            "blocked by the IOMMU"
+        } else {
             "not observed (no IOMMU fault recorded)"
         }
     );

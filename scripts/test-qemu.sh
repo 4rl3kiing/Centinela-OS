@@ -30,6 +30,8 @@ REQUIRED_MESSAGES=(
     "SMP: CPU 1 ran 5/5 tasks on its own scheduler"
     "SMP: application processor 1 ran its own task partition concurrently with the BSP."
     "[task e1000-driver] e1000: link up; ARP reply from 10.0.2.2 at 52:55:0a:00:02:02"
+    "block written and read back (IOMMU-confined DMA)"
+    "Storage: 1/1 NVMe driver checks passed; out-of-domain DMA blocked by the IOMMU."
     "[task shell] cat nota.txt: microkernel con capacidades"
     "[task shell] net: udp loopback echo 'ping' ok"
     "[task fs-fuzzer] fs-fuzzer: 8/8 malformed requests rejected by ramfs"
@@ -52,7 +54,7 @@ REQUIRED_MESSAGES=(
     "[task hello] kernel pointer rejected with EFAULT"
     "Isolation: 12/12 tasks behaved as required; kernel still running."
     "Scheduler: preemptive time slicing verified (both CPU-bound tasks finished)."
-    "Boot modules: 12 verified by the boot chain."
+    "Boot modules: 13 verified by the boot chain."
     "[task elf-hello] hello from a Rust ELF loaded from a verified boot module"
     "[task elf-hello] mapped 2 zeroed anonymous RW pages with MapMemory"
     "ELF loader: refused elf-wx: segment both writable and executable (W^X); nothing was mapped or executed."
@@ -100,6 +102,10 @@ bench
 exit
 SHELL
 
+# Scratch disk for the NVMe driver scenario (contents are not preserved).
+NVME_IMAGE=build/nvme.img
+dd if=/dev/zero of="$NVME_IMAGE" bs=1M count=4 status=none
+
 # run_and_check MODE [extra required message...] -- QEMU ARGS...
 run_and_check() {
     local mode="$1"; shift
@@ -110,7 +116,8 @@ run_and_check() {
     local stderr="build/logs/qemu-$P$mode.stderr"
     : >"$log"
     set +e
-    timeout "$TIMEOUT_SECONDS" "$QEMU" -machine q35 -m 512M -smp 4 "${ACCEL[@]}" -device intel-iommu,intremap=on -device e1000,netdev=n0 -netdev user,id=n0 -display none -monitor none \
+    timeout "$TIMEOUT_SECONDS" "$QEMU" -machine q35 -m 512M -smp 4 "${ACCEL[@]}" -device intel-iommu,intremap=on -device e1000,netdev=n0 -netdev user,id=n0 \
+        -drive "file=$NVME_IMAGE,if=none,id=nvm,format=raw" -device nvme,serial=centinela,drive=nvm -display none -monitor none \
         -serial "file:$log" -serial null \
         -chardev "file,id=shellin,path=/dev/null,input-path=$SHELL_INPUT" -serial chardev:shellin \
         -fw_cfg name=opt/centinela/poweroff,string=1 \

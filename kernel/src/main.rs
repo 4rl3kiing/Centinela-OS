@@ -433,7 +433,7 @@ fn kernel_heap_self_test(hhdm: HhdmOffset, pmm: &'static PmmLock<'static>) -> bo
     true
 }
 
-const MAX_MODULES: usize = 12;
+const MAX_MODULES: usize = 16;
 const MAX_MODULE_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_MODULE_NAME: usize = 32;
 

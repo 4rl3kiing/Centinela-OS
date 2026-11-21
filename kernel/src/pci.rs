@@ -53,6 +53,17 @@ pub(crate) fn find(vendor: u16, device_id: u16) -> Option<Device> {
     })
 }
 
+/// Finds the first function on bus 0 with this class, subclass and
+/// programming interface (for example 01:08:02, an NVMe controller).
+pub(crate) fn find_class(class: u8, subclass: u8, interface: u8) -> Option<Device> {
+    let wanted = u32::from(class) << 24 | u32::from(subclass) << 16 | u32::from(interface) << 8;
+    (0u8..=255).find_map(|devfn| {
+        let device = Device { bus: 0, devfn };
+        (read32(device, 0) != 0xffff_ffff && read32(device, 0x08) & 0xffff_ff00 == wanted)
+            .then_some(device)
+    })
+}
+
 /// BAR 0 when it is a memory BAR: (physical base, size in bytes).
 pub(crate) fn mem_bar0(device: Device) -> Option<(u64, u64)> {
     let original = read32(device, 0x10);
