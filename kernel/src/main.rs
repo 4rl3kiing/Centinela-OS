@@ -454,8 +454,8 @@ fn run_isolation(memory: &mut HhdmFrameMemory<'_, '_>, kernel_root: PhysAddr, hh
     }
     if system::run_self_test(memory, kernel_root, hhdm) {
         serial_write(
-            "Microkernel milestone: ADR-0002 acceptance met (Ring 3 service, capability IPC, \
-             supervised restart); every hostile task contained.\r\n",
+            "Microkernel milestone: Ring 3 init manages services through capability IPC \
+             and attenuated grants; every hostile task contained.\r\n",
         );
     } else {
         serial_write("Centinela-OS: microkernel self-test failed.\r\n");

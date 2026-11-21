@@ -16,6 +16,23 @@ impl Rights {
     pub const CONTROL: Self = Self(1 << 2);
     pub const MAP: Self = Self(1 << 3);
     pub const CONNECT: Self = Self(1 << 4);
+    /// Allows passing (an attenuated copy of) this capability to another task.
+    pub const GRANT: Self = Self(1 << 5);
+    /// Every defined right.
+    pub const ALL: Self = Self((1 << 6) - 1);
+
+    /// Decodes rights from user input; undefined bits are rejected, not dropped.
+    pub const fn from_bits(bits: u16) -> Option<Self> {
+        if bits & !Self::ALL.0 != 0 {
+            None
+        } else {
+            Some(Self(bits))
+        }
+    }
+
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
 
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -169,6 +186,11 @@ impl<T, const N: usize> CapabilityTable<T, N> {
         slot.value.as_ref().ok_or(TableError::InvalidHandle)
     }
 
+    /// Rights held through a valid handle (used to bound capability transfers).
+    pub fn rights(&self, handle: CapabilityHandle<T>) -> Result<Rights, TableError> {
+        Ok(self.validated_slot(handle)?.rights)
+    }
+
     pub fn get_mut(
         &mut self,
         handle: CapabilityHandle<T>,
@@ -296,6 +318,13 @@ mod tests {
             Err(TableError::InvalidHandle)
         );
         assert_eq!(task_b.remove(handle_a), Err(TableError::InvalidHandle));
+    }
+
+    #[test]
+    fn rights_decoding_rejects_undefined_bits() {
+        assert_eq!(Rights::from_bits(Rights::GRANT.bits()), Some(Rights::GRANT));
+        assert_eq!(Rights::from_bits(1 << 6), None);
+        assert_eq!(Rights::from_bits(u16::MAX), None);
     }
 
     #[test]

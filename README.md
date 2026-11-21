@@ -63,4 +63,6 @@ Bootstrap, PMM and hardening milestones passed under BIOS and UEFI in QEMU, with
 
 **Microkernel milestone (ADR-0002 acceptance):** a Ring 3 service is reached only through an endpoint capability (separate SEND/RECEIVE rights, 4-word bounded messages). A client injects a fault into it; the kernel returns `EPIPE` to the client, the supervisor restarts the service with fresh memory and capabilities, and the next request succeeds. Forged handles, missing rights, oversized messages and capability-less IPC terminate the offender.
 
-Not yet implemented: capability transfer over IPC, user-space service manager, preemptive scheduler, SMP, ELF loading, KASLR, KPTI, heap hardening and IOMMU.
+**Service manager:** restart policy moved out of the kernel into `init`, a Ring 3 task. Clients start with only a capability to init and receive attenuated service capabilities from it (capability transfer requires GRANT and can never add rights). The kernel notifies init of service deaths with a kernel-origin flag no task can forge, and performs restarts only for holders of a process capability, within a quota.
+
+Not yet implemented: dynamic service registration, capability revocation trees, preemptive scheduler, SMP, ELF loading, KASLR, KPTI, heap hardening and IOMMU.

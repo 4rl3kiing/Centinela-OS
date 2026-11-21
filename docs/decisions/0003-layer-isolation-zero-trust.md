@@ -25,10 +25,12 @@ comes from.
 | Memory | Bootloader page tables, tasks | Per-task PML4; kernel half copied with USER stripped at the top level; empty user half per task; W^X; NX; NULL page unmappable for users; frames zeroed before use and reclaimed after |
 | Kernel ↔ task | Every user value | Syscalls need policy **and** capability; any violation kills the task; user pointers validated against the task's own tables and read through kernel aliases (the kernel never dereferences user addresses, SMAP never relaxed); SYSRET only to canonical lower-half RIP with fixed RFLAGS; user text sanitized before logging |
 | Task ↔ CPU time | Tasks that never yield | Local APIC timer watchdog with a per-task budget; legacy PIC IRQs fully masked |
-| Task ↔ task (IPC) | Every other task, including services | Endpoint capabilities with separate SEND/RECEIVE rights; raw handles resolved only in the caller's table (table-tagged, generation-checked); messages bounded to 4 register words with unused words zeroed; a dead server wakes its caller with `EPIPE`; restarted services get fresh memory and capabilities |
+| Task ↔ task (IPC) | Every other task, including services | Endpoint capabilities with separate SEND/RECEIVE rights; raw handles resolved only in the caller's table (table-tagged, generation-checked); messages bounded to 4 register words with unused words zeroed; capabilities can be passed only with GRANT and only attenuated (never more rights than held); a dead server wakes its caller with `EPIPE` |
+| Kernel ↔ init | The service manager itself | Init holds restart policy, but restarts need ManageProcesses, a process capability with CONTROL, and stay within a kernel quota (3); death notices carry a kernel-origin flag that no task can set, so forged notices are recognizable |
 | Task ↔ hardware | Direct device access | IOPL 0 and no TSS I/O bitmap (all ports #GP); all IDT gates DPL 0 (no `int n` spoofing); device MMIO mapped only kernel-only, uncached, NX |
 
-The policy lives in the kernel (`kernel/src/isolation.rs`); the mechanisms
+Service policy (directory, restart decisions) lives in `init`, a Ring 3 task;
+kernel policy lives in `kernel/src/isolation.rs` and `kernel/src/system.rs`; the mechanisms
 live in the HAL (`gdt`, `idt`, `syscall`, `apic`) and memory modules
 (`address_space`, `hhdm_backend`, `usercopy`).
 
@@ -52,12 +54,15 @@ end exactly as required and return all of its memory:
 | spin | infinite loop | killed by watchdog |
 | stack-overflow | exhaust stack | killed by #PF on the unmapped page |
 
-A second scenario runs a Ring 3 service, a client that injects a fault into
-it, and four tasks that abuse IPC (receive with a SEND-only capability, forged
-handle, oversized message, no capability at all). The service must be
-restarted exactly once and still be serving at shutdown, the client must get
-every reply (and `EPIPE` for the crashed request), and each abuser must be
-terminated.
+A second scenario runs `init` (Ring 3 service manager), an adder service
+supervised by init, and six other tasks. The client starts with only a SEND
+capability to init, receives a SEND-only (no GRANT) adder capability from it,
+uses the service and then crashes it. The kernel wakes the client with
+`EPIPE`, notifies init, and init requests the restart, which the kernel
+performs within its quota; the next request succeeds. Hostile tasks forge a
+death notice (init ignores it), try to re-grant a capability with more rights,
+receive with a SEND-only capability, use a forged handle and send an oversized
+message; all but the forger (which is simply ignored) are terminated.
 
 CI boots BIOS, BIOS with `-cpu max` (SMEP/SMAP/UMIP) and UEFI and fails on any
 unexpected outcome, leak, kernel trap or panic. Locally verified as well: a
@@ -67,8 +72,8 @@ IST stack).
 
 ## Not yet covered (next milestones)
 
-- Capability transfer over IPC, multiple endpoints and a user-space service
-  manager (restart policy lives in the kernel supervisor today).
+- Dynamic service registration and capability revocation trees (init's
+  directory is static; restarts reuse the same program image).
 - A preemptive scheduler (scheduling is IPC-driven; the watchdog terminates
   rather than preempts).
 - SMP: per-CPU GDT/TSS/stacks and the TLB shootdown transport.
