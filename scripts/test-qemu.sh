@@ -150,6 +150,45 @@ run_and_check bios-cpu-max \
     "CPU hardening: SMEP enabled." "CPU hardening: SMAP enabled." "CPU hardening: UMIP enabled." \
     -- -cpu max -cdrom "$ISO" -boot d
 
+# Screen console: boot once more with a monitor socket, wait for the final
+# milestone, take a screendump and decode the framebuffer text cells.
+screen_check() {
+    local log="build/logs/qemu-${P}screen.log" sock="build/qemu-monitor.sock"
+    local shot="build/logs/${P}screen.ppm"
+    rm -f "$sock" "$shot"
+    : >"$log"
+    # Same machine as the other boots, minus the fw_cfg power-off request,
+    # so the final screen stays up for the screendump.
+    "$QEMU" -machine q35 -m 512M -smp 4 "${ACCEL[@]}" -device intel-iommu,intremap=on \
+        -device e1000,netdev=n0 -netdev user,id=n0 \
+        -drive "file=$NVME_IMAGE,if=none,id=nvm,format=raw" -device nvme,serial=centinela,drive=nvm \
+        -display none -monitor "unix:$sock,server,nowait" \
+        -serial "file:$log" -serial null \
+        -chardev "file,id=shellin,path=/dev/null,input-path=$SHELL_INPUT" -serial chardev:shellin \
+        -no-reboot -no-shutdown -cdrom "$ISO" -boot d >/dev/null 2>&1 &
+    local pid=$!
+    local waited=0
+    until grep -Fq "Microkernel milestone:" "$log" || ((waited >= TIMEOUT_SECONDS * 2)); do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    python3 - "$sock" "$shot" <<'PY'
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+time.sleep(0.5)
+s.sendall(f"screendump {sys.argv[2]}\n".encode())
+time.sleep(2)
+s.close()
+PY
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    test -s "$shot" || fail "$log" /dev/null "screendump was not produced"
+    python3 scripts/check-screen.py "$shot" \
+        "Microkernel milestone: Ring 3 init manages services" || fail "$log" /dev/null "screen console check failed"
+}
+screen_check
+
 OVMF_CODE="${OVMF_CODE:-}"
 OVMF_VARS="${OVMF_VARS:-}"
 if [[ -z "$OVMF_CODE" ]]; then
