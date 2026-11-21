@@ -150,3 +150,24 @@ in parallel with 7 and 8.
   machines with a serial port or serial-over-LAN must be available.
 - Two design decisions (filesystem, network stack) are deliberately left
   open and must be closed by their own ADRs before implementation.
+
+## Amendment (2026-11-21): code first, physical testing at the end
+
+Approved by the owner. Everything that can be implemented and verified in
+QEMU (TCG and KVM) is built first; physical-machine testing becomes one
+campaign at the end, and the fixes that follow are driven by its results.
+The approach keeps three conditions:
+
+1. **No QEMU-only shortcuts.** Configuration comes from the same sources
+   real firmware provides (ACPI tables, PCI configuration, the device's own
+   capability registers), never from values that only hold in QEMU.
+2. **Diagnosis built in.** Every boot prints an `HWREPORT` block (CPU, ACPI
+   tables, every PCI function and whether it has a driver), and the
+   installer keeps its log, so that one physical test boot gives enough
+   information to plan the corrections.
+3. **Several configurations in CI.** Intel and AMD IOMMUs, BIOS and UEFI,
+   different devices and memory sizes.
+
+Accepted risk: problems that only real hardware shows (firmware quirks,
+device variety, timing) surface late, in one batch, and are fixed in a
+dedicated round after the campaign.
