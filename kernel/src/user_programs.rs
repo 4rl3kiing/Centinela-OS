@@ -425,6 +425,54 @@ core::arch::global_asm!(
     "    ud2",
     ".global centinela_user_oversized_message_end",
     "centinela_user_oversized_message_end:",
+    "",
+    // Attack: a driver granted COM3 reaches for COM1, the kernel console.
+    ".balign 16",
+    ".global centinela_user_port_escape_start",
+    "centinela_user_port_escape_start:",
+    "    mov edi, 0x3e8",
+    "    xor esi, esi",
+    "    mov eax, 15",
+    "    syscall",
+    "    mov edi, 0x3f8",
+    "    mov esi, 1",
+    "    mov edx, 0x41",
+    "    mov eax, 15",
+    "    syscall",
+    "    xor edi, edi",
+    "    mov eax, 12",
+    "    syscall",
+    "    ud2",
+    ".global centinela_user_port_escape_end",
+    "centinela_user_port_escape_end:",
+    "",
+    // Attack: re-arm an interrupt line it was never bound to.
+    ".balign 16",
+    ".global centinela_user_irq_forge_start",
+    "centinela_user_irq_forge_start:",
+    "    mov eax, 16",
+    "    syscall",
+    "    xor edi, edi",
+    "    mov eax, 12",
+    "    syscall",
+    "    ud2",
+    ".global centinela_user_irq_forge_end",
+    "centinela_user_irq_forge_end:",
+    "",
+    // Attack: port I/O syscall without the DeviceAccess capability.
+    ".balign 16",
+    ".global centinela_user_no_device_cap_start",
+    "centinela_user_no_device_cap_start:",
+    "    mov edi, 0x60",
+    "    xor esi, esi",
+    "    mov eax, 15",
+    "    syscall",
+    "    xor edi, edi",
+    "    mov eax, 12",
+    "    syscall",
+    "    ud2",
+    ".global centinela_user_no_device_cap_end",
+    "centinela_user_no_device_cap_end:",
     ".text",
 );
 
@@ -536,4 +584,19 @@ program!(
     worker,
     centinela_user_worker_start,
     centinela_user_worker_end
+);
+program!(
+    port_escape,
+    centinela_user_port_escape_start,
+    centinela_user_port_escape_end
+);
+program!(
+    irq_forge,
+    centinela_user_irq_forge_start,
+    centinela_user_irq_forge_end
+);
+program!(
+    no_device_cap,
+    centinela_user_no_device_cap_start,
+    centinela_user_no_device_cap_end
 );

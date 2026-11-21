@@ -183,6 +183,93 @@ pub fn parse_dmar(table: &[u8], units: &mut [DrhdUnit]) -> Result<Dmar, AcpiErro
     })
 }
 
+/// I/O APIC described by the MADT.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IoApic {
+    pub address: u64,
+    pub gsi_base: u32,
+}
+
+/// ISA interrupt source override (legacy IRQ → GSI, polarity/trigger).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IsaOverride {
+    pub source: u8,
+    pub gsi: u32,
+    pub flags: u16,
+}
+
+/// Parsed MADT: the first I/O APIC and up to `MAX_OVERRIDES` ISA overrides.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Madt {
+    pub io_apic: Option<IoApic>,
+    pub overrides: [IsaOverride; MAX_OVERRIDES],
+    pub override_count: usize,
+}
+
+pub const MAX_OVERRIDES: usize = 16;
+
+impl Madt {
+    /// Resolves a legacy ISA IRQ to (GSI, active_low, level_triggered).
+    pub fn route_isa(&self, irq: u8) -> (u32, bool, bool) {
+        self.overrides[..self.override_count]
+            .iter()
+            .find(|entry| entry.source == irq)
+            .map_or((u32::from(irq), false, false), |entry| {
+                // MPS INTI flags: polarity bits 1:0 (3 = active low),
+                // trigger bits 3:2 (3 = level).
+                (
+                    entry.gsi,
+                    entry.flags & 0b11 == 0b11,
+                    (entry.flags >> 2) & 0b11 == 0b11,
+                )
+            })
+    }
+}
+
+/// Parses a checksummed MADT ("APIC") table defensively.
+pub fn parse_madt(table: &[u8]) -> Result<Madt, AcpiError> {
+    if table.len() < 44 || &table[..4] != b"APIC" || !checksum_ok(table) {
+        return Err(AcpiError::BadTable);
+    }
+    let mut madt = Madt::default();
+    let mut offset = 44;
+    while offset < table.len() {
+        let kind = *table.get(offset).ok_or(AcpiError::BadTable)?;
+        let length = usize::from(*table.get(offset + 1).ok_or(AcpiError::BadTable)?);
+        let end = offset.checked_add(length).ok_or(AcpiError::BadTable)?;
+        if length < 2 || end > table.len() {
+            return Err(AcpiError::BadTable);
+        }
+        match kind {
+            1 if length >= 12 && madt.io_apic.is_none() => {
+                let address = u64::from(u32_at(table, offset + 4).ok_or(AcpiError::BadTable)?);
+                if address == 0 || address & 0xfff != 0 {
+                    return Err(AcpiError::BadTable);
+                }
+                madt.io_apic = Some(IoApic {
+                    address,
+                    gsi_base: u32_at(table, offset + 8).ok_or(AcpiError::BadTable)?,
+                });
+            }
+            2 if length >= 10 => {
+                let slot = madt
+                    .overrides
+                    .get_mut(madt.override_count)
+                    .ok_or(AcpiError::TooManyUnits)?;
+                *slot = IsaOverride {
+                    source: table[offset + 3],
+                    gsi: u32_at(table, offset + 4).ok_or(AcpiError::BadTable)?,
+                    flags: u16_at(table, offset + 8).ok_or(AcpiError::BadTable)?,
+                };
+                madt.override_count += 1;
+            }
+            _ => {}
+        }
+        offset = end;
+    }
+    Ok(madt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +393,45 @@ mod tests {
         t[48 + 3] = 0;
         fix_checksum(&mut t, 9);
         assert_eq!(parse_dmar(&t, &mut units), Err(AcpiError::BadTable));
+    }
+
+    fn madt(entries: &[&[u8]]) -> Vec<u8> {
+        let mut body = vec![0u8; 8];
+        for entry in entries {
+            body.extend_from_slice(entry);
+        }
+        table(b"APIC", &body)
+    }
+
+    #[test]
+    fn parses_ioapic_and_overrides() {
+        let mut ioapic = vec![1u8, 12, 0, 0];
+        ioapic.extend_from_slice(&0xfec0_0000u32.to_le_bytes());
+        ioapic.extend_from_slice(&0u32.to_le_bytes());
+        let mut iso = vec![2u8, 10, 0, 0];
+        iso.extend_from_slice(&2u32.to_le_bytes());
+        iso.extend_from_slice(&0u16.to_le_bytes());
+        let mut level = vec![2u8, 10, 0, 9];
+        level.extend_from_slice(&9u32.to_le_bytes());
+        level.extend_from_slice(&0b1111u16.to_le_bytes());
+        let parsed = parse_madt(&madt(&[&ioapic, &iso, &level])).unwrap();
+        assert_eq!(parsed.io_apic.unwrap().address, 0xfec0_0000);
+        assert_eq!(parsed.route_isa(0), (2, false, false));
+        assert_eq!(parsed.route_isa(9), (9, true, true));
+        assert_eq!(parsed.route_isa(3), (3, false, false));
+    }
+
+    #[test]
+    fn hostile_madt_fails_closed() {
+        assert_eq!(parse_madt(&madt(&[&[1, 0]])), Err(AcpiError::BadTable));
+        assert_eq!(
+            parse_madt(&madt(&[&[1, 200, 0, 0]])),
+            Err(AcpiError::BadTable)
+        );
+        let mut unaligned = vec![1u8, 12, 0, 0];
+        unaligned.extend_from_slice(&0xfec0_0010u32.to_le_bytes());
+        unaligned.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(parse_madt(&madt(&[&unaligned])), Err(AcpiError::BadTable));
     }
 
     #[test]

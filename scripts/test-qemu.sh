@@ -17,6 +17,7 @@ REQUIRED_MESSAGES=(
     "CPU hardening: CR0.WP enabled."
     "SMP: 3 application processors online (isolated, parked"
     "IOMMU: DMA remapping enabled on 1 unit(s), deny-by-default"
+    "Drivers: 5/5 Ring 3 driver checks passed"
     "Limine base revision 5 accepted."
     "VMM bootstrap: Limine page-table frames validated through HHDM."
     "VMM bootstrap: HHDM root alias and kernel RX mapping verified."
@@ -36,7 +37,7 @@ REQUIRED_MESSAGES=(
     "[task hello] kernel pointer rejected with EFAULT"
     "Isolation: 12/12 tasks behaved as required; kernel still running."
     "Scheduler: preemptive time slicing verified (both CPU-bound tasks finished)."
-    "Boot modules: 2 verified by the boot chain."
+    "Boot modules: 4 verified by the boot chain."
     "[task elf-hello] hello from a Rust ELF loaded from a verified boot module"
     "[task elf-hello] mapped 2 zeroed anonymous RW pages with MapMemory"
     "ELF loader: refused elf-wx: segment both writable and executable (W^X); nothing was mapped or executed."
@@ -71,7 +72,7 @@ run_and_check() {
     : >"$log"
     set +e
     timeout "$TIMEOUT_SECONDS" "$QEMU" -machine q35 -m 512M -smp 4 -device intel-iommu -display none -monitor none \
-        -serial "file:$log" -no-reboot -no-shutdown "$@" >"$stderr" 2>&1
+        -serial "file:$log" -serial null -no-reboot -no-shutdown "$@" >"$stderr" 2>&1
     local status=$?
     set -e
     # 124 = still halted when the timeout fired, which is the expected end state.

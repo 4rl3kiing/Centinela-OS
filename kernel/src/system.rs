@@ -21,7 +21,7 @@ use centinela_hal::idt::{TrapFrame, exception_name};
 use centinela_hal::serial::{SerialWriter, write as serial_write};
 use centinela_hal::syscall::{self, SyscallFrame, UserContext};
 use centinela_kernel::ipc::{
-    CallOutcome, Endpoint, IpcViolation, MAX_MESSAGE_WORDS, Message, MessageFlags,
+    CallOutcome, Endpoint, IpcViolation, MAX_MESSAGE_WORDS, Message, MessageFlags, NOTICE_IRQ,
     NOTICE_SERVICE_DIED, RECEIVE, SEND, STATUS_NO_RECEIVER, STATUS_OK, STATUS_PEER_DIED, TaskId,
     attenuate,
 };
@@ -44,7 +44,23 @@ use centinela_kernel::elf::{self, ElfError};
 use centinela_security::permissions::PagePermissions;
 
 const MAX_TASKS: usize = 8;
-const ENDPOINT_COUNT: usize = 2;
+const ENDPOINT_COUNT: usize = 4;
+/// Interrupt vectors reserved for IRQs bound to Ring 3 drivers.
+pub(crate) const DEVICE_VECTOR_BASE: u64 = 0x24;
+const MAX_IRQ_ROUTES: usize = 4;
+/// Idle wake-ups (timer ticks or IRQs) allowed while only drivers wait.
+const MAX_IDLE_WAKEUPS: u32 = 500;
+/// Port ranges the kernel never grants: interrupt controllers, PIT, system
+/// control, CMOS/RTC, the kernel's own console (COM1) and PCI configuration.
+const KERNEL_PORTS: [(u16, u16); 7] = [
+    (0x20, 2),
+    (0x40, 4),
+    (0x61, 1),
+    (0x70, 2),
+    (0xa0, 2),
+    (0x3f8, 8),
+    (0xcf8, 8),
+];
 /// Kernel-enforced ceiling on restarts per service, whatever init requests.
 const MAX_RESTARTS: u32 = 3;
 const MAX_WRITE_LENGTH: u64 = 256;
@@ -62,6 +78,52 @@ const EBUSY: u64 = (-16_i64) as u64;
 const ENDPOINT_INIT: usize = 0;
 /// Endpoint served by the adder service.
 const ENDPOINT_ADDER: usize = 1;
+/// Endpoints on which the Ring 3 UART and keyboard drivers receive IRQs.
+const ENDPOINT_UART: usize = 2;
+const ENDPOINT_KBD: usize = 3;
+
+/// Why a driver's device access was refused (always fatal for the task).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceViolation {
+    PortOutsideGrant(u16),
+    InvalidOperation,
+    NoInterruptGrant,
+}
+
+/// Hardware a Ring 3 driver may touch, granted by the kernel at start.
+#[derive(Clone, Copy)]
+struct DeviceGrant {
+    /// Mediated port windows: (first port, number of ports); count 0 = unused.
+    ports: [(u16, u16); 2],
+    /// Legacy ISA IRQ, delivered as a kernel notice on this endpoint.
+    irq: Option<(u8, usize)>,
+}
+
+impl DeviceGrant {
+    fn allows_port(self, port: u64) -> bool {
+        self.ports.iter().any(|&(base, count)| {
+            let (base, count) = (u64::from(base), u64::from(count));
+            port >= base && port < base + count
+        })
+    }
+
+    fn overlaps_kernel_ports(self) -> bool {
+        self.ports.iter().any(|&(base, count)| {
+            let (base, count) = (u32::from(base), u32::from(count));
+            KERNEL_PORTS.iter().any(|&(start, length)| {
+                let (start, length) = (u32::from(start), u32::from(length));
+                base < start + length && start < base + count
+            })
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct IrqRoute {
+    isa_irq: u8,
+    endpoint: usize,
+    owner: usize,
+}
 
 /// How a task ended. Every variant except `Exited` and `Stopped` is a
 /// containment event.
@@ -82,6 +144,8 @@ pub enum TaskExit {
     Stopped,
     /// The ELF loader refused the image; nothing was executed.
     LoadRejected(ElfError),
+    /// A driver touched hardware outside its grant.
+    Device(DeviceViolation),
 }
 
 impl TaskExit {
@@ -96,6 +160,7 @@ impl TaskExit {
             Self::CpuBudgetExceeded => 5,
             Self::Stopped => 6,
             Self::LoadRejected(_) => 7,
+            Self::Device(_) => 8,
         }
     }
 }
@@ -117,6 +182,7 @@ enum Expect {
     ExitAfterPreemption(u64),
     /// The loader must refuse the image for this reason.
     LoadRejected(ElfError),
+    Device(DeviceViolation),
 }
 
 impl Expect {
@@ -139,6 +205,7 @@ impl Expect {
             (Self::Ipc(expected), TaskExit::Ipc(actual)) => expected == actual,
             (Self::LoadRejected(expected), TaskExit::LoadRejected(actual)) => expected == actual,
             (Self::Service { restarts: expected }, TaskExit::Stopped) => expected == restarts,
+            (Self::Device(expected), TaskExit::Device(actual)) => expected == actual,
             _ => false,
         }
     }
@@ -171,6 +238,8 @@ struct TaskSpec {
     priority: bool,
     /// Endpoint that receives a kernel notice when this task dies.
     supervisor: Option<usize>,
+    /// Ports and IRQ of a Ring 3 driver (grants DeviceAccess).
+    device: Option<DeviceGrant>,
     expect: Expect,
 }
 
@@ -219,6 +288,8 @@ struct EndpointState {
     rendezvous: Endpoint,
     /// Task slots whose death notice is waiting for the receiver.
     pending_notices: u8,
+    /// A bound IRQ fired and its notice awaits the receiver.
+    pending_irq: Option<u8>,
 }
 
 /// What ended the most recent run of the current task.
@@ -245,6 +316,7 @@ struct System {
     event: Event,
     reader: HhdmReader,
     next_table_id: u32,
+    irq_routes: [Option<IrqRoute>; MAX_IRQ_ROUTES],
 }
 
 static mut SYSTEM: Option<System> = None;
@@ -332,6 +404,12 @@ pub fn trap_handler(frame: &mut TrapFrame) {
         // NMI, double fault and machine check signal platform or kernel
         // failure: never attribute them to a task, always fail closed.
         2 | 8 | 18 => fatal_kernel_trap(frame),
+        vector
+            if (DEVICE_VECTOR_BASE..DEVICE_VECTOR_BASE + MAX_IRQ_ROUTES as u64)
+                .contains(&vector) =>
+        {
+            device_interrupt((vector - DEVICE_VECTOR_BASE) as usize);
+        }
         vector if user_task => {
             let exit = TaskExit::Fault {
                 vector,
@@ -375,11 +453,136 @@ pub fn syscall_handler(frame: &mut SyscallFrame) {
         Ok(Syscall::IpcReplyWait) => ipc_reply_wait(system, frame),
         Ok(Syscall::CreateProcess) => process_restart(system, frame),
         Ok(Syscall::MapMemory) => map_memory_request(system, frame),
+        Ok(Syscall::PortIo) => port_io(system, frame),
+        Ok(Syscall::IrqAck) => irq_ack(system, frame),
         Ok(_) => frame.rax = ENOSYS,
     }
     if frame.sanitize_for_sysret().is_err() {
         terminate(system, TaskExit::BadReturnAddress);
     }
+}
+
+/// A bound IRQ fired: mask the line (only the driver re-arms it), then notify
+/// the driver through its endpoint as a kernel-origin message.
+fn device_interrupt(route: usize) {
+    let Some(system) = system_state() else {
+        centinela_hal::apic::end_of_interrupt();
+        return;
+    };
+    let Some(IrqRoute {
+        isa_irq, endpoint, ..
+    }) = system.irq_routes[route]
+    else {
+        centinela_hal::apic::end_of_interrupt();
+        return;
+    };
+    crate::ioapic::set_masked(isa_irq, true);
+    centinela_hal::apic::end_of_interrupt();
+    system.endpoints[endpoint].pending_irq = Some(isa_irq);
+    deliver_pending_notice(system, endpoint);
+}
+
+/// `PortIo`: one 8-bit access, mediated, inside the caller's port grant.
+/// RDI = port, RSI = 0 (read) or 1 (write), RDX = value to write.
+fn port_io(system: &mut System, frame: &mut SyscallFrame) {
+    let grant = current_task(system).and_then(|task| task.spec.device);
+    let port = frame.rdi;
+    let violation = match grant {
+        None => Some(DeviceViolation::PortOutsideGrant(port as u16)),
+        Some(grant) if !grant.allows_port(port) => {
+            Some(DeviceViolation::PortOutsideGrant(port as u16))
+        }
+        Some(_) if frame.rsi > 1 || frame.rdx > 0xff => Some(DeviceViolation::InvalidOperation),
+        Some(_) => None,
+    };
+    if let Some(violation) = violation {
+        terminate(system, TaskExit::Device(violation));
+    }
+    let port = port as u16;
+    if frame.rsi == 1 {
+        let value = frame.rdx as u8;
+        // SAFETY: CPL 0; the port lies in a kernel-vetted driver grant that
+        // excludes every kernel-owned port range.
+        unsafe {
+            core::arch::asm!("out dx, al", in("dx") port, in("al") value,
+                options(nomem, nostack, preserves_flags));
+        }
+        frame.rax = 0;
+    } else {
+        let value: u8;
+        // SAFETY: As above.
+        unsafe {
+            core::arch::asm!("in al, dx", in("dx") port, out("al") value,
+                options(nomem, nostack, preserves_flags));
+        }
+        frame.rax = u64::from(value);
+    }
+}
+
+/// `IrqAck`: re-arms the caller's own bound line; no arguments to forge.
+fn irq_ack(system: &mut System, frame: &mut SyscallFrame) {
+    let Some(caller) = system.current else { return };
+    let route = system
+        .irq_routes
+        .iter()
+        .flatten()
+        .find(|route| route.owner == caller)
+        .copied();
+    match route {
+        Some(route) => {
+            crate::ioapic::set_masked(route.isa_irq, false);
+            frame.rax = 0;
+        }
+        None => terminate(system, TaskExit::Device(DeviceViolation::NoInterruptGrant)),
+    }
+}
+
+/// Binds the IRQ of every driver task to a device vector (masked).
+fn bind_irqs(system: &mut System) -> bool {
+    let mut next = 0;
+    for index in 0..MAX_TASKS {
+        let Some(task) = system.tasks[index].as_ref() else {
+            continue;
+        };
+        let Some((isa_irq, endpoint)) = task.spec.device.and_then(|device| device.irq) else {
+            continue;
+        };
+        if next >= MAX_IRQ_ROUTES
+            // Bound masked: the driver arms its line with IrqAck once ready.
+            || !crate::ioapic::route(isa_irq, (DEVICE_VECTOR_BASE + next as u64) as u8, true)
+        {
+            return false;
+        }
+        system.irq_routes[next] = Some(IrqRoute {
+            isa_irq,
+            endpoint,
+            owner: index,
+        });
+        next += 1;
+    }
+    true
+}
+
+/// Masks and forgets every IRQ route owned by task `index`.
+fn unbind_irqs(system: &mut System, index: usize) {
+    for slot in system.irq_routes.iter_mut() {
+        if let Some(route) = *slot
+            && route.owner == index
+        {
+            crate::ioapic::set_masked(route.isa_irq, true);
+            system.endpoints[route.endpoint].pending_irq = None;
+            *slot = None;
+        }
+    }
+}
+
+/// True if a live driver is blocked waiting for its (armed) interrupt.
+fn driver_waiting(system: &System) -> bool {
+    system.irq_routes.iter().flatten().any(|route| {
+        system.tasks[route.owner]
+            .as_ref()
+            .is_some_and(|task| task.state == TaskState::BlockedReceive)
+    })
 }
 
 fn sys_write(task: &Task, reader: HhdmReader, address: u64, length: u64) -> u64 {
@@ -552,6 +755,19 @@ fn deliver_pending_notice(system: &mut System, endpoint: usize) {
         .as_ref()
         .is_some_and(|task| task.state == TaskState::BlockedReceive)
     {
+        return;
+    }
+    if let Some(isa_irq) = system.endpoints[endpoint].pending_irq.take() {
+        system.endpoints[endpoint].rendezvous.take_receiver();
+        if let Some(task) = system.tasks[receiver].as_mut() {
+            let notice = Outgoing {
+                message: Message::from_registers(2, [NOTICE_IRQ, u64::from(isa_irq), 0, 0])
+                    .unwrap_or_default(),
+                transfer: None,
+            };
+            deliver(task, STATUS_OK, &notice, true);
+            task.state = TaskState::Ready;
+        }
         return;
     }
     let pending = &mut system.endpoints[endpoint].pending_notices;
@@ -767,6 +983,15 @@ fn spawn(
     if spec.manage_memory {
         capabilities.grant(Capability::ManageMemory);
     }
+    if let Some(device) = spec.device {
+        if device.overlaps_kernel_ports() {
+            let _ = destroy_user_address_space(memory, root);
+            return Err(SpawnError::Failed(
+                "device grant overlaps kernel-owned ports",
+            ));
+        }
+        capabilities.grant(Capability::DeviceAccess);
+    }
     Ok(Task {
         spec,
         state: TaskState::Ready,
@@ -841,6 +1066,7 @@ fn run_system(
             event: Event::Blocked,
             reader,
             next_table_id: 1,
+            irq_routes: [None; MAX_IRQ_ROUTES],
         });
     }
     let Some(system) = system_state() else {
@@ -849,10 +1075,23 @@ fn run_system(
     for (index, spec) in specs.iter().take(MAX_TASKS).enumerate() {
         start_task(memory, kernel_root, system, index, *spec, 0, &mut outcomes);
     }
+    if !bind_irqs(system) {
+        serial_write("Centinela-OS: could not route a driver IRQ.\r\n");
+    }
 
     let mut last = MAX_TASKS - 1;
+    let mut idle_wakeups = 0u32;
     while let Some(system) = system_state() {
         let Some(next) = pick_next(system, last) else {
+            // Only drivers waiting for hardware: sleep until an interrupt.
+            if driver_waiting(system) && idle_wakeups < MAX_IDLE_WAKEUPS {
+                idle_wakeups += 1;
+                // SAFETY: Interrupts are enabled only for this one HLT; the
+                // handlers re-borrow the system state themselves and no
+                // reference to it is live across the wait.
+                unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) };
+                continue;
+            }
             break;
         };
         last = next;
@@ -1027,6 +1266,7 @@ fn reap(
         return;
     };
     let (spec, serving, restarts, exit) = (task.spec, task.serving, task.restarts, task.exit);
+    unbind_irqs(system, index);
     for endpoint in system.endpoints.iter_mut() {
         if let Some(caller) = endpoint.rendezvous.on_task_death(index, serving)
             && let Some(caller) = system.tasks[caller].as_mut()
@@ -1066,6 +1306,7 @@ fn reap_final(
     index: usize,
     outcomes: &mut [Option<Outcome>; MAX_TASKS],
 ) {
+    unbind_irqs(system, index);
     let Some(task) = system.tasks[index].take() else {
         return;
     };
@@ -1130,6 +1371,18 @@ fn describe(exit: TaskExit, writer: &mut SerialWriter) {
         TaskExit::BadReturnAddress => write!(writer, "terminated: invalid return address"),
         TaskExit::CpuBudgetExceeded => write!(writer, "terminated: CPU budget exceeded"),
         TaskExit::Stopped => write!(writer, "still serving at shutdown"),
+        TaskExit::Device(DeviceViolation::PortOutsideGrant(port)) => {
+            write!(
+                writer,
+                "terminated: port {port:#x} outside its device grant"
+            )
+        }
+        TaskExit::Device(DeviceViolation::InvalidOperation) => {
+            write!(writer, "terminated: invalid port operation")
+        }
+        TaskExit::Device(DeviceViolation::NoInterruptGrant) => {
+            write!(writer, "terminated: acknowledged an IRQ it does not own")
+        }
         TaskExit::LoadRejected(error) => {
             write!(
                 writer,
@@ -1199,6 +1452,7 @@ const fn isolated(
         manage_memory: false,
         priority: false,
         supervisor: None,
+        device: None,
         expect,
     }
 }
@@ -1223,6 +1477,7 @@ const fn init_client(
         manage_memory: false,
         priority: false,
         supervisor: None,
+        device: None,
         expect,
     }
 }
@@ -1387,6 +1642,7 @@ pub fn run_self_test(
                 manage_memory: true,
                 priority: false,
                 supervisor: None,
+                device: None,
                 expect,
             };
             let elf_tasks = [
@@ -1443,6 +1699,7 @@ pub fn run_self_test(
             manage_memory: false,
             priority: true,
             supervisor: None,
+            device: None,
             expect: Expect::Service { restarts: 0 },
         },
         TaskSpec {
@@ -1456,6 +1713,7 @@ pub fn run_self_test(
             manage_memory: false,
             priority: true,
             supervisor: Some(ENDPOINT_INIT),
+            device: None,
             expect: Expect::Service { restarts: 1 },
         },
         init_client(
@@ -1507,5 +1765,104 @@ pub fn run_self_test(
         "Microkernel: {scenario_passed}/{} service-manager checks passed; kernel still running.\r\n",
         scenario.len()
     );
-    isolation_ok && preemption_ok && elf_ok && scenario_passed == scenario.len()
+    let drivers_ok = run_driver_scenario(memory, kernel_root, hhdm, &module);
+    isolation_ok && preemption_ok && elf_ok && scenario_passed == scenario.len() && drivers_ok
+}
+
+/// Ring 3 drivers: hardware access only through kernel-mediated grants, and
+/// IRQs delivered as kernel-origin IPC notices.
+fn run_driver_scenario(
+    memory: &mut HhdmFrameMemory<'_, '_>,
+    kernel_root: PhysAddr,
+    hhdm: HhdmOffset,
+    module: &dyn Fn(&str) -> Option<&'static [u8]>,
+) -> bool {
+    use user_programs as p;
+    let mut writer = SerialWriter;
+    let (Some(uart), Some(kbd)) = (module("uart-driver"), module("kbd-driver")) else {
+        serial_write("Centinela-OS: required driver boot modules are missing.\r\n");
+        return false;
+    };
+    let device_syscalls =
+        IPC_SYSCALLS | (1 << Syscall::PortIo as u8) | (1 << Syscall::IrqAck as u8);
+    let task = |name, role, program, endpoint: Option<usize>, device, expect| TaskSpec {
+        name,
+        role,
+        program,
+        extra_syscalls: device_syscalls,
+        endpoints: [endpoint.map(|endpoint| (endpoint, RECEIVE)), None],
+        process: None,
+        manage_processes: false,
+        manage_memory: false,
+        priority: false,
+        supervisor: None,
+        device,
+        expect,
+    };
+    let tasks = [
+        task(
+            "uart-driver",
+            "Ring 3 16550 driver: COM2 ports + IRQ 3",
+            Image::Elf(uart),
+            Some(ENDPOINT_UART),
+            Some(DeviceGrant {
+                ports: [(0x2f8, 8), (0, 0)],
+                irq: Some((3, ENDPOINT_UART)),
+            }),
+            Expect::Exit(0),
+        ),
+        task(
+            "kbd-driver",
+            "Ring 3 i8042 keyboard driver: ports 0x60/0x64 + IRQ 1",
+            Image::Elf(kbd),
+            Some(ENDPOINT_KBD),
+            Some(DeviceGrant {
+                ports: [(0x60, 1), (0x64, 1)],
+                irq: Some((1, ENDPOINT_KBD)),
+            }),
+            Expect::Exit(0),
+        ),
+        task(
+            "port-escape",
+            "COM3 driver reaches for the kernel console",
+            Image::Flat(p::port_escape),
+            None,
+            Some(DeviceGrant {
+                ports: [(0x3e8, 8), (0, 0)],
+                irq: None,
+            }),
+            Expect::Device(DeviceViolation::PortOutsideGrant(0x3f8)),
+        ),
+        task(
+            "irq-forge",
+            "re-arms an IRQ it was never bound to",
+            Image::Flat(p::irq_forge),
+            None,
+            Some(DeviceGrant {
+                ports: [(0x2e8, 8), (0, 0)],
+                irq: None,
+            }),
+            Expect::Device(DeviceViolation::NoInterruptGrant),
+        ),
+        task(
+            "no-device-cap",
+            "port I/O syscall without DeviceAccess",
+            Image::Flat(p::no_device_cap),
+            None,
+            None,
+            Expect::CapabilityDenied,
+        ),
+    ];
+    let outcomes = run_system(memory, kernel_root, hhdm, &tasks);
+    let passed = outcomes
+        .iter()
+        .flatten()
+        .filter(|outcome| report(outcome))
+        .count();
+    let _ = write!(
+        writer,
+        "Drivers: {passed}/{} Ring 3 driver checks passed (UART and keyboard IRQs as kernel notices).\r\n",
+        tasks.len()
+    );
+    passed == tasks.len()
 }

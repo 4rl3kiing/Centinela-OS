@@ -23,9 +23,13 @@ pub enum Syscall {
     IpcCall = 13,
     /// Synchronous IPC: reply to the pending caller, then wait for a request.
     IpcReplyWait = 14,
+    /// Mediated 8-bit port access inside the caller's granted port range.
+    PortIo = 15,
+    /// Re-arms the caller's own bound interrupt line after servicing it.
+    IrqAck = 16,
 }
 
-const VALID_SYSCALL_BITS: u64 = (1 << 15) - 1;
+const VALID_SYSCALL_BITS: u64 = (1 << 17) - 1;
 
 impl Syscall {
     /// Decodes a raw syscall number from Ring 3. Unknown numbers are `None`.
@@ -46,6 +50,8 @@ impl Syscall {
             12 => Self::Exit,
             13 => Self::IpcCall,
             14 => Self::IpcReplyWait,
+            15 => Self::PortIo,
+            16 => Self::IrqAck,
             _ => return None,
         })
     }
@@ -63,6 +69,9 @@ impl Syscall {
             }
             Self::MapMemory => Some(Capability::ManageMemory),
             Self::CreateProcess => Some(Capability::ManageProcesses),
+            // Which ports and which line are object grants checked by the
+            // kernel per call; the capability gates the whole surface.
+            Self::PortIo | Self::IrqAck => Some(Capability::DeviceAccess),
             // IPC authority comes from the endpoint handle's rights
             // (object capability), checked by the IPC layer.
             Self::Exit | Self::IpcCall | Self::IpcReplyWait => None,
@@ -207,11 +216,11 @@ mod tests {
 
     #[test]
     fn every_syscall_number_round_trips() {
-        for number in 0..15 {
+        for number in 0..17 {
             let syscall = Syscall::from_number(number).expect("defined syscall");
             assert_eq!(syscall as u64, number);
         }
-        assert_eq!(Syscall::from_number(15), None);
+        assert_eq!(Syscall::from_number(17), None);
     }
 
     #[test]

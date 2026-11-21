@@ -5,6 +5,8 @@
 // The isolation runtime drives real hardware; it only exists for the kernel
 // target (host builds of this binary are used solely for linting).
 #[cfg(target_os = "none")]
+mod ioapic;
+#[cfg(target_os = "none")]
 mod iommu;
 #[cfg(target_os = "none")]
 mod isolation;
@@ -604,7 +606,7 @@ fn run_isolation(
     if !isolation::init_cpu_layer(memory, kernel_root, hhdm) {
         halt_forever();
     }
-    if !init_iommu(memory, kernel_root, hhdm) {
+    if !init_platform(memory, kernel_root, hhdm) {
         halt_forever();
     }
     // SAFETY: BSP, IF=0, GDT/IDT loaded; the request lives in the Limine
@@ -656,7 +658,7 @@ fn in_acpi_memory(start: u64, end: u64) -> bool {
 }
 
 #[cfg(target_os = "none")]
-fn init_iommu(
+fn init_platform(
     memory: &mut HhdmFrameMemory<'_, '_>,
     kernel_root: PhysAddr,
     hhdm: HhdmOffset,
@@ -679,7 +681,7 @@ fn init_iommu(
             .checked_sub(base)
             .map(|physical| (&reader, physical))
     };
-    iommu::init(memory, kernel_root, rsdp)
+    iommu::init(memory, kernel_root, rsdp) && ioapic::init(memory, kernel_root, rsdp)
 }
 
 #[cfg(not(target_os = "none"))]

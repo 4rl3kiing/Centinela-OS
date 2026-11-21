@@ -192,6 +192,11 @@ mod runtime {
         write(REG_TIMER_INITIAL, initial_count);
     }
 
+    /// Local APIC ID of the calling CPU (xAPIC: bits 31:24 of register 0x20).
+    pub fn local_id() -> u32 {
+        read(0x20) >> 24
+    }
+
     /// Signals end of interrupt for the current APIC interrupt.
     pub fn end_of_interrupt() {
         write(REG_EOI, 0);
@@ -199,7 +204,7 @@ mod runtime {
 }
 
 #[cfg(target_os = "none")]
-pub use runtime::{calibrate, end_of_interrupt, init, physical_base};
+pub use runtime::{calibrate, end_of_interrupt, init, local_id, physical_base};
 
 #[cfg(test)]
 mod tests {

@@ -11,9 +11,11 @@ pub enum Capability {
     ManageProcesses = 4,
     ManageMemory = 5,
     LoadDrivers = 6,
+    /// Ring 3 driver: mediated port I/O and interrupt acknowledgement.
+    DeviceAccess = 7,
 }
 
-const VALID_CAPABILITY_BITS: u64 = (1 << 7) - 1;
+const VALID_CAPABILITY_BITS: u64 = (1 << 8) - 1;
 
 /// A compact set of granted capabilities.
 ///

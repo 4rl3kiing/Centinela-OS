@@ -9,6 +9,13 @@
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_MAP_MEMORY: u64 = 10;
 pub const SYS_EXIT: u64 = 12;
+pub const SYS_IPC_REPLY_WAIT: u64 = 14;
+pub const SYS_PORT_IO: u64 = 15;
+pub const SYS_IRQ_ACK: u64 = 16;
+/// Set by the kernel in delivered flags for kernel-originated messages.
+pub const FLAG_KERNEL_ORIGIN: u64 = 1 << 16;
+/// Label of the kernel notice sent when a bound IRQ fires.
+pub const NOTICE_IRQ: u64 = 0x1A0_0001;
 
 /// Raw 2-argument syscall.
 ///
@@ -46,6 +53,102 @@ pub fn map_memory(pages: u64) -> Result<*mut u8, u64> {
         Err(result)
     } else {
         Ok(result as *mut u8)
+    }
+}
+
+/// Mediated 8-bit port read (the kernel checks the port against our grant).
+pub fn port_in(port: u16) -> u8 {
+    // SAFETY: The kernel validates the port; out-of-grant access kills us.
+    unsafe { syscall3(SYS_PORT_IO, u64::from(port), 0, 0) as u8 }
+}
+
+/// Mediated 8-bit port write.
+pub fn port_out(port: u16, value: u8) {
+    // SAFETY: As in `port_in`.
+    unsafe {
+        syscall3(SYS_PORT_IO, u64::from(port), 1, u64::from(value));
+    }
+}
+
+/// Re-arms our bound interrupt line.
+pub fn irq_ack() {
+    // SAFETY: No arguments; the kernel acts only on our own binding.
+    unsafe {
+        syscall3(SYS_IRQ_ACK, 0, 0, 0);
+    }
+}
+
+/// Raw 3-argument syscall.
+///
+/// # Safety
+/// Arguments must satisfy the contract of the syscall `number`.
+pub unsafe fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 {
+    let result: u64;
+    // SAFETY: As in `syscall2`.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") number => result,
+            in("rdi") arg0,
+            in("rsi") arg1,
+            in("rdx") arg2,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack)
+        );
+    }
+    result
+}
+
+/// A message received from an endpoint.
+pub struct Received {
+    pub status: u64,
+    pub flags: u64,
+    pub words: [u64; 4],
+}
+
+impl Received {
+    /// True only for a kernel IRQ notice (tasks cannot forge the origin bit).
+    pub fn is_irq_notice(&self, irq: u64) -> bool {
+        self.status == 0
+            && self.flags & FLAG_KERNEL_ORIGIN != 0
+            && self.words[0] == NOTICE_IRQ
+            && self.words[1] == irq
+    }
+}
+
+/// Replies with an empty message (if serving) and waits on `endpoint`.
+pub fn reply_wait(endpoint: u64) -> Received {
+    let (status, flags, w0, w1, w2, w3): (u64, u64, u64, u64, u64, u64);
+    // SAFETY: Register ABI of IpcReplyWait; the kernel validates the handle.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_IPC_REPLY_WAIT => status,
+            in("rdi") endpoint,
+            inlateout("rsi") 0u64 => flags,
+            inlateout("rdx") 0u64 => w0,
+            inlateout("r10") 0u64 => w1,
+            inlateout("r8") 0u64 => w2,
+            inlateout("r9") 0u64 => w3,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack)
+        );
+    }
+    Received {
+        status,
+        flags,
+        words: [w0, w1, w2, w3],
+    }
+}
+
+/// Waits for the next IRQ notice on `endpoint`, ignoring anything else.
+pub fn wait_irq(endpoint: u64, irq: u64) {
+    loop {
+        if reply_wait(endpoint).is_irq_notice(irq) {
+            return;
+        }
     }
 }
 

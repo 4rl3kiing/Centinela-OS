@@ -21,3 +21,15 @@ name = "elf-wx"
 path = "src/bin/elf_wx.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "uart-driver"
+path = "src/bin/uart_driver.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "kbd-driver"
+path = "src/bin/kbd_driver.rs"
+test = false
+bench = false

@@ -53,6 +53,8 @@ pub const FLAG_KERNEL_ORIGIN: u64 = 1 << 16;
 pub const MAX_WORDS_WITH_TRANSFER: usize = MAX_MESSAGE_WORDS - 1;
 /// Label of the kernel notice sent to a supervisor when a service dies.
 pub const NOTICE_SERVICE_DIED: u64 = 0xDEAD_0001;
+/// Label of the kernel notice sent to a driver when its bound IRQ fires.
+pub const NOTICE_IRQ: u64 = 0x1A0_0001;
 
 /// Decoded flags word (RSI): bits 0-7 length, bits 8-15 rights to grant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
