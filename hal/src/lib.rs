@@ -10,6 +10,8 @@
 pub mod apic;
 pub mod cpu;
 pub mod entropy;
+pub mod font;
+pub mod framebuffer;
 pub mod gdt;
 pub mod idt;
 pub mod serial;

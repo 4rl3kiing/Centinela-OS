@@ -2,6 +2,9 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+#[cfg(target_os = "none")]
+extern crate alloc;
+
 // The isolation runtime drives real hardware; it only exists for the kernel
 // target (host builds of this binary are used solely for linting).
 #[cfg(target_os = "none")]
@@ -12,6 +15,8 @@ mod iommu;
 mod isolation;
 #[cfg(target_os = "none")]
 mod pci;
+#[cfg(target_os = "none")]
+mod power;
 #[cfg(target_os = "none")]
 mod smp;
 #[cfg(target_os = "none")]
@@ -78,9 +83,33 @@ struct LimineRequests {
     executable_address: LimineRequest,
     modules: LimineRequest,
     rsdp: LimineRequest,
+    framebuffer: LimineRequest,
     #[cfg(target_os = "none")]
     mp: smp::LimineMpRequest,
     end_marker: [u64; 2],
+}
+
+#[repr(C)]
+struct LimineFramebufferResponse {
+    revision: u64,
+    framebuffer_count: u64,
+    framebuffers: *const *const LimineFramebuffer,
+}
+
+#[repr(C)]
+struct LimineFramebuffer {
+    address: u64,
+    width: u64,
+    height: u64,
+    pitch: u64,
+    bpp: u16,
+    memory_model: u8,
+    red_mask_size: u8,
+    red_mask_shift: u8,
+    green_mask_size: u8,
+    green_mask_shift: u8,
+    blue_mask_size: u8,
+    blue_mask_shift: u8,
 }
 
 #[repr(C)]
@@ -180,6 +209,18 @@ static mut LIMINE_REQUESTS: LimineRequests = LimineRequests {
         revision: 0,
         response: core::ptr::null_mut(),
     },
+    // Linear framebuffer for the on-screen console (physical machines
+    // without COM1). Its address is an HHDM virtual address.
+    framebuffer: LimineRequest {
+        id: [
+            LIMINE_COMMON_MAGIC[0],
+            LIMINE_COMMON_MAGIC[1],
+            0x9d58_27dc_d881_dd75,
+            0xa314_8604_f6fa_b11b,
+        ],
+        revision: 0,
+        response: core::ptr::null_mut(),
+    },
     // Application processors stay in Limine's parking loop until released.
     #[cfg(target_os = "none")]
     mp: smp::LimineMpRequest {
@@ -195,6 +236,200 @@ static mut LIMINE_REQUESTS: LimineRequests = LimineRequests {
     },
     end_marker: [0xadc0_e053_1bb1_0d03, 0x9572_709f_3176_4c62],
 };
+
+/// Marks every higher-half top-level slot except the kernel image's as
+/// non-executable.
+///
+/// Limine maps its direct map (HHDM) writable *and* executable, and the
+/// kernel runs on those tables. Without this, any kernel write primitive
+/// into the HHDM would become code execution. NX in a PML4 entry applies to
+/// the whole 512 GiB below it. Kernel code, including the KPTI entry
+/// trampoline, lives only in the kernel image's slot(s), which stay as they
+/// are. Must run after EFER.NXE is set, after the APs have left Limine's
+/// HHDM-resident parking loop, and before any task runs. Device windows the
+/// kernel maps later get fresh top-level entries that are already NX at
+/// the leaf.
+#[cfg(target_os = "none")]
+fn seal_hhdm_non_executable(root: VirtAddr) -> bool {
+    const PRESENT: u64 = 1;
+    const NO_EXECUTE: u64 = 1 << 63;
+    let slot = |address: u64| ((address >> 39) & 0x1ff) as usize;
+    // Linker-provided symbols; only their addresses are used.
+    let (image_start, image_end) = (
+        addr_of!(__kernel_virt_start) as u64,
+        addr_of!(__kernel_virt_end) as u64,
+    );
+    let kernel_slots = slot(image_start)..=slot(image_end.saturating_sub(1));
+    let table = root.get() as *mut u64;
+    let mut sealed = 0;
+    for index in 256..512 {
+        if kernel_slots.contains(&index) {
+            continue;
+        }
+        // SAFETY: `root` is the verified HHDM alias of the active PML4 and
+        // `index` < 512; single CPU, no other walker mutates it.
+        unsafe {
+            let entry = table.add(index).read_volatile();
+            if entry & PRESENT != 0 && entry & NO_EXECUTE == 0 {
+                table.add(index).write_volatile(entry | NO_EXECUTE);
+                sealed += 1;
+            }
+        }
+    }
+    // SAFETY: Only permissions were tightened on non-code regions.
+    unsafe { centinela_hal::cpu::flush_tlb_all() };
+    // Read back: every present non-kernel upper slot must now carry NX.
+    let all_sealed = (256..512)
+        .filter(|i| !kernel_slots.contains(i))
+        .all(|index| {
+            // SAFETY: As above.
+            let entry = unsafe { table.add(index).read_volatile() };
+            entry & PRESENT == 0 || entry & NO_EXECUTE != 0
+        });
+    if !all_sealed {
+        return false;
+    }
+    let _ = core::fmt::Write::write_fmt(
+        &mut SerialWriter,
+        format_args!(
+            "VMM hardening: HHDM sealed non-executable ({sealed} top-level slots; kernel image slots untouched).\r\n"
+        ),
+    );
+    true
+}
+
+/// Brings up the on-screen console from the first Limine framebuffer.
+///
+/// The firmware-reported geometry is validated, and both ends of the buffer
+/// must be mapped writable and non-executable in the active tables before a
+/// single pixel is written. A missing or refused framebuffer only disables
+/// the screen console; boot continues on serial.
+fn framebuffer_console<M: PageTableMemory>(walker: &PageTableWalker<'_, M>) {
+    use centinela_hal::framebuffer::{ColorField, FramebufferInfo};
+    use core::fmt::Write;
+    // SAFETY: Limine writes the response pointer before entry; read once.
+    let response = unsafe { addr_of!(LIMINE_REQUESTS.framebuffer.response).read() }
+        as *const LimineFramebufferResponse;
+    if response.is_null() {
+        serial_write("Framebuffer console: no framebuffer from the bootloader; serial only.\r\n");
+        return;
+    }
+    // SAFETY: Non-null Limine response in bootloader-reclaimable memory.
+    let (count, list) = unsafe {
+        (
+            addr_of!((*response).framebuffer_count).read(),
+            addr_of!((*response).framebuffers).read(),
+        )
+    };
+    if count == 0 || list.is_null() {
+        serial_write("Framebuffer console: no framebuffer from the bootloader; serial only.\r\n");
+        return;
+    }
+    // SAFETY: `count >= 1`, so the first entry exists; Limine owns it.
+    let entry = unsafe { list.read() };
+    if entry.is_null() {
+        serial_write("Framebuffer console: refused (null descriptor); serial only.\r\n");
+        return;
+    }
+    // SAFETY: Non-null descriptor provided by Limine.
+    let fb = unsafe { entry.read() };
+    let info = FramebufferInfo {
+        address: fb.address,
+        width: fb.width,
+        height: fb.height,
+        pitch: fb.pitch,
+        bits_per_pixel: fb.bpp,
+        memory_model: fb.memory_model,
+        red: ColorField {
+            size: fb.red_mask_size,
+            shift: fb.red_mask_shift,
+        },
+        green: ColorField {
+            size: fb.green_mask_size,
+            shift: fb.green_mask_shift,
+        },
+        blue: ColorField {
+            size: fb.blue_mask_size,
+            shift: fb.blue_mask_shift,
+        },
+    };
+    let Ok(geometry) = info.validate() else {
+        serial_write(
+            "Framebuffer console: refused (unsupported or invalid geometry); serial only.\r\n",
+        );
+        return;
+    };
+    let last = u64::from(geometry.pitch) * u64::from(geometry.height) - 4;
+    // NX comes from `seal_hhdm_non_executable` (the buffer is in the HHDM).
+    let mapped_rw = |address: u64| {
+        VirtAddr::new(address)
+            .ok()
+            .and_then(|virt| walker.translate(virt).ok())
+            .is_some_and(|t| t.writable)
+    };
+    if !mapped_rw(geometry.address) || !mapped_rw(geometry.address + last) {
+        serial_write("Framebuffer console: refused (buffer not mapped writable); serial only.\r\n");
+        return;
+    }
+    match centinela_hal::framebuffer::init(&info) {
+        Ok(geometry) => {
+            let _ = writeln!(
+                SerialWriter,
+                "Framebuffer console: {}x{} pixels, {}x{} cells.\r",
+                geometry.width, geometry.height, geometry.columns, geometry.rows
+            );
+            serial_write("Framebuffer console: online (readback verified).\r\n");
+        }
+        Err(_) => serial_write("Framebuffer console: refused (readback failed); serial only.\r\n"),
+    }
+}
+
+#[cfg(target_os = "none")]
+#[global_allocator]
+static KERNEL_HEAP: centinela_kernel::memory::heap::global::KernelHeap =
+    centinela_kernel::memory::heap::global::KernelHeap::new();
+
+/// Host builds use the system allocator.
+#[cfg(not(target_os = "none"))]
+fn kernel_heap_self_test(_hhdm: HhdmOffset, _pmm: &'static PmmLock<'static>) -> bool {
+    true
+}
+
+/// Connects the hardened heap to the frame allocator and checks that
+/// allocations are zeroed, distinct, and fully reclaimed.
+#[cfg(target_os = "none")]
+fn kernel_heap_self_test(hhdm: HhdmOffset, pmm: &'static PmmLock<'static>) -> bool {
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+    KERNEL_HEAP.install(hhdm, pmm);
+    let frames_before = pmm.with(|pmm| pmm.free_frames());
+    {
+        let mut objects: Vec<Box<[u8; 100]>> = Vec::new();
+        for index in 0..64u8 {
+            let object = Box::new([index; 100]);
+            objects.push(object);
+        }
+        let intact = objects
+            .iter()
+            .enumerate()
+            .all(|(index, object)| object.iter().all(|&byte| byte == index as u8));
+        let page = Box::new([0u8; 4096]);
+        if !intact || page.iter().any(|&byte| byte != 0) {
+            serial_write("Centinela-OS: kernel heap self-test failed (contents).\r\n");
+            return false;
+        }
+    }
+    let (bytes, pages) = KERNEL_HEAP.usage();
+    let frames_after = pmm.with(|pmm| pmm.free_frames());
+    if bytes != 0 || pages != 0 || frames_after != frames_before {
+        serial_write("Centinela-OS: kernel heap self-test failed (leak).\r\n");
+        return false;
+    }
+    serial_write(
+        "Kernel heap: hardened slab allocator online (canaries, poisoning, randomized slots).\r\n",
+    );
+    true
+}
 
 const MAX_MODULES: usize = 12;
 const MAX_MODULE_SIZE: u64 = 16 * 1024 * 1024;
@@ -370,6 +605,7 @@ fn initialize_memory() -> Option<BootMemory> {
     }
     serial_write("VMM bootstrap: Limine page-table frames validated through HHDM.\r\n");
     serial_write("VMM bootstrap: HHDM root alias and kernel RX mapping verified.\r\n");
+    framebuffer_console(&walker);
 
     // Record the bootloader-owned paging root without switching CR3.
     // The active page tables remain unchanged.
@@ -429,6 +665,9 @@ fn initialize_memory() -> Option<BootMemory> {
     // SAFETY: PMM_STATE was initialized just above and is never moved; this
     // is the only reference handed out.
     let pmm = unsafe { (*addr_of!(PMM_STATE)).assume_init_ref() };
+    if !kernel_heap_self_test(hhdm_offset, pmm) {
+        return None;
+    }
     Some(BootMemory {
         pmm,
         hhdm: hhdm_offset,
@@ -619,6 +858,15 @@ fn run_isolation(
     if !unsafe { smp::start(&raw const LIMINE_REQUESTS.mp) } {
         halt_forever();
     }
+    // Only now: parked APs ran Limine's wait loop from the HHDM until
+    // `smp::start` moved them into kernel code.
+    let root = PhysAddr::new(kernel_root.get())
+        .ok()
+        .and_then(|root| hhdm.physical_to_virtual(root).ok());
+    if !root.is_some_and(seal_hhdm_non_executable) {
+        serial_write("Centinela-OS: HHDM is still executable after sealing.\r\n");
+        halt_forever();
+    }
     if system::run_self_test(memory, kernel_root, hhdm, modules) {
         serial_write(
             "Microkernel milestone: Ring 3 init manages services through capability IPC \
@@ -627,6 +875,7 @@ fn run_isolation(
     } else {
         serial_write("Centinela-OS: microkernel self-test failed.\r\n");
     }
+    power::finish_boot();
 }
 
 /// True if `[start, end)` lies inside one ACPI memory-map region.
@@ -686,6 +935,7 @@ fn init_platform(
             .checked_sub(base)
             .map(|physical| (&reader, physical))
     };
+    power::init(rsdp);
     iommu::init(memory, kernel_root, rsdp) && ioapic::init(memory, kernel_root, rsdp)
 }
 

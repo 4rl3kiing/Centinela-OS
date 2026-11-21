@@ -13,6 +13,10 @@ mkdir -p build/logs
 
 REQUIRED_MESSAGES=(
     "Centinela-OS: Rust kernel entry reached."
+    "Framebuffer console: online (readback verified)."
+    "VMM hardening: HHDM sealed non-executable"
+    "Power: ACPI S5 available"
+    "Kernel heap: hardened slab allocator online (canaries, poisoning, randomized slots)."
     "CPU hardening: NXE enabled."
     "CPU hardening: CR0.WP enabled."
     "SMP: 3 application processors online (isolated, parked"
@@ -107,10 +111,12 @@ run_and_check() {
     timeout "$TIMEOUT_SECONDS" "$QEMU" -machine q35 -m 512M -smp 4 "${ACCEL[@]}" -device intel-iommu -device e1000,netdev=n0 -netdev user,id=n0 -display none -monitor none \
         -serial "file:$log" -serial null \
         -chardev "file,id=shellin,path=/dev/null,input-path=$SHELL_INPUT" -serial chardev:shellin \
-        -no-reboot -no-shutdown "$@" >"$stderr" 2>&1
+        -fw_cfg name=opt/centinela/poweroff,string=1 \
+        -no-reboot "$@" >"$stderr" 2>&1
     local status=$?
     set -e
-    # 124 = still halted when the timeout fired, which is the expected end state.
+    # 0 = the kernel powered off (ACPI S5) after the self-test; 124 = still
+    # halted when the timeout fired (no S5 support).
     if [[ "$status" -ne 124 && "$status" -ne 0 ]]; then
         fail "$log" "$stderr" "QEMU $mode exited with status $status"
     fi
