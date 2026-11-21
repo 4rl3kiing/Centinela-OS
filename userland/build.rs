@@ -11,6 +11,11 @@ fn main() {
             ("elf-wx", "link-wx.ld"),
             ("uart-driver", "link.ld"),
             ("kbd-driver", "link.ld"),
+            ("serial-service", "link.ld"),
+            ("ramfs", "link.ld"),
+            ("netsvc", "link.ld"),
+            ("shell", "link.ld"),
+            ("fs-fuzzer", "link.ld"),
         ] {
             println!("cargo:rustc-link-arg-bin={bin}=-T{manifest}/{script}");
             // Fixed-address static executable (ET_EXEC) from PIC code.

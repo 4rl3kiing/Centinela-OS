@@ -9,7 +9,12 @@
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_MAP_MEMORY: u64 = 10;
 pub const SYS_EXIT: u64 = 12;
+pub const SYS_IPC_CALL: u64 = 13;
 pub const SYS_IPC_REPLY_WAIT: u64 = 14;
+/// ReplyWait without replying: the pending caller stays blocked.
+pub const FLAG_DEFER_REPLY: u64 = 1 << 17;
+/// Status returned when the endpoint has no waiting server (retry later).
+pub const STATUS_NO_RECEIVER: u64 = (-3_i64) as u64;
 pub const SYS_PORT_IO: u64 = 15;
 pub const SYS_IRQ_ACK: u64 = 16;
 /// Set by the kernel in delivered flags for kernel-originated messages.
@@ -117,20 +122,21 @@ impl Received {
     }
 }
 
-/// Replies with an empty message (if serving) and waits on `endpoint`.
-pub fn reply_wait(endpoint: u64) -> Received {
-    let (status, flags, w0, w1, w2, w3): (u64, u64, u64, u64, u64, u64);
-    // SAFETY: Register ABI of IpcReplyWait; the kernel validates the handle.
+/// Raw IPC syscall: `flags` holds the length (bits 0-7) and option bits.
+pub fn ipc(number: u64, endpoint: u64, flags: u64, words: [u64; 4]) -> Received {
+    let (status, out_flags, w0, w1, w2, w3): (u64, u64, u64, u64, u64, u64);
+    // SAFETY: Register ABI of the IPC syscalls; the kernel validates the
+    // handle, the flags and the message bounds.
     unsafe {
         core::arch::asm!(
             "syscall",
-            inlateout("rax") SYS_IPC_REPLY_WAIT => status,
+            inlateout("rax") number => status,
             in("rdi") endpoint,
-            inlateout("rsi") 0u64 => flags,
-            inlateout("rdx") 0u64 => w0,
-            inlateout("r10") 0u64 => w1,
-            inlateout("r8") 0u64 => w2,
-            inlateout("r9") 0u64 => w3,
+            inlateout("rsi") flags => out_flags,
+            inlateout("rdx") words[0] => w0,
+            inlateout("r10") words[1] => w1,
+            inlateout("r8") words[2] => w2,
+            inlateout("r9") words[3] => w3,
             lateout("rcx") _,
             lateout("r11") _,
             options(nostack)
@@ -138,8 +144,107 @@ pub fn reply_wait(endpoint: u64) -> Received {
     }
     Received {
         status,
-        flags,
+        flags: out_flags,
         words: [w0, w1, w2, w3],
+    }
+}
+
+/// Replies with an empty message (if serving) and waits on `endpoint`.
+pub fn reply_wait(endpoint: u64) -> Received {
+    ipc(SYS_IPC_REPLY_WAIT, endpoint, 0, [0; 4])
+}
+
+/// Replies with `words` to the pending caller, then waits.
+pub fn reply_and_wait(endpoint: u64, words: [u64; 4]) -> Received {
+    ipc(SYS_IPC_REPLY_WAIT, endpoint, 4, words)
+}
+
+/// Waits again while the pending caller stays blocked (deferred reply).
+pub fn wait_deferred(endpoint: u64) -> Received {
+    ipc(SYS_IPC_REPLY_WAIT, endpoint, FLAG_DEFER_REPLY, [0; 4])
+}
+
+/// Sends a 4-word request and waits for the reply, retrying while the
+/// server is busy. Returns `None` if the server never became available.
+pub fn call(endpoint: u64, words: [u64; 4]) -> Option<Received> {
+    for _ in 0..1_000_000 {
+        let reply = ipc(SYS_IPC_CALL, endpoint, 4, words);
+        if reply.status != STATUS_NO_RECEIVER {
+            return (reply.status == 0).then_some(reply);
+        }
+        core::hint::spin_loop();
+    }
+    None
+}
+
+/// Packs up to 8 bytes into a word (little endian).
+pub fn pack(bytes: &[u8]) -> u64 {
+    let mut word = [0u8; 8];
+    let length = bytes.len().min(8);
+    word[..length].copy_from_slice(&bytes[..length]);
+    u64::from_le_bytes(word)
+}
+
+/// Unpacks a word into bytes and returns the used length.
+pub fn unpack(word: u64, out: &mut [u8; 8]) -> usize {
+    *out = word.to_le_bytes();
+    out.iter().position(|&b| b == 0).unwrap_or(8)
+}
+
+/// Fixed-capacity text buffer for composing console lines without a heap.
+pub struct Line {
+    buffer: [u8; 200],
+    length: usize,
+}
+
+impl Default for Line {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Line {
+    pub const fn new() -> Self {
+        Self {
+            buffer: [0; 200],
+            length: 0,
+        }
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) -> &mut Self {
+        for &byte in bytes {
+            if self.length < self.buffer.len() {
+                self.buffer[self.length] = byte;
+                self.length += 1;
+            }
+        }
+        self
+    }
+
+    pub fn number(&mut self, mut value: u64) -> &mut Self {
+        let mut digits = [0u8; 20];
+        let mut count = 0;
+        loop {
+            digits[count] = b'0' + (value % 10) as u8;
+            count += 1;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        while count > 0 {
+            count -= 1;
+            self.push(&[digits[count]]);
+        }
+        self
+    }
+
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buffer[..self.length]).unwrap_or("")
+    }
+
+    pub fn print(&self) {
+        write(self.as_str());
     }
 }
 

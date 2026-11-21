@@ -44,7 +44,7 @@ use centinela_kernel::elf::{self, ElfError};
 use centinela_security::permissions::PagePermissions;
 
 const MAX_TASKS: usize = 8;
-const ENDPOINT_COUNT: usize = 4;
+const ENDPOINT_COUNT: usize = 7;
 /// Interrupt vectors reserved for IRQs bound to Ring 3 drivers.
 pub(crate) const DEVICE_VECTOR_BASE: u64 = 0x24;
 const MAX_IRQ_ROUTES: usize = 4;
@@ -81,6 +81,10 @@ const ENDPOINT_ADDER: usize = 1;
 /// Endpoints on which the Ring 3 UART and keyboard drivers receive IRQs.
 const ENDPOINT_UART: usize = 2;
 const ENDPOINT_KBD: usize = 3;
+/// Phase 5 services: serial console (COM3), RAM filesystem, network.
+const ENDPOINT_CONSOLE: usize = 4;
+const ENDPOINT_FS: usize = 5;
+const ENDPOINT_NET: usize = 6;
 
 /// Why a driver's device access was refused (always fatal for the task).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -227,8 +231,9 @@ struct TaskSpec {
     role: &'static str,
     program: Image,
     extra_syscalls: u64,
-    /// Endpoint capabilities granted at start; raw handles arrive in RDI, RSI.
-    endpoints: [Option<(usize, Rights)>; 2],
+    /// Endpoint capabilities granted at start; raw handles arrive in RDI,
+    /// RSI and (when no process capability is granted) RDX.
+    endpoints: [Option<(usize, Rights)>; 3],
     /// Process capability (CONTROL) over this task slot; raw handle in RDX.
     process: Option<usize>,
     manage_processes: bool,
@@ -576,6 +581,14 @@ fn unbind_irqs(system: &mut System, index: usize) {
     }
 }
 
+/// True while some task other than a long-running service is still alive:
+/// only then is it worth sleeping for hardware.
+fn work_remaining(system: &System) -> bool {
+    system.tasks.iter().flatten().any(|task| {
+        task.state != TaskState::Dead && !matches!(task.spec.expect, Expect::Service { .. })
+    })
+}
+
 /// True if a live driver is blocked waiting for its (armed) interrupt.
 fn driver_waiting(system: &System) -> bool {
     system.irq_routes.iter().flatten().any(|route| {
@@ -629,6 +642,7 @@ fn resolve_endpoint(task: &Task, raw: u64, rights: Rights) -> Result<usize, IpcV
 struct Outgoing {
     message: Message,
     transfer: Option<(usize, Rights)>,
+    defer_reply: bool,
 }
 
 /// Validates flags, message bounds and any capability transfer.
@@ -646,7 +660,11 @@ fn outgoing(task: &Task, frame: &SyscallFrame) -> Result<Outgoing, IpcViolation>
     };
     let message =
         Message::from_registers(flags.length, [frame.rdx, frame.r10, frame.r8, frame.r9])?;
-    Ok(Outgoing { message, transfer })
+    Ok(Outgoing {
+        message,
+        transfer,
+        defer_reply: flags.defer_reply,
+    })
 }
 
 /// Writes a status, message and optional new capability into a receiver's
@@ -679,6 +697,7 @@ fn deliver_status(receiver: &mut Task, status: u64) {
     let empty = Outgoing {
         message: Message::default(),
         transfer: None,
+        defer_reply: false,
     };
     deliver(receiver, status, &empty, false);
 }
@@ -688,6 +707,7 @@ fn deliver_notice(receiver: &mut Task, process_handle: u64, code: u64) {
         message: Message::from_registers(3, [NOTICE_SERVICE_DIED, process_handle, code, 0])
             .unwrap_or_default(),
         transfer: None,
+        defer_reply: false,
     };
     deliver(receiver, STATUS_OK, &notice, true);
 }
@@ -698,7 +718,12 @@ fn ipc_call(system: &mut System, frame: &mut SyscallFrame) {
         .ok_or(IpcViolation::InvalidHandle)
         .and_then(|task| {
             let endpoint = resolve_endpoint(task, frame.rdi, SEND)?;
-            Ok((endpoint, outgoing(task, frame)?))
+            let request = outgoing(task, frame)?;
+            // Deferring is a server-side operation only.
+            if request.defer_reply {
+                return Err(IpcViolation::MalformedMessage);
+            }
+            Ok((endpoint, request))
         });
     let (endpoint, request) = match checked {
         Ok(value) => value,
@@ -729,7 +754,10 @@ fn ipc_reply_wait(system: &mut System, frame: &mut SyscallFrame) {
         Ok(value) => value,
         Err(violation) => terminate(system, TaskExit::Ipc(violation)),
     };
-    if let Some(caller) = system.endpoints[endpoint].rendezvous.reply_wait(server)
+    let deferred = reply.defer_reply;
+    if deferred {
+        system.endpoints[endpoint].rendezvous.wait_deferred(server);
+    } else if let Some(caller) = system.endpoints[endpoint].rendezvous.reply_wait(server)
         && let Some(caller) = system.tasks[caller].as_mut()
         && caller.state == TaskState::BlockedReply
     {
@@ -737,7 +765,9 @@ fn ipc_reply_wait(system: &mut System, frame: &mut SyscallFrame) {
         caller.state = TaskState::Ready;
     }
     if let Some(task) = current_task(system) {
-        task.serving = false;
+        if !deferred {
+            task.serving = false;
+        }
         task.context = UserContext::from_syscall(frame);
         task.state = TaskState::BlockedReceive;
     }
@@ -764,6 +794,7 @@ fn deliver_pending_notice(system: &mut System, endpoint: usize) {
                 message: Message::from_registers(2, [NOTICE_IRQ, u64::from(isa_irq), 0, 0])
                     .unwrap_or_default(),
                 transfer: None,
+                defer_reply: false,
             };
             deliver(task, STATUS_OK, &notice, true);
             task.state = TaskState::Ready;
@@ -953,7 +984,7 @@ fn spawn(
         rsp: USER_STACK_TOP - 8,
         ..UserContext::default()
     };
-    let mut raw = [0u64; 2];
+    let mut raw = [0u64; 3];
     for (slot, grant) in raw.iter_mut().zip(spec.endpoints) {
         if let Some((endpoint, rights)) = grant {
             *slot = endpoints
@@ -964,7 +995,14 @@ fn spawn(
     }
     frame.rdi = raw[0];
     frame.rsi = raw[1];
+    frame.rdx = raw[2];
     let mut process_handle = None;
+    if spec.process.is_some() && spec.endpoints[2].is_some() {
+        let _ = destroy_user_address_space(memory, root);
+        return Err(SpawnError::Failed(
+            "RDX carries either an endpoint or a process handle",
+        ));
+    }
     if let Some(target) = spec.process {
         let handle = processes
             .insert(target, Rights::CONTROL)
@@ -1084,7 +1122,7 @@ fn run_system(
     while let Some(system) = system_state() {
         let Some(next) = pick_next(system, last) else {
             // Only drivers waiting for hardware: sleep until an interrupt.
-            if driver_waiting(system) && idle_wakeups < MAX_IDLE_WAKEUPS {
+            if driver_waiting(system) && work_remaining(system) && idle_wakeups < MAX_IDLE_WAKEUPS {
                 idle_wakeups += 1;
                 // SAFETY: Interrupts are enabled only for this one HLT; the
                 // handlers re-borrow the system state themselves and no
@@ -1446,7 +1484,7 @@ const fn isolated(
         role,
         program: Image::Flat(program),
         extra_syscalls,
-        endpoints: [None, None],
+        endpoints: [None, None, None],
         process: None,
         manage_processes: false,
         manage_memory: false,
@@ -1471,7 +1509,7 @@ const fn init_client(
         role,
         program: Image::Flat(program),
         extra_syscalls: IPC_SYSCALLS,
-        endpoints: [Some((ENDPOINT_INIT, SEND)), None],
+        endpoints: [Some((ENDPOINT_INIT, SEND)), None, None],
         process: None,
         manage_processes: false,
         manage_memory: false,
@@ -1636,7 +1674,7 @@ pub fn run_self_test(
                 role,
                 program: Image::Elf(bytes),
                 extra_syscalls: 1 << Syscall::MapMemory as u8,
-                endpoints: [None, None],
+                endpoints: [None, None, None],
                 process: None,
                 manage_processes: false,
                 manage_memory: true,
@@ -1693,6 +1731,7 @@ pub fn run_self_test(
             endpoints: [
                 Some((ENDPOINT_INIT, RECEIVE)),
                 Some((ENDPOINT_ADDER, SEND.union(Rights::GRANT))),
+                None,
             ],
             process: Some(1),
             manage_processes: true,
@@ -1707,7 +1746,7 @@ pub fn run_self_test(
             role: "Ring 3 service supervised by init",
             program: Image::Flat(p::adder_service),
             extra_syscalls: IPC_SYSCALLS,
-            endpoints: [Some((ENDPOINT_ADDER, RECEIVE)), None],
+            endpoints: [Some((ENDPOINT_ADDER, RECEIVE)), None, None],
             process: None,
             manage_processes: false,
             manage_memory: false,
@@ -1766,7 +1805,111 @@ pub fn run_self_test(
         scenario.len()
     );
     let drivers_ok = run_driver_scenario(memory, kernel_root, hhdm, &module);
-    isolation_ok && preemption_ok && elf_ok && scenario_passed == scenario.len() && drivers_ok
+    let services_ok = run_services_scenario(memory, kernel_root, hhdm, &module);
+    isolation_ok
+        && preemption_ok
+        && elf_ok
+        && scenario_passed == scenario.len()
+        && drivers_ok
+        && services_ok
+}
+
+/// Phase 5: a shell on the serial console driving a RAM filesystem and a
+/// loopback network service, all in Ring 3, plus a hostile filesystem client.
+fn run_services_scenario(
+    memory: &mut HhdmFrameMemory<'_, '_>,
+    kernel_root: PhysAddr,
+    hhdm: HhdmOffset,
+    module: &dyn Fn(&str) -> Option<&'static [u8]>,
+) -> bool {
+    let mut writer = SerialWriter;
+    let names = ["serial-service", "ramfs", "netsvc", "shell", "fs-fuzzer"];
+    let mut images = [&[][..]; 5];
+    for (image, name) in images.iter_mut().zip(names) {
+        let Some(bytes) = module(name) else {
+            serial_write("Centinela-OS: required service boot modules are missing.\r\n");
+            return false;
+        };
+        *image = bytes;
+    }
+    let service = |name, role, image, endpoints, extra, expect| TaskSpec {
+        name,
+        role,
+        program: Image::Elf(image),
+        extra_syscalls: IPC_SYSCALLS | extra,
+        endpoints,
+        process: None,
+        manage_processes: false,
+        manage_memory: extra & (1 << Syscall::MapMemory as u8) != 0,
+        priority: matches!(expect, Expect::Service { .. }),
+        supervisor: None,
+        device: None,
+        expect,
+    };
+    let device_syscalls = (1 << Syscall::PortIo as u8) | (1 << Syscall::IrqAck as u8);
+    let mut console = service(
+        "serial-service",
+        "Ring 3 console driver: COM3 ports + IRQ 4, deferred replies",
+        images[0],
+        [Some((ENDPOINT_CONSOLE, RECEIVE)), None, None],
+        device_syscalls,
+        Expect::Service { restarts: 0 },
+    );
+    console.device = Some(DeviceGrant {
+        ports: [(0x3e8, 8), (0, 0)],
+        irq: Some((4, ENDPOINT_CONSOLE)),
+    });
+    let tasks = [
+        console,
+        service(
+            "ramfs",
+            "Ring 3 RAM filesystem service",
+            images[1],
+            [Some((ENDPOINT_FS, RECEIVE)), None, None],
+            1 << Syscall::MapMemory as u8,
+            Expect::Service { restarts: 0 },
+        ),
+        service(
+            "netsvc",
+            "Ring 3 loopback network service",
+            images[2],
+            [Some((ENDPOINT_NET, RECEIVE)), None, None],
+            0,
+            Expect::Service { restarts: 0 },
+        ),
+        service(
+            "shell",
+            "Ring 3 shell: SEND to console, fs and net only",
+            images[3],
+            [
+                Some((ENDPOINT_CONSOLE, SEND)),
+                Some((ENDPOINT_FS, SEND)),
+                Some((ENDPOINT_NET, SEND)),
+            ],
+            0,
+            Expect::Exit(0),
+        ),
+        service(
+            "fs-fuzzer",
+            "hostile client sending malformed filesystem requests",
+            images[4],
+            [Some((ENDPOINT_FS, SEND)), None, None],
+            0,
+            Expect::Exit(0),
+        ),
+    ];
+    let outcomes = run_system(memory, kernel_root, hhdm, &tasks);
+    let passed = outcomes
+        .iter()
+        .flatten()
+        .filter(|outcome| report(outcome))
+        .count();
+    let _ = write!(
+        writer,
+        "Services: {passed}/{} checks passed (shell over serial, ramfs, loopback network, IPC benchmark).\r\n",
+        tasks.len()
+    );
+    passed == tasks.len()
 }
 
 /// Ring 3 drivers: hardware access only through kernel-mediated grants, and
@@ -1790,7 +1933,7 @@ fn run_driver_scenario(
         role,
         program,
         extra_syscalls: device_syscalls,
-        endpoints: [endpoint.map(|endpoint| (endpoint, RECEIVE)), None],
+        endpoints: [endpoint.map(|endpoint| (endpoint, RECEIVE)), None, None],
         process: None,
         manage_processes: false,
         manage_memory: false,
@@ -1824,11 +1967,11 @@ fn run_driver_scenario(
         ),
         task(
             "port-escape",
-            "COM3 driver reaches for the kernel console",
+            "COM4 driver reaches for the kernel console",
             Image::Flat(p::port_escape),
             None,
             Some(DeviceGrant {
-                ports: [(0x3e8, 8), (0, 0)],
+                ports: [(0x2e8, 8), (0, 0)],
                 irq: None,
             }),
             Expect::Device(DeviceViolation::PortOutsideGrant(0x3f8)),
@@ -1839,7 +1982,7 @@ fn run_driver_scenario(
             Image::Flat(p::irq_forge),
             None,
             Some(DeviceGrant {
-                ports: [(0x2e8, 8), (0, 0)],
+                ports: [(0x278, 3), (0, 0)],
                 irq: None,
             }),
             Expect::Device(DeviceViolation::NoInterruptGrant),

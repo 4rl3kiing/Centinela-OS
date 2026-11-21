@@ -33,3 +33,33 @@ name = "kbd-driver"
 path = "src/bin/kbd_driver.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "serial-service"
+path = "src/bin/serial_service.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "ramfs"
+path = "src/bin/ramfs.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "netsvc"
+path = "src/bin/netsvc.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "shell"
+path = "src/bin/shell.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "fs-fuzzer"
+path = "src/bin/fs_fuzzer.rs"
+test = false
+bench = false

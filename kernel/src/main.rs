@@ -193,7 +193,7 @@ static mut LIMINE_REQUESTS: LimineRequests = LimineRequests {
     end_marker: [0xadc0_e053_1bb1_0d03, 0x9572_709f_3176_4c62],
 };
 
-const MAX_MODULES: usize = 8;
+const MAX_MODULES: usize = 12;
 const MAX_MODULE_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_MODULE_NAME: usize = 32;
 

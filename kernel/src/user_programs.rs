@@ -426,11 +426,11 @@ core::arch::global_asm!(
     ".global centinela_user_oversized_message_end",
     "centinela_user_oversized_message_end:",
     "",
-    // Attack: a driver granted COM3 reaches for COM1, the kernel console.
+    // Attack: a driver granted COM4 reaches for COM1, the kernel console.
     ".balign 16",
     ".global centinela_user_port_escape_start",
     "centinela_user_port_escape_start:",
-    "    mov edi, 0x3e8",
+    "    mov edi, 0x2e8",
     "    xor esi, esi",
     "    mov eax, 15",
     "    syscall",
