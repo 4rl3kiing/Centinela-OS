@@ -78,7 +78,7 @@ run_and_check() {
     fi
     local message
     for message in "${REQUIRED_MESSAGES[@]}" "${extra[@]}"; do
-        grep -Fq "$message" "$log" || fail "$log" "$stderr" "Missing for $mode boot: $message"
+        grep -Fq -- "$message" "$log" || fail "$log" "$stderr" "Missing for $mode boot: $message"
     done
     # Any kernel-reported failure or panic fails the run even if milestones passed.
     # Every "Centinela-OS: " line except the entry banner is an error report.

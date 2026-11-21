@@ -105,7 +105,7 @@ pub(crate) fn trampoline_entries() -> &'static [(u16, u64)] {
     // SAFETY: Written once by `build_trampoline` during single-CPU boot,
     // read-only afterwards.
     unsafe {
-                let len = *addr_of!(TRAMPOLINE_LEN);
+        let len = *addr_of!(TRAMPOLINE_LEN);
         let entries: &'static [(u16, u64); 4] = &*addr_of!(TRAMPOLINE);
         &entries[..len]
     }
