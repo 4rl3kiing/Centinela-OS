@@ -17,6 +17,7 @@ REQUIRED_MESSAGES=(
     "VMM hardening: HHDM sealed non-executable"
     "Power: ACPI S5 available"
     "Clock: wall time "
+    "IOMMU: interrupt remapping enabled (remappable format only; compatibility format blocked)."
     "Kernel heap: hardened slab allocator online (canaries, poisoning, randomized slots)."
     "CPU hardening: NXE enabled."
     "CPU hardening: CR0.WP enabled."
@@ -109,7 +110,7 @@ run_and_check() {
     local stderr="build/logs/qemu-$P$mode.stderr"
     : >"$log"
     set +e
-    timeout "$TIMEOUT_SECONDS" "$QEMU" -machine q35 -m 512M -smp 4 "${ACCEL[@]}" -device intel-iommu -device e1000,netdev=n0 -netdev user,id=n0 -display none -monitor none \
+    timeout "$TIMEOUT_SECONDS" "$QEMU" -machine q35 -m 512M -smp 4 "${ACCEL[@]}" -device intel-iommu,intremap=on -device e1000,netdev=n0 -netdev user,id=n0 -display none -monitor none \
         -serial "file:$log" -serial null \
         -chardev "file,id=shellin,path=/dev/null,input-path=$SHELL_INPUT" -serial chardev:shellin \
         -fw_cfg name=opt/centinela/poweroff,string=1 \

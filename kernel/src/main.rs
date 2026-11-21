@@ -939,7 +939,7 @@ fn init_platform(
     };
     power::init(rsdp);
     clock::init(rsdp);
-    iommu::init(memory, kernel_root, rsdp) && ioapic::init(memory, kernel_root, rsdp)
+    iommu::init(memory, kernel_root, base, rsdp) && ioapic::init(memory, kernel_root, rsdp)
 }
 
 #[cfg(not(target_os = "none"))]
