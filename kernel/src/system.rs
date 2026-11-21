@@ -2231,7 +2231,10 @@ fn run_network_scenario(
         if blocked {
             "blocked by the IOMMU"
         } else {
-            "NOT BLOCKED"
+            // The fault is only produced once the driver reaches its
+            // out-of-domain descriptor; an earlier failure means "untested",
+            // not "DMA escaped".
+            "not observed (no IOMMU fault recorded)"
         }
     );
     passed == tasks.len() && blocked

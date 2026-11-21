@@ -68,19 +68,32 @@ fn put_u64(base: *mut u8, offset: usize, value: u64) {
 
 /// Polls `done` for up to ~800 million TSC cycles of wall time, so the
 /// timeout holds on emulated and hardware-virtualized CPUs alike.
+/// Polls `done` until it holds or the wait times out.
+///
+/// The bound is wall-clock (TSC cycles), not a poll count: a poll count
+/// tuned for emulation expires in milliseconds under KVM or on a fast CPU,
+/// before the network answers. Both bounds must pass before giving up, so
+/// a slow emulator still gets at least `MIN_POLLS` attempts.
 fn spin_until(mut done: impl FnMut() -> bool) -> bool {
-    // SAFETY: RDTSC is unprivileged (CR4.TSD clear).
-    let start = unsafe { core::arch::x86_64::_rdtsc() };
+    const MIN_POLLS: u32 = 20_000_000;
+    const MAX_CYCLES: u64 = 10_000_000_000;
+    let start = rdtsc();
+    let mut polls = 0u32;
     loop {
         if done() {
             return true;
         }
-        // SAFETY: As above.
-        if unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start) > 800_000_000 {
+        polls = polls.saturating_add(1);
+        if polls >= MIN_POLLS && rdtsc().wrapping_sub(start) >= MAX_CYCLES {
             return false;
         }
         core::hint::spin_loop();
     }
+}
+
+fn rdtsc() -> u64 {
+    // SAFETY: RDTSC is unprivileged unless CR4.TSD is set; no memory access.
+    unsafe { core::arch::x86_64::_rdtsc() }
 }
 
 #[unsafe(no_mangle)]
