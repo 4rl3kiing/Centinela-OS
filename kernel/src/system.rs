@@ -63,6 +63,8 @@ const KERNEL_PORTS: [(u16, u16); 7] = [
     (0x3f8, 8),
     (0xcf8, 8),
 ];
+/// Longest single Sleep, in ticks.
+const MAX_SLEEP_TICKS: u64 = 100;
 /// Kernel-enforced ceiling on restarts per service, whatever init requests.
 const MAX_RESTARTS: u32 = 3;
 const MAX_WRITE_LENGTH: u64 = 256;
@@ -278,6 +280,8 @@ enum TaskState {
     Ready,
     BlockedReceive,
     BlockedReply,
+    /// Waiting for this many more timer ticks (Sleep syscall).
+    Sleeping(u32),
     Dead,
 }
 
@@ -433,6 +437,9 @@ pub fn trap_handler(frame: &mut TrapFrame) {
     match frame.vector {
         TIMER_VECTOR => {
             apic::end_of_interrupt();
+            if let Some(system) = system_state() {
+                wake_sleepers(system);
+            }
             if user_task && let Some(system) = system_state() {
                 let (over_budget, slice_over) =
                     current_task(system).map_or((false, false), |task| {
@@ -517,6 +524,11 @@ pub fn syscall_handler(frame: &mut SyscallFrame) {
         Ok(Syscall::PortIo) => port_io(system, frame),
         Ok(Syscall::IrqAck) => irq_ack(system, frame),
         Ok(Syscall::Revoke) => revoke(system, frame),
+        Ok(Syscall::Sleep) => {
+            let ticks = frame.rdi.clamp(1, MAX_SLEEP_TICKS) as u32;
+            frame.rax = 0;
+            park(system, frame, TaskState::Sleeping(ticks), Event::Blocked);
+        }
         Ok(Syscall::DmaAlloc) => {
             let allowed = current_task(system).is_some_and(|task| task.dma_root.is_some());
             if !allowed {
@@ -533,6 +545,28 @@ pub fn syscall_handler(frame: &mut SyscallFrame) {
     if frame.sanitize_for_sysret().is_err() {
         terminate(system, TaskExit::BadReturnAddress);
     }
+}
+
+/// One timer tick: count down every sleeping task of this CPU.
+fn wake_sleepers(system: &mut System) {
+    for task in system.tasks.iter_mut().flatten() {
+        if let TaskState::Sleeping(ticks) = task.state {
+            task.state = if ticks <= 1 {
+                TaskState::Ready
+            } else {
+                TaskState::Sleeping(ticks - 1)
+            };
+        }
+    }
+}
+
+/// True if a task of this CPU is sleeping (the CPU should idle, not stop).
+fn task_sleeping(system: &System) -> bool {
+    system
+        .tasks
+        .iter()
+        .flatten()
+        .any(|task| matches!(task.state, TaskState::Sleeping(_)))
 }
 
 /// A bound IRQ fired: mask the line (only the driver re-arms it), then notify
@@ -1346,7 +1380,9 @@ fn run_system(
     while let Some(system) = system_state() {
         let Some(next) = pick_next(system, last) else {
             // Only drivers waiting for hardware: sleep until an interrupt.
-            if driver_waiting(system) && work_remaining(system) && idle_wakeups < MAX_IDLE_WAKEUPS {
+            let waiting =
+                (driver_waiting(system) && work_remaining(system)) || task_sleeping(system);
+            if waiting && idle_wakeups < MAX_IDLE_WAKEUPS {
                 idle_wakeups += 1;
                 // SAFETY: Interrupts are enabled only for this one HLT; the
                 // handlers re-borrow the system state themselves and no
@@ -2180,7 +2216,7 @@ fn run_network_scenario(
             name: "e1000-driver",
             role: "Ring 3 NIC driver: MMIO BAR + IOMMU-confined DMA",
             program: Image::Elf(image),
-            extra_syscalls: 1 << Syscall::DmaAlloc as u8,
+            extra_syscalls: (1 << Syscall::DmaAlloc as u8) | (1 << Syscall::Sleep as u8),
             endpoints: [None, None, None],
             process: None,
             manage_processes: false,

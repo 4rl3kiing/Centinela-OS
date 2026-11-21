@@ -32,9 +32,11 @@ pub enum Syscall {
     /// Allocates DMA pages mapped both in the caller and in its device's
     /// IOMMU domain (never at a physical address the device chooses).
     DmaAlloc = 18,
+    /// Blocks the caller for a bounded number of timer ticks (no CPU used).
+    Sleep = 19,
 }
 
-const VALID_SYSCALL_BITS: u64 = (1 << 19) - 1;
+const VALID_SYSCALL_BITS: u64 = (1 << 20) - 1;
 
 impl Syscall {
     /// Decodes a raw syscall number from Ring 3. Unknown numbers are `None`.
@@ -59,6 +61,7 @@ impl Syscall {
             16 => Self::IrqAck,
             17 => Self::Revoke,
             18 => Self::DmaAlloc,
+            19 => Self::Sleep,
             _ => return None,
         })
     }
@@ -82,7 +85,7 @@ impl Syscall {
             // IPC authority comes from the endpoint handle's rights
             // (object capability), checked by the IPC layer.
             // Revocation authority is the unbadged GRANT capability itself.
-            Self::Exit | Self::IpcCall | Self::IpcReplyWait | Self::Revoke => None,
+            Self::Exit | Self::IpcCall | Self::IpcReplyWait | Self::Revoke | Self::Sleep => None,
         }
     }
 }
@@ -224,11 +227,11 @@ mod tests {
 
     #[test]
     fn every_syscall_number_round_trips() {
-        for number in 0..19 {
+        for number in 0..20 {
             let syscall = Syscall::from_number(number).expect("defined syscall");
             assert_eq!(syscall as u64, number);
         }
-        assert_eq!(Syscall::from_number(19), None);
+        assert_eq!(Syscall::from_number(20), None);
     }
 
     #[test]
