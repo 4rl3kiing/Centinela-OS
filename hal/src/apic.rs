@@ -33,10 +33,9 @@ pub const CALIBRATION_MS: u64 = 10;
 
 /// APIC timer counts per millisecond from a calibration measurement.
 pub const fn counts_per_ms(elapsed_counts: u64, window_ms: u64) -> u64 {
-    if window_ms == 0 {
-        0
-    } else {
-        elapsed_counts / window_ms
+    match elapsed_counts.checked_div(window_ms) {
+        Some(per_ms) => per_ms,
+        None => 0,
     }
 }
 
