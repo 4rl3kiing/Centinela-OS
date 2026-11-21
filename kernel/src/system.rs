@@ -1,18 +1,17 @@
-//! Microkernel task system: scheduler, capability-checked IPC, supervision.
+//! Microkernel task system: scheduler, capability IPC and service lifecycle.
 //!
-//! The kernel provides mechanisms only: address spaces, a rendezvous IPC
-//! endpoint, capability checks and fault containment. Services run in Ring 3
-//! and are reached exclusively through endpoint capabilities.
+//! Mechanism vs. policy:
+//! - The kernel provides address spaces, rendezvous IPC endpoints, capability
+//!   checks, capability transfer with attenuation, fault containment, death
+//!   notices and a restart primitive.
+//! - The *policy* (which service exists, who may reach it, when to restart
+//!   it) lives in `init`, a Ring 3 service manager. The kernel distrusts init
+//!   too: restarts need a process capability with CONTROL, the
+//!   ManageProcesses capability, and stay within a kernel-enforced quota.
 //!
-//! Scheduling is driven by IPC: a task runs until it blocks in IPC, exits or
-//! is terminated. Ready services are preferred so that a restarted service is
-//! waiting for requests before its clients resume.
-//!
-//! Supervision: when a restartable service dies, the kernel wakes any caller
-//! that was waiting on it with `STATUS_PEER_DIED`, reclaims the service's
-//! memory and starts a fresh instance with a fresh capability table. Handles
-//! held by the dead instance are revoked with its table; nothing it held is
-//! restored.
+//! Scheduling is IPC-driven: a task runs until it blocks in IPC, asks for a
+//! restart, exits or is terminated. Ready priority tasks (init, services) run
+//! first, so services are waiting before their clients resume.
 
 use core::fmt::Write;
 
@@ -22,8 +21,9 @@ use centinela_hal::idt::{TrapFrame, exception_name};
 use centinela_hal::serial::{SerialWriter, write as serial_write};
 use centinela_hal::syscall::{self, SyscallFrame};
 use centinela_kernel::ipc::{
-    CallOutcome, Endpoint, IpcViolation, MAX_MESSAGE_WORDS, Message, RECEIVE, SEND,
-    STATUS_NO_RECEIVER, STATUS_OK, STATUS_PEER_DIED, TaskId,
+    CallOutcome, Endpoint, IpcViolation, MAX_MESSAGE_WORDS, Message, MessageFlags,
+    NOTICE_SERVICE_DIED, RECEIVE, SEND, STATUS_NO_RECEIVER, STATUS_OK, STATUS_PEER_DIED, TaskId,
+    attenuate,
 };
 use centinela_kernel::memory::address_space::{
     create_user_address_space, destroy_user_address_space,
@@ -43,14 +43,20 @@ use crate::isolation::{
 };
 use crate::user_programs;
 
-const MAX_TASKS: usize = 6;
+const MAX_TASKS: usize = 8;
+const ENDPOINT_COUNT: usize = 2;
+/// Kernel-enforced ceiling on restarts per service, whatever init requests.
 const MAX_RESTARTS: u32 = 3;
 const MAX_WRITE_LENGTH: u64 = 256;
 const EFAULT: u64 = (-14_i64) as u64;
 const EINVAL: u64 = (-22_i64) as u64;
 const ENOSYS: u64 = (-38_i64) as u64;
-/// The single endpoint object of this milestone (index into `endpoints`).
-const ENDPOINT_SERVICE: usize = 0;
+const EPERM: u64 = (-1_i64) as u64;
+const EBUSY: u64 = (-16_i64) as u64;
+/// Endpoint served by init (directory and supervisor notices).
+const ENDPOINT_INIT: usize = 0;
+/// Endpoint served by the adder service.
+const ENDPOINT_ADDER: usize = 1;
 
 /// How a task ended. Every variant except `Exited` and `Stopped` is a
 /// containment event.
@@ -71,6 +77,21 @@ pub enum TaskExit {
     Stopped,
 }
 
+impl TaskExit {
+    /// Compact code delivered to supervisors in death notices.
+    const fn notice_code(self) -> u64 {
+        match self {
+            Self::Exited(_) => 0,
+            Self::Fault { .. } => 1,
+            Self::Violation(_) => 2,
+            Self::Ipc(_) => 3,
+            Self::BadReturnAddress => 4,
+            Self::CpuBudgetExceeded => 5,
+            Self::Stopped => 6,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Expect {
     Exit(u64),
@@ -80,7 +101,7 @@ enum Expect {
     UnknownSyscall,
     CpuBudgetExceeded,
     Ipc(IpcViolation),
-    /// A service that must still be serving at shutdown after this many restarts.
+    /// Still serving at shutdown after exactly this many restarts.
     Service {
         restarts: u32,
     },
@@ -113,9 +134,15 @@ struct TaskSpec {
     role: &'static str,
     program: fn() -> &'static [u8],
     extra_syscalls: u64,
-    /// Rights on the service endpoint; the raw handle is passed in RDI.
-    endpoint_rights: Option<Rights>,
-    restartable: bool,
+    /// Endpoint capabilities granted at start; raw handles arrive in RDI, RSI.
+    endpoints: [Option<(usize, Rights)>; 2],
+    /// Process capability (CONTROL) over this task slot; raw handle in RDX.
+    process: Option<usize>,
+    manage_processes: bool,
+    /// Scheduled before ordinary tasks (init and services).
+    priority: bool,
+    /// Endpoint that receives a kernel notice when this task dies.
+    supervisor: Option<usize>,
     expect: Expect,
 }
 
@@ -133,7 +160,10 @@ struct Task {
     root: PhysAddr,
     policy: SyscallPolicy,
     capabilities: CapabilitySet,
-    endpoints: CapabilityTable<usize, 2>,
+    endpoints: CapabilityTable<usize, 8>,
+    processes: CapabilityTable<usize, 4>,
+    /// Raw handle this task holds for the process capability it was granted.
+    process_handle: Option<(usize, u64)>,
     frame: SyscallFrame,
     ticks: u32,
     /// True while this task holds a request it has not replied to.
@@ -142,16 +172,36 @@ struct Task {
     exit: Option<TaskExit>,
 }
 
+/// A supervised task that died and awaits a restart decision.
+#[derive(Clone, Copy)]
+struct Dormant {
+    spec: TaskSpec,
+    restarts: u32,
+    exit: Option<TaskExit>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct EndpointState {
+    rendezvous: Endpoint,
+    /// Task slots whose death notice is waiting for the receiver.
+    pending_notices: u8,
+}
+
 /// What ended the most recent run of the current task.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Event {
     Blocked,
     Ended,
+    /// The current task asked the kernel to restart this dormant slot.
+    Restart(usize),
 }
 
 struct System {
     tasks: [Option<Task>; MAX_TASKS],
-    endpoints: [Endpoint; 1],
+    dormant: [Option<Dormant>; MAX_TASKS],
+    endpoints: [EndpointState; ENDPOINT_COUNT],
+    /// Raw handle, in the supervisor's table, naming each task slot.
+    notice_handles: [u64; MAX_TASKS],
     current: Option<TaskId>,
     saved_kernel_rsp: u64,
     event: Event,
@@ -188,6 +238,15 @@ fn terminate(system: &mut System, exit: TaskExit) -> ! {
         task.state = TaskState::Dead;
     }
     leave_user(system, Event::Ended)
+}
+
+/// Saves the caller's registers and leaves it in `state`.
+fn park(system: &mut System, frame: &SyscallFrame, state: TaskState, event: Event) -> ! {
+    if let Some(task) = current_task(system) {
+        task.frame = *frame;
+        task.state = state;
+    }
+    leave_user(system, event)
 }
 
 pub fn trap_handler(frame: &mut TrapFrame) {
@@ -252,6 +311,7 @@ pub fn syscall_handler(frame: &mut SyscallFrame) {
         }
         Ok(Syscall::IpcCall) => ipc_call(system, frame),
         Ok(Syscall::IpcReplyWait) => ipc_reply_wait(system, frame),
+        Ok(Syscall::CreateProcess) => process_restart(system, frame),
         Ok(_) => frame.rax = ENOSYS,
     }
     if frame.sanitize_for_sysret().is_err() {
@@ -283,31 +343,87 @@ fn sys_write(task: &Task, reader: HhdmReader, address: u64, length: u64) -> u64 
     length
 }
 
+fn table_violation(error: TableError) -> IpcViolation {
+    match error {
+        TableError::PermissionDenied => IpcViolation::MissingRights,
+        _ => IpcViolation::InvalidHandle,
+    }
+}
+
 /// Resolves the endpoint named by a raw user handle, requiring `rights`.
 fn resolve_endpoint(task: &Task, raw: u64, rights: Rights) -> Result<usize, IpcViolation> {
     let handle = task.endpoints.handle_from_raw(raw);
     task.endpoints
         .get(handle, rights)
         .copied()
-        .map_err(|error| match error {
-            TableError::PermissionDenied => IpcViolation::MissingRights,
-            _ => IpcViolation::InvalidHandle,
-        })
+        .map_err(table_violation)
 }
 
-fn message_from(frame: &SyscallFrame) -> Result<Message, IpcViolation> {
-    Message::from_registers(frame.rsi, [frame.rdx, frame.r10, frame.r8, frame.r9])
+/// A validated outgoing message, possibly carrying an attenuated capability.
+struct Outgoing {
+    message: Message,
+    transfer: Option<(usize, Rights)>,
 }
 
-/// Writes a status and message into a blocked task's saved registers.
-fn deliver(frame: &mut SyscallFrame, status: u64, message: Message) {
-    let words = message.words();
+/// Validates flags, message bounds and any capability transfer.
+fn outgoing(task: &Task, frame: &SyscallFrame) -> Result<Outgoing, IpcViolation> {
+    let flags = MessageFlags::parse(frame.rsi)?;
+    let transfer = match flags.grant {
+        None => None,
+        Some(requested) => {
+            // The capability to pass travels in the last word (R9).
+            let handle = task.endpoints.handle_from_raw(frame.r9);
+            let held = task.endpoints.rights(handle).map_err(table_violation)?;
+            let endpoint = *task.endpoints.get(handle, held).map_err(table_violation)?;
+            Some((endpoint, attenuate(held, requested)?))
+        }
+    };
+    let message =
+        Message::from_registers(flags.length, [frame.rdx, frame.r10, frame.r8, frame.r9])?;
+    Ok(Outgoing { message, transfer })
+}
+
+/// Writes a status, message and optional new capability into a receiver's
+/// saved registers. The flags word is rebuilt by the kernel, so a sender can
+/// never make a message look kernel-originated.
+fn deliver(receiver: &mut Task, status: u64, outgoing: &Outgoing, kernel_origin: bool) {
+    let words = outgoing.message.words();
+    let mut granted = None;
+    let mut last_word = words[3];
+    if let Some((endpoint, rights)) = outgoing.transfer {
+        // A full receiver table simply receives no capability.
+        last_word = match receiver.endpoints.insert(endpoint, rights) {
+            Ok(handle) => {
+                granted = Some(rights);
+                handle.to_raw()
+            }
+            Err(_) => 0,
+        };
+    }
+    let frame = &mut receiver.frame;
     frame.rax = status;
-    frame.rsi = message.length() as u64;
+    frame.rsi = MessageFlags::delivered(outgoing.message.length() as u64, granted, kernel_origin);
     frame.rdx = words[0];
     frame.r10 = words[1];
     frame.r8 = words[2];
-    frame.r9 = words[3];
+    frame.r9 = last_word;
+}
+
+fn deliver_status(receiver: &mut Task, status: u64) {
+    let empty = Outgoing {
+        message: Message::default(),
+        transfer: None,
+    };
+    deliver(receiver, status, &empty, false);
+}
+
+fn deliver_notice(receiver: &mut Task, process_handle: u64, code: u64) {
+    let notice = Outgoing {
+        message: Message::from_registers(3, [NOTICE_SERVICE_DIED, process_handle, code, 0])
+            .unwrap_or_default(),
+        transfer: None,
+    };
+    deliver(receiver, STATUS_OK, &notice, true);
 }
 
 fn ipc_call(system: &mut System, frame: &mut SyscallFrame) {
@@ -316,25 +432,21 @@ fn ipc_call(system: &mut System, frame: &mut SyscallFrame) {
         .ok_or(IpcViolation::InvalidHandle)
         .and_then(|task| {
             let endpoint = resolve_endpoint(task, frame.rdi, SEND)?;
-            Ok((endpoint, message_from(frame)?))
+            Ok((endpoint, outgoing(task, frame)?))
         });
-    let (endpoint, message) = match checked {
+    let (endpoint, request) = match checked {
         Ok(value) => value,
         Err(violation) => terminate(system, TaskExit::Ipc(violation)),
     };
-    match system.endpoints[endpoint].call(caller) {
+    match system.endpoints[endpoint].rendezvous.call(caller) {
         CallOutcome::NoReceiver => frame.rax = STATUS_NO_RECEIVER,
         CallOutcome::Delivered { server } => {
             if let Some(server) = system.tasks[server].as_mut() {
-                deliver(&mut server.frame, STATUS_OK, message);
+                deliver(server, STATUS_OK, &request, false);
                 server.serving = true;
                 server.state = TaskState::Ready;
             }
-            if let Some(task) = current_task(system) {
-                task.frame = *frame;
-                task.state = TaskState::BlockedReply;
-            }
-            leave_user(system, Event::Blocked);
+            park(system, frame, TaskState::BlockedReply, Event::Blocked);
         }
     }
 }
@@ -345,25 +457,81 @@ fn ipc_reply_wait(system: &mut System, frame: &mut SyscallFrame) {
         .ok_or(IpcViolation::InvalidHandle)
         .and_then(|task| {
             let endpoint = resolve_endpoint(task, frame.rdi, RECEIVE)?;
-            Ok((endpoint, message_from(frame)?))
+            Ok((endpoint, outgoing(task, frame)?))
         });
     let (endpoint, reply) = match checked {
         Ok(value) => value,
         Err(violation) => terminate(system, TaskExit::Ipc(violation)),
     };
-    if let Some(caller) = system.endpoints[endpoint].reply_wait(server)
+    if let Some(caller) = system.endpoints[endpoint].rendezvous.reply_wait(server)
         && let Some(caller) = system.tasks[caller].as_mut()
         && caller.state == TaskState::BlockedReply
     {
-        deliver(&mut caller.frame, STATUS_OK, reply);
+        deliver(caller, STATUS_OK, &reply, false);
         caller.state = TaskState::Ready;
     }
     if let Some(task) = current_task(system) {
-        task.frame = *frame;
         task.serving = false;
+        task.frame = *frame;
         task.state = TaskState::BlockedReceive;
     }
-    leave_user(system, Event::Blocked);
+    // A pending kernel notice is delivered at once instead of blocking.
+    deliver_pending_notice(system, endpoint);
+    leave_user(system, Event::Blocked)
+}
+
+/// If `endpoint` has a waiting receiver and a pending notice, deliver it.
+fn deliver_pending_notice(system: &mut System, endpoint: usize) {
+    let Some(receiver) = system.endpoints[endpoint].rendezvous.receiver() else {
+        return;
+    };
+    if !system.tasks[receiver]
+        .as_ref()
+        .is_some_and(|task| task.state == TaskState::BlockedReceive)
+    {
+        return;
+    }
+    let pending = &mut system.endpoints[endpoint].pending_notices;
+    if *pending == 0 {
+        return;
+    }
+    let slot = pending.trailing_zeros() as usize;
+    *pending &= !(1 << slot);
+    system.endpoints[endpoint].rendezvous.take_receiver();
+    let handle = system.notice_handles[slot];
+    let code = system.dormant[slot]
+        .and_then(|dormant| dormant.exit)
+        .map_or(0, TaskExit::notice_code);
+    if let Some(task) = system.tasks[receiver].as_mut() {
+        deliver_notice(task, handle, code);
+        task.state = TaskState::Ready;
+    }
+}
+
+/// `CreateProcess` syscall: restart a dormant supervised task.
+///
+/// Requires ManageProcesses (checked by `authorize`) and a process capability
+/// with CONTROL over the slot (forged handles terminate the caller). Returns
+/// EBUSY if the task is alive and EPERM once the kernel quota is exhausted.
+fn process_restart(system: &mut System, frame: &mut SyscallFrame) {
+    let resolved = current_task(system)
+        .ok_or(IpcViolation::InvalidHandle)
+        .and_then(|task| {
+            let handle = task.processes.handle_from_raw(frame.rdi);
+            task.processes
+                .get(handle, Rights::CONTROL)
+                .copied()
+                .map_err(table_violation)
+        });
+    let slot = match resolved {
+        Ok(slot) => slot,
+        Err(violation) => terminate(system, TaskExit::Ipc(violation)),
+    };
+    match system.dormant[slot] {
+        None => frame.rax = EBUSY,
+        Some(dormant) if dormant.restarts >= MAX_RESTARTS => frame.rax = EPERM,
+        Some(_) => park(system, frame, TaskState::Ready, Event::Restart(slot)),
+    }
 }
 
 /// Builds a task's address space and initial register state.
@@ -387,21 +555,39 @@ fn spawn(
     }
 
     let mut endpoints = CapabilityTable::new(table_id).map_err(|_| "capability table")?;
+    let mut processes = CapabilityTable::new(table_id).map_err(|_| "capability table")?;
     let mut frame = SyscallFrame {
         rip: USER_CODE_BASE,
         rsp: USER_STACK_TOP,
         ..SyscallFrame::default()
     };
-    if let Some(rights) = spec.endpoint_rights {
-        let handle = endpoints
-            .insert(ENDPOINT_SERVICE, rights)
-            .map_err(|_| "capability grant failed")?;
-        frame.rdi = handle.to_raw();
+    let mut raw = [0u64; 2];
+    for (slot, grant) in raw.iter_mut().zip(spec.endpoints) {
+        if let Some((endpoint, rights)) = grant {
+            *slot = endpoints
+                .insert(endpoint, rights)
+                .map_err(|_| "capability grant failed")?
+                .to_raw();
+        }
+    }
+    frame.rdi = raw[0];
+    frame.rsi = raw[1];
+    let mut process_handle = None;
+    if let Some(target) = spec.process {
+        let handle = processes
+            .insert(target, Rights::CONTROL)
+            .map_err(|_| "process capability grant failed")?
+            .to_raw();
+        frame.rdx = handle;
+        process_handle = Some((target, handle));
     }
 
     let syscalls = (1 << Syscall::Write as u8) | (1 << Syscall::Exit as u8) | spec.extra_syscalls;
     let mut capabilities = CapabilitySet::EMPTY;
     capabilities.grant(Capability::WriteConsole);
+    if spec.manage_processes {
+        capabilities.grant(Capability::ManageProcesses);
+    }
     Ok(Task {
         spec,
         state: TaskState::Ready,
@@ -409,6 +595,8 @@ fn spawn(
         policy: SyscallPolicy::new(SyscallSet::from_bits(syscalls)),
         capabilities,
         endpoints,
+        processes,
+        process_handle,
         frame,
         ticks: 0,
         serving: false,
@@ -433,20 +621,20 @@ fn report_user_strip(stripped: u16) {
     }
 }
 
-/// Picks the next ready task: services first, then round-robin.
+/// Picks the next ready task: priority tasks first, then round-robin.
 fn pick_next(system: &System, after: usize) -> Option<usize> {
     let ready = |index: usize| {
         system.tasks[index]
             .as_ref()
             .is_some_and(|task| task.state == TaskState::Ready)
     };
-    let service_ready = (0..MAX_TASKS).find(|&index| {
+    let priority = (0..MAX_TASKS).find(|&index| {
         ready(index)
             && system.tasks[index]
                 .as_ref()
-                .is_some_and(|task| task.spec.restartable)
+                .is_some_and(|task| task.spec.priority)
     });
-    service_ready.or_else(|| {
+    priority.or_else(|| {
         (1..=MAX_TASKS)
             .map(|offset| (after + offset) % MAX_TASKS)
             .find(|&index| ready(index))
@@ -462,7 +650,7 @@ struct Outcome {
     reclaimed: bool,
 }
 
-/// Runs a set of tasks until none is ready, supervising restartable services.
+/// Runs a set of tasks until none is ready.
 fn run_system(
     memory: &mut HhdmFrameMemory<'_, '_>,
     kernel_root: PhysAddr,
@@ -477,7 +665,9 @@ fn run_system(
     unsafe {
         *core::ptr::addr_of_mut!(SYSTEM) = Some(System {
             tasks: [const { None }; MAX_TASKS],
-            endpoints: [Endpoint::new()],
+            dormant: [None; MAX_TASKS],
+            endpoints: [EndpointState::default(); ENDPOINT_COUNT],
+            notice_handles: [0; MAX_TASKS],
             current: None,
             saved_kernel_rsp: 0,
             event: Event::Blocked,
@@ -489,19 +679,7 @@ fn run_system(
         return outcomes;
     };
     for (index, spec) in specs.iter().take(MAX_TASKS).enumerate() {
-        let table_id = system.next_table_id;
-        system.next_table_id += 1;
-        match spawn(memory, kernel_root, *spec, table_id, 0) {
-            Ok(task) => system.tasks[index] = Some(task),
-            Err(reason) => {
-                let mut writer = SerialWriter;
-                let _ = write!(
-                    writer,
-                    "Isolation: task {} could not run: {reason}\r\n",
-                    spec.name
-                );
-            }
-        }
+        start_task(memory, kernel_root, system, index, *spec, 0, &mut outcomes);
     }
 
     let mut last = MAX_TASKS - 1;
@@ -536,18 +714,33 @@ fn run_system(
             task.exit = Some(TaskExit::BadReturnAddress);
             system.event = Event::Ended;
         }
-        if system.event == Event::Ended {
-            reap(memory, kernel_root, system, next, &mut outcomes);
+        match system.event {
+            Event::Ended => reap(memory, system, next, &mut outcomes),
+            Event::Restart(slot) => {
+                let result = restart(memory, kernel_root, system, slot, &mut outcomes);
+                if let Some(requester) = system.tasks[next].as_mut() {
+                    requester.frame.rax = result;
+                }
+            }
+            Event::Blocked => {}
         }
     }
 
-    // Shutdown: tasks still blocked (servers waiting for requests) are stopped.
+    // Shutdown: blocked tasks (servers waiting for requests) are stopped and
+    // dormant tasks keep their last exit.
     if let Some(system) = system_state() {
         for index in 0..MAX_TASKS {
             if let Some(task) = system.tasks[index].as_mut() {
                 task.exit = Some(TaskExit::Stopped);
                 task.state = TaskState::Dead;
                 reap_final(memory, system, index, &mut outcomes);
+            } else if let Some(dormant) = system.dormant[index].take() {
+                outcomes[index] = Some(Outcome {
+                    spec: dormant.spec,
+                    exit: dormant.exit,
+                    restarts: dormant.restarts,
+                    reclaimed: true,
+                });
             }
         }
     }
@@ -556,16 +749,85 @@ fn run_system(
 
     let reclaimed = memory.free_frames() == frames_before;
     for outcome in outcomes.iter_mut().flatten() {
-        outcome.reclaimed = reclaimed;
+        outcome.reclaimed = outcome.reclaimed && reclaimed;
     }
     outcomes
 }
 
-/// Handles a task that ended: wake its waiting caller, reclaim it, and
-/// restart it if it is a supervised service with restarts left.
-fn reap(
+fn start_task(
     memory: &mut HhdmFrameMemory<'_, '_>,
     kernel_root: PhysAddr,
+    system: &mut System,
+    index: usize,
+    spec: TaskSpec,
+    restarts: u32,
+    outcomes: &mut [Option<Outcome>; MAX_TASKS],
+) -> bool {
+    let table_id = system.next_table_id;
+    system.next_table_id += 1;
+    match spawn(memory, kernel_root, spec, table_id, restarts) {
+        Ok(task) => {
+            if let Some((target, raw)) = task.process_handle {
+                system.notice_handles[target] = raw;
+            }
+            system.tasks[index] = Some(task);
+            true
+        }
+        Err(reason) => {
+            let mut writer = SerialWriter;
+            let _ = write!(
+                writer,
+                "Isolation: task {} could not run: {reason}\r\n",
+                spec.name
+            );
+            outcomes[index] = Some(Outcome {
+                spec,
+                exit: None,
+                restarts,
+                reclaimed: false,
+            });
+            false
+        }
+    }
+}
+
+/// Restarts a dormant slot on behalf of its supervisor; returns the status.
+fn restart(
+    memory: &mut HhdmFrameMemory<'_, '_>,
+    kernel_root: PhysAddr,
+    system: &mut System,
+    slot: usize,
+    outcomes: &mut [Option<Outcome>; MAX_TASKS],
+) -> u64 {
+    let Some(dormant) = system.dormant[slot].take() else {
+        return EBUSY;
+    };
+    let restarts = dormant.restarts + 1;
+    if start_task(
+        memory,
+        kernel_root,
+        system,
+        slot,
+        dormant.spec,
+        restarts,
+        outcomes,
+    ) {
+        let mut writer = SerialWriter;
+        let _ = write!(
+            writer,
+            "Kernel: restarted {} at init's request (fresh memory and capabilities, restart {restarts}/{MAX_RESTARTS}).\r\n",
+            dormant.spec.name
+        );
+        STATUS_OK
+    } else {
+        EPERM
+    }
+}
+
+/// Handles a task that ended: wake its waiting caller, reclaim its memory,
+/// and either notify its supervisor (task goes dormant) or finalize it.
+fn reap(
+    memory: &mut HhdmFrameMemory<'_, '_>,
     system: &mut System,
     index: usize,
     outcomes: &mut [Option<Outcome>; MAX_TASKS],
@@ -575,55 +837,36 @@ fn reap(
     };
     let (spec, serving, restarts, exit) = (task.spec, task.serving, task.restarts, task.exit);
     for endpoint in system.endpoints.iter_mut() {
-        if let Some(caller) = endpoint.on_task_death(index, serving)
+        if let Some(caller) = endpoint.rendezvous.on_task_death(index, serving)
             && let Some(caller) = system.tasks[caller].as_mut()
             && caller.state == TaskState::BlockedReply
         {
-            deliver(&mut caller.frame, STATUS_PEER_DIED, Message::default());
+            deliver_status(caller, STATUS_PEER_DIED);
             caller.state = TaskState::Ready;
         }
     }
+    let Some(supervisor) = spec.supervisor else {
+        reap_final(memory, system, index, outcomes);
+        return;
+    };
 
     let mut writer = SerialWriter;
-    if spec.restartable && restarts < MAX_RESTARTS && exit != Some(TaskExit::Exited(0)) {
-        let _ = write!(writer, "Supervisor: service {} ", spec.name);
-        if let Some(exit) = exit {
-            describe(exit, &mut writer);
-        }
-        serial_write("\r\n");
-        if let Some(old) = system.tasks[index].take() {
-            // The old capability table (and every handle it issued) dies here.
-            let _ = destroy_user_address_space(memory, old.root);
-        }
-        let table_id = system.next_table_id;
-        system.next_table_id += 1;
-        match spawn(memory, kernel_root, spec, table_id, restarts + 1) {
-            Ok(task) => {
-                system.tasks[index] = Some(task);
-                let _ = write!(
-                    writer,
-                    "Supervisor: service {} restarted with fresh memory and capabilities (restart {}).\r\n",
-                    spec.name,
-                    restarts + 1
-                );
-            }
-            Err(reason) => {
-                let _ = write!(
-                    writer,
-                    "Supervisor: restart of {} failed: {reason}\r\n",
-                    spec.name
-                );
-                outcomes[index] = Some(Outcome {
-                    spec,
-                    exit,
-                    restarts,
-                    reclaimed: false,
-                });
-            }
-        }
-        return;
+    let _ = write!(writer, "Kernel: service {} ", spec.name);
+    if let Some(exit) = exit {
+        describe(exit, &mut writer);
     }
-    reap_final(memory, system, index, outcomes);
+    serial_write("; notifying its supervisor.\r\n");
+    if let Some(old) = system.tasks[index].take() {
+        // Its capability tables, and every handle they issued, die here.
+        let _ = destroy_user_address_space(memory, old.root);
+    }
+    system.dormant[index] = Some(Dormant {
+        spec,
+        restarts,
+        exit,
+    });
+    system.endpoints[supervisor].pending_notices |= 1 << index;
+    deliver_pending_notice(system, supervisor);
 }
 
 fn reap_final(
@@ -636,7 +879,7 @@ fn reap_final(
         return;
     };
     for endpoint in system.endpoints.iter_mut() {
-        let _ = endpoint.on_task_death(index, false);
+        let _ = endpoint.rendezvous.on_task_death(index, false);
     }
     let reclaimed = destroy_user_address_space(memory, task.root).is_ok();
     outcomes[index] = Some(Outcome {
@@ -687,8 +930,11 @@ fn describe(exit: TaskExit, writer: &mut SerialWriter) {
         }
         TaskExit::Ipc(IpcViolation::MalformedMessage) => write!(
             writer,
-            "terminated: IPC message longer than {MAX_MESSAGE_WORDS} words"
+            "terminated: malformed IPC message (over {MAX_MESSAGE_WORDS} words or invalid flags)"
         ),
+        TaskExit::Ipc(IpcViolation::RightsAmplification) => {
+            write!(writer, "terminated: tried to grant rights it does not hold")
+        }
         TaskExit::BadReturnAddress => write!(writer, "terminated: invalid return address"),
         TaskExit::CpuBudgetExceeded => write!(writer, "terminated: CPU budget exceeded"),
         TaskExit::Stopped => write!(writer, "still serving at shutdown"),
@@ -741,15 +987,39 @@ const fn isolated(
         role,
         program,
         extra_syscalls,
-        endpoint_rights: None,
-        restartable: false,
+        endpoints: [None, None],
+        process: None,
+        manage_processes: false,
+        priority: false,
+        supervisor: None,
         expect,
     }
 }
 
 const IPC_SYSCALLS: u64 = (1 << Syscall::IpcCall as u8) | (1 << Syscall::IpcReplyWait as u8);
 
-/// Runs every isolation scenario and the microkernel service scenario.
+/// A client-side task holding only a SEND capability to init's endpoint.
+const fn init_client(
+    name: &'static str,
+    role: &'static str,
+    program: fn() -> &'static [u8],
+    expect: Expect,
+) -> TaskSpec {
+    TaskSpec {
+        name,
+        role,
+        program,
+        extra_syscalls: IPC_SYSCALLS,
+        endpoints: [Some((ENDPOINT_INIT, SEND)), None],
+        process: None,
+        manage_processes: false,
+        priority: false,
+        supervisor: None,
+        expect,
+    }
+}
+
+/// Runs every isolation scenario and the service-manager scenario.
 pub fn run_self_test(
     memory: &mut HhdmFrameMemory<'_, '_>,
     kernel_root: PhysAddr,
@@ -852,64 +1122,72 @@ pub fn run_self_test(
     );
     let isolation_ok = passed == isolated_tasks.len();
 
-    // Microkernel scenario: a Ring 3 service reached only through an endpoint
-    // capability, a client that injects a fault into it, and hostile tasks
-    // that abuse IPC.
+    // Service-manager scenario. Slot 1 is the adder service whose process
+    // capability init holds.
     let scenario = [
         TaskSpec {
+            name: "init",
+            role: "Ring 3 service manager: directory + restart policy",
+            program: p::init,
+            extra_syscalls: IPC_SYSCALLS | (1 << Syscall::CreateProcess as u8),
+            endpoints: [
+                Some((ENDPOINT_INIT, RECEIVE)),
+                Some((ENDPOINT_ADDER, SEND.union(Rights::GRANT))),
+            ],
+            process: Some(1),
+            manage_processes: true,
+            priority: true,
+            supervisor: None,
+            expect: Expect::Service { restarts: 0 },
+        },
+        TaskSpec {
             name: "adder-service",
-            role: "Ring 3 service (RECEIVE)",
+            role: "Ring 3 service supervised by init",
             program: p::adder_service,
             extra_syscalls: IPC_SYSCALLS,
-            endpoint_rights: Some(RECEIVE),
-            restartable: true,
+            endpoints: [Some((ENDPOINT_ADDER, RECEIVE)), None],
+            process: None,
+            manage_processes: false,
+            priority: true,
+            supervisor: Some(ENDPOINT_INIT),
             expect: Expect::Service { restarts: 1 },
         },
-        TaskSpec {
-            name: "client",
-            role: "client with fault injection (SEND)",
-            program: p::client,
-            extra_syscalls: IPC_SYSCALLS,
-            endpoint_rights: Some(SEND),
-            restartable: false,
-            expect: Expect::Exit(0),
-        },
-        TaskSpec {
-            name: "rogue-receive",
-            role: "receive with a SEND-only capability",
-            program: p::rogue_receive,
-            extra_syscalls: IPC_SYSCALLS,
-            endpoint_rights: Some(SEND),
-            restartable: false,
-            expect: Expect::Ipc(IpcViolation::MissingRights),
-        },
-        TaskSpec {
-            name: "forged-handle",
-            role: "IPC with a forged handle",
-            program: p::forged_handle,
-            extra_syscalls: IPC_SYSCALLS,
-            endpoint_rights: Some(SEND),
-            restartable: false,
-            expect: Expect::Ipc(IpcViolation::InvalidHandle),
-        },
-        TaskSpec {
-            name: "oversized-message",
-            role: "IPC message beyond bounds",
-            program: p::oversized_message,
-            extra_syscalls: IPC_SYSCALLS,
-            endpoint_rights: Some(SEND),
-            restartable: false,
-            expect: Expect::Ipc(IpcViolation::MalformedMessage),
-        },
-        TaskSpec {
-            name: "no-capability",
-            role: "IPC without any endpoint capability",
-            program: p::forged_handle,
-            extra_syscalls: IPC_SYSCALLS,
-            endpoint_rights: None,
-            restartable: false,
-            expect: Expect::Ipc(IpcViolation::InvalidHandle),
-        },
+        init_client(
+            "client",
+            "gets the service from init; injects a fault",
+            p::client,
+            Expect::Exit(0),
+        ),
+        init_client(
+            "spoof-notice",
+            "forges a kernel death notice",
+            p::spoof_notice,
+            Expect::Exit(0),
+        ),
+        init_client(
+            "amplify",
+            "re-grants its SEND capability with more rights",
+            p::amplify,
+            Expect::Ipc(IpcViolation::RightsAmplification),
+        ),
+        init_client(
+            "rogue-receive",
+            "receive with a SEND-only capability",
+            p::rogue_receive,
+            Expect::Ipc(IpcViolation::MissingRights),
+        ),
+        init_client(
+            "forged-handle",
+            "IPC with a forged handle",
+            p::forged_handle,
+            Expect::Ipc(IpcViolation::InvalidHandle),
+        ),
+        init_client(
+            "oversized-message",
+            "IPC message beyond bounds",
+            p::oversized_message,
+            Expect::Ipc(IpcViolation::MalformedMessage),
+        ),
     ];
     let outcomes = run_system(memory, kernel_root, hhdm, &scenario);
     let mut scenario_passed = 0usize;
@@ -920,7 +1198,7 @@ pub fn run_self_test(
     }
     let _ = write!(
         writer,
-        "Microkernel: {scenario_passed}/{} IPC/service checks passed; kernel still running.\r\n",
+        "Microkernel: {scenario_passed}/{} service-manager checks passed; kernel still running.\r\n",
         scenario.len()
     );
     isolation_ok && scenario_passed == scenario.len()
