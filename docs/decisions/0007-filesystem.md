@@ -1,6 +1,6 @@
 # ADR-0007: Persistent filesystem for version 1.0
 
-- Status: **Proposed** (2026-11-21), awaiting the owner's decision
+- Status: **Accepted** (2026-11-21): the owner approved option A
 - Scope: roadmap phase 7 (ADR-0005, open decision 1)
 - Builds on: ADR-0003 (zero-trust layers), ADR-0005
 
@@ -53,7 +53,12 @@ Sketch of option A (to be refined before code):
   with the service).
 - FAT32 support is still required for the EFI partition and USB sticks.
 
-## Decision needed from the owner
+## Decision
 
-Approve option A (recommended), choose B or C, or ask for a different
-option. No filesystem code is written until this ADR is accepted.
+Option A, approved by the owner on 2026-11-21: an own copy-on-write,
+checksummed filesystem for system and home volumes, plus FAT32 for
+removable media and the EFI system partition.
+
+Implementation order: on-disk format crate (host-tested and fuzzed),
+then mkfs/fsck host tools, then the Ring 3 filesystem service over the
+block service.
