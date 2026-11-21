@@ -245,6 +245,46 @@ pub fn rtc_century_register<R: PhysicalReader>(reader: &R, rsdp: u64) -> u8 {
         .unwrap_or(0)
 }
 
+/// Lists the signatures of every table the XSDT/RSDT references (up to
+/// `out.len()`), for the hardware report. Returns how many were stored.
+pub fn list_tables<R: PhysicalReader>(reader: &R, rsdp: u64, out: &mut [[u8; 4]]) -> usize {
+    let Some(v1) = reader.bytes(rsdp, 20) else {
+        return 0;
+    };
+    if &v1[..8] != b"RSD PTR " || !checksum_ok(v1) {
+        return 0;
+    }
+    let (root, entry_size) = if v1[15] >= 2 {
+        match reader.bytes(rsdp, 36).and_then(|v2| u64_at(v2, 24)) {
+            Some(xsdt) => (xsdt, 8),
+            None => return 0,
+        }
+    } else {
+        (u64::from(u32_at(v1, 16).unwrap_or(0)), 4)
+    };
+    let Ok(root_table) = read_table(reader, root) else {
+        return 0;
+    };
+    let entries = ((root_table.len() - HEADER_LENGTH) / entry_size).min(MAX_ROOT_ENTRIES);
+    let mut stored = 0;
+    for index in 0..entries {
+        if stored == out.len() {
+            break;
+        }
+        let offset = HEADER_LENGTH + index * entry_size;
+        let physical = if entry_size == 8 {
+            u64_at(root_table, offset)
+        } else {
+            u32_at(root_table, offset).map(u64::from)
+        };
+        if let Some(signature) = physical.and_then(|p| reader.bytes(p, 4)) {
+            out[stored].copy_from_slice(signature);
+            stored += 1;
+        }
+    }
+    stored
+}
+
 /// One DMA-remapping hardware unit (DRHD) from the DMAR table.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DrhdUnit {

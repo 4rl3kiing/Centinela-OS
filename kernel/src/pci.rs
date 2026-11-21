@@ -95,3 +95,38 @@ pub(crate) fn disable_dma(device: Device) {
     let command = read32(device, COMMAND) & 0xffff;
     write32(device, COMMAND, command & !BUS_MASTER);
 }
+
+/// Calls `visit(device, vendor, device_id, class, subclass, interface)` for
+/// every present function on every bus (configuration mechanism #1).
+pub(crate) fn for_each(mut visit: impl FnMut(Device, u16, u16, u8, u8, u8)) {
+    for bus in 0u8..=255 {
+        for slot in 0u8..32 {
+            for function in 0u8..8 {
+                let device = Device {
+                    bus,
+                    devfn: slot << 3 | function,
+                };
+                let id = read32(device, 0);
+                if id & 0xffff == 0xffff {
+                    if function == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                let class = read32(device, 0x08);
+                visit(
+                    device,
+                    id as u16,
+                    (id >> 16) as u16,
+                    (class >> 24) as u8,
+                    (class >> 16) as u8,
+                    (class >> 8) as u8,
+                );
+                // Single-function devices answer on every function number.
+                if function == 0 && (read32(device, 0x0c) >> 16) & 0x80 == 0 {
+                    break;
+                }
+            }
+        }
+    }
+}

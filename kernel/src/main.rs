@@ -10,6 +10,8 @@ extern crate alloc;
 #[cfg(target_os = "none")]
 mod clock;
 #[cfg(target_os = "none")]
+mod hwreport;
+#[cfg(target_os = "none")]
 mod ioapic;
 #[cfg(target_os = "none")]
 mod iommu;
@@ -937,6 +939,7 @@ fn init_platform(
             .checked_sub(base)
             .map(|physical| (&reader, physical))
     };
+    hwreport::print(rsdp);
     power::init(rsdp);
     clock::init(rsdp);
     iommu::init(memory, kernel_root, base, rsdp) && ioapic::init(memory, kernel_root, rsdp)
