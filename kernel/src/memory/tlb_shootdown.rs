@@ -27,15 +27,14 @@ pub trait TlbShootdownTransport {
     /// The handler must acquire those writes, invalidate the requested page,
     /// and publish completion before acknowledging. Concurrent shootdowns
     /// must not overwrite one another's request/acknowledgement state.
-    fn send_shootdown_ipi(
-        &mut self,
-        cpu_id: usize,
-        address: VirtAddr,
-    ) -> Result<(), Self::Error>;
+    fn send_shootdown_ipi(&mut self, cpu_id: usize, address: VirtAddr) -> Result<(), Self::Error>;
 
     /// Waits for the specified CPU's acknowledgement. Implementations must
     /// use a bounded timeout and acquire the handler's completion publication;
     /// it must not report success before invalidation has completed on that CPU.
+    /// Acknowledgements must be matched to the request that produced them
+    /// (for example with a per-request sequence number), so a late ack from an
+    /// aborted shootdown can never satisfy a newer one.
     fn wait_for_ack(&mut self, cpu_id: usize) -> Result<(), Self::Error>;
 }
 
@@ -46,8 +45,16 @@ pub enum ShootdownError<E> {
     InvalidCpuId,
     CurrentCpuNotOnline,
     LocalInvalidation(E),
-    SendFailed { cpu_id: usize, pending_mask: u64, source: E },
-    AckFailed { cpu_id: usize, pending_mask: u64, source: E },
+    SendFailed {
+        cpu_id: usize,
+        pending_mask: u64,
+        source: E,
+    },
+    AckFailed {
+        cpu_id: usize,
+        pending_mask: u64,
+        source: E,
+    },
 }
 
 /// Coordinates local invalidation, remote IPIs, and acknowledgements.
@@ -77,23 +84,32 @@ impl TlbShootdown {
             .invalidate_local(address)
             .map_err(ShootdownError::LocalInvalidation)?;
 
-        let mut pending = online & !current_bit;
-        let mut send_mask = pending;
+        let remote = online & !current_bit;
+        let mut sent = 0u64;
+        let mut send_mask = remote;
         while send_mask != 0 {
             let cpu_id = send_mask.trailing_zeros() as usize;
             send_mask &= !(1u64 << cpu_id);
             if let Err(source) = transport.send_shootdown_ipi(cpu_id, address) {
+                // Drain the IPIs that were already delivered so their
+                // acknowledgements cannot leak into a later shootdown, then
+                // report every CPU that has not confirmed invalidation.
+                let unconfirmed = Self::drain_acks(transport, sent);
                 return Err(ShootdownError::SendFailed {
                     cpu_id,
-                    pending_mask: pending,
+                    pending_mask: (remote & !sent) | unconfirmed,
                     source,
                 });
             }
+            sent |= 1u64 << cpu_id;
         }
 
+        let mut pending = remote;
         while pending != 0 {
             let cpu_id = pending.trailing_zeros() as usize;
             if let Err(source) = transport.wait_for_ack(cpu_id) {
+                // Only CPUs that have not acknowledged yet may still hold a
+                // stale translation.
                 return Err(ShootdownError::AckFailed {
                     cpu_id,
                     pending_mask: pending,
@@ -104,6 +120,19 @@ impl TlbShootdown {
         }
 
         Ok(())
+    }
+
+    /// Waits for every CPU in `mask`; returns the CPUs that failed to ack.
+    fn drain_acks<T: TlbShootdownTransport>(transport: &mut T, mut mask: u64) -> u64 {
+        let mut unconfirmed = 0u64;
+        while mask != 0 {
+            let cpu_id = mask.trailing_zeros() as usize;
+            mask &= !(1u64 << cpu_id);
+            if transport.wait_for_ack(cpu_id).is_err() {
+                unconfirmed |= 1u64 << cpu_id;
+            }
+        }
+        unconfirmed
     }
 }
 
@@ -132,21 +161,33 @@ mod tests {
     impl TlbShootdownTransport for MockTransport {
         type Error = MockError;
 
-        fn current_cpu_id(&self) -> usize { self.current }
-        fn online_cpu_mask(&self) -> u64 { self.online }
+        fn current_cpu_id(&self) -> usize {
+            self.current
+        }
+        fn online_cpu_mask(&self) -> u64 {
+            self.online
+        }
 
         fn invalidate_local(&mut self, _: VirtAddr) -> Result<(), Self::Error> {
-            if self.fail_local { Err(MockError::Local) } else { Ok(()) }
+            if self.fail_local {
+                Err(MockError::Local)
+            } else {
+                Ok(())
+            }
         }
 
         fn send_shootdown_ipi(&mut self, cpu_id: usize, _: VirtAddr) -> Result<(), Self::Error> {
-            if self.fail_send == Some(cpu_id) { return Err(MockError::Send); }
+            if self.fail_send == Some(cpu_id) {
+                return Err(MockError::Send);
+            }
             self.sent |= 1u64 << cpu_id;
             Ok(())
         }
 
         fn wait_for_ack(&mut self, cpu_id: usize) -> Result<(), Self::Error> {
-            if self.fail_ack == Some(cpu_id) { return Err(MockError::Ack); }
+            if self.fail_ack == Some(cpu_id) {
+                return Err(MockError::Ack);
+            }
             self.acked |= 1u64 << cpu_id;
             Ok(())
         }
@@ -184,10 +225,12 @@ mod tests {
             TlbShootdown::invalidate(&mut transport, address),
             Err(ShootdownError::SendFailed {
                 cpu_id: 2,
-                pending_mask: 0b1110,
+                pending_mask: 0b1100,
                 source: MockError::Send,
             })
         );
+        // CPU 1 already received its IPI: its ack must be consumed now.
+        assert_eq!(transport.acked, 0b0010);
     }
 
     #[test]
@@ -200,7 +243,7 @@ mod tests {
             TlbShootdown::invalidate(&mut transport, address),
             Err(ShootdownError::AckFailed {
                 cpu_id: 2,
-                pending_mask: 0b1110,
+                pending_mask: 0b1100,
                 source: MockError::Ack,
             })
         );

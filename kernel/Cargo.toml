@@ -11,3 +11,11 @@ centinela-security = { path = "../security" }
 
 [lints]
 workspace = true
+
+# The freestanding kernel binary defines its own panic handler and entry point,
+# so it cannot be built as a host test harness; unit tests live in the library.
+[[bin]]
+name = "centinela-kernel"
+path = "src/main.rs"
+test = false
+bench = false

@@ -6,11 +6,17 @@
 use super::pmm::{Pmm, PmmError};
 
 /// A physical frame exclusively owned by the page-table subsystem.
+///
+/// This is a linear ownership token: it is neither `Copy` nor `Clone`, and it
+/// must be handed back through `PageTableFrameAllocator::release`.
 #[derive(Debug, Eq, PartialEq)]
+#[must_use = "dropping a PageTableFrame leaks the physical frame"]
 pub struct PageTableFrame(u64);
 
 impl PageTableFrame {
-    pub const fn physical_address(self) -> u64 {
+    /// Borrows the address without consuming the ownership token (taking
+    /// `self` by value made the frame impossible to release afterwards).
+    pub const fn physical_address(&self) -> u64 {
         self.0
     }
 }

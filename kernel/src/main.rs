@@ -9,10 +9,10 @@ use core::ptr::{addr_of, addr_of_mut};
 use centinela_hal::cpu::{
     CpuHardeningError, current_page_table_root, enable_boot_hardening, halt_forever,
 };
-use centinela_hal::serial::{init as serial_init, write as serial_write};
+use centinela_hal::serial::{SerialWriter, init as serial_init, write as serial_write};
 use centinela_kernel::memory::pmm::{BITMAP_WORDS, LimineMemoryMapResponse, Pmm};
 use centinela_kernel::memory::vmm::{
-    BootPagingInfo, HhdmOffset, HhdmPageTableMemory, PageTableWalker, VirtAddr,
+    BootPagingInfo, HhdmOffset, HhdmPageTableMemory, PageTableMemory, PageTableWalker, VirtAddr,
 };
 
 const LIMINE_COMMON_MAGIC: [u64; 2] = [0xc7b1_dd30_df4c_8b88, 0x0a82_e883_a194_f07b];
@@ -39,18 +39,26 @@ struct LimineHhdmResponse {
 }
 
 #[repr(C)]
+struct LimineExecutableAddressResponse {
+    revision: u64,
+    physical_base: u64,
+    virtual_base: u64,
+}
+
+#[repr(C)]
 struct LimineRequests {
     start_marker: [u64; 4],
     base_revision: [u64; 3],
     stack_size: LimineStackSizeRequest,
     hhdm: LimineRequest,
     memory_map: LimineRequest,
+    executable_address: LimineRequest,
     end_marker: [u64; 2],
 }
 
 unsafe extern "C" {
-    static __kernel_phys_start: u8;
-    static __kernel_phys_end: u8;
+    static __kernel_virt_start: u8;
+    static __kernel_virt_end: u8;
 }
 
 #[used]
@@ -90,6 +98,18 @@ static mut LIMINE_REQUESTS: LimineRequests = LimineRequests {
             LIMINE_COMMON_MAGIC[1],
             0x67cf_3d9d_378a_806f,
             0xe304_acdf_c50c_3c62,
+        ],
+        revision: 0,
+        response: core::ptr::null_mut(),
+    },
+    // Limine picks the kernel's physical load address; this response is the
+    // authoritative source for the physical range the PMM must reserve.
+    executable_address: LimineRequest {
+        id: [
+            LIMINE_COMMON_MAGIC[0],
+            LIMINE_COMMON_MAGIC[1],
+            0x71ba_7686_3cc5_5f63,
+            0xb264_4a48_c516_a487,
         ],
         revision: 0,
         response: core::ptr::null_mut(),
@@ -203,15 +223,19 @@ fn initialize_memory() -> bool {
 
     // Record the bootloader-owned paging root without switching CR3.
     // The active page tables remain unchanged.
+    // SAFETY: BOOT_PAGING_INFO is written exactly once during single-core
+    // bootstrap, before any reader exists.
     unsafe {
         addr_of_mut!(BOOT_PAGING_INFO).write(MaybeUninit::new(paging_info));
     }
 
-    // The linker exports physical load boundaries, including the PMM bitmap
-    // in BSS, so the allocator cannot hand kernel-owned frames back to callers.
-    // addr_of! obtains linker-symbol addresses without reading their contents.
-    let kernel_start = addr_of!(__kernel_phys_start) as u64;
-    let kernel_end = addr_of!(__kernel_phys_end) as u64;
+    // Limine chooses the physical load address, so the reserved range comes
+    // from the executable-address response (not a link-time constant) and is
+    // cross-checked against the live page tables. The image size, including
+    // the PMM bitmaps in BSS, comes from linker-exported virtual bounds.
+    let Some((kernel_start, kernel_end)) = kernel_physical_range(&walker) else {
+        return false;
+    };
 
     // SAFETY: The bitmap is a unique static buffer. The kernel is single-core
     // and interrupts are not enabled at this bootstrap stage.
@@ -257,12 +281,76 @@ fn initialize_memory() -> bool {
     true
 }
 
+/// Returns the kernel image's physical `[start, end)` range, or `None` after
+/// logging why the executable-address response could not be trusted.
+fn kernel_physical_range<M: PageTableMemory>(
+    walker: &PageTableWalker<'_, M>,
+) -> Option<(u64, u64)> {
+    // SAFETY: Reads a bootloader-populated pointer without creating a
+    // reference to the mutable request structure.
+    let response = unsafe {
+        addr_of!(LIMINE_REQUESTS.executable_address.response)
+            .read_volatile()
+            .cast::<LimineExecutableAddressResponse>()
+    };
+    if response.is_null() {
+        serial_write("Centinela-OS: Limine executable-address response missing.\r\n");
+        return None;
+    }
+    // SAFETY: Limine keeps the response valid and immutable during boot.
+    let (revision, physical_base, virtual_base) = unsafe {
+        (
+            addr_of!((*response).revision).read(),
+            addr_of!((*response).physical_base).read(),
+            addr_of!((*response).virtual_base).read(),
+        )
+    };
+
+    // addr_of! obtains linker-symbol addresses without reading their contents.
+    let virt_start = addr_of!(__kernel_virt_start) as u64;
+    let virt_end = addr_of!(__kernel_virt_end) as u64;
+    let image_size = virt_end.checked_sub(virt_start).filter(|size| *size > 0);
+    let physical_end = image_size.and_then(|size| physical_base.checked_add(size));
+    let (Some(_), Some(physical_end)) = (image_size, physical_end) else {
+        serial_write("Centinela-OS: invalid kernel image bounds.\r\n");
+        return None;
+    };
+    if revision != 0
+        || physical_base == 0
+        || physical_base & 0xfff != 0
+        || virtual_base != virt_start
+    {
+        serial_write("Centinela-OS: unexpected executable-address response.\r\n");
+        return None;
+    }
+
+    // The response must agree with what the CPU actually translates, at both
+    // ends of the image (this also proves the physical placement is linear).
+    let translate = |virtual_address: u64| {
+        VirtAddr::new(virtual_address)
+            .ok()
+            .and_then(|address| walker.translate(address).ok())
+            .map(|translation| translation.physical_address)
+    };
+    if translate(virt_start) != Some(physical_base)
+        || translate(virt_end - 1) != Some(physical_end - 1)
+    {
+        serial_write("Centinela-OS: kernel physical base does not match page tables.\r\n");
+        return None;
+    }
+    serial_write("Kernel image: physical range verified against page tables.\r\n");
+    Some((physical_base, physical_end))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    serial_init();
+    // Best effort: without a UART the boot continues silently instead of hanging.
+    let _ = serial_init();
     serial_write("\r\nCentinela-OS: Rust kernel entry reached.\r\n");
 
-    match enable_boot_hardening() {
+    // SAFETY: Ring 0, bootstrap CPU, interrupts disabled (Limine hands off with
+    // IF clear) and only supervisor mappings exist at this point.
+    match unsafe { enable_boot_hardening() } {
         Ok(features) => {
             serial_write("CPU hardening: NXE enabled.\r\n");
             if features.write_protect {
@@ -286,6 +374,10 @@ pub extern "C" fn _start() -> ! {
             serial_write("Centinela-OS: CPU hardening register verification failed.\r\n");
             halt_forever();
         }
+        Err(CpuHardeningError::UnsupportedPagingMode) => {
+            serial_write("Centinela-OS: 5-level paging is active but unsupported.\r\n");
+            halt_forever();
+        }
     }
 
     if !initialize_memory() {
@@ -298,7 +390,16 @@ pub extern "C" fn _start() -> ! {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo<'_>) -> ! {
+fn panic(info: &PanicInfo<'_>) -> ! {
+    use core::fmt::Write;
+
     serial_write("\r\nCentinela-OS: PANIC. System halted.\r\n");
+    // Location and message make field failures diagnosable. Formatting errors
+    // are ignored: the halt below must happen regardless.
+    let mut writer = SerialWriter;
+    if let Some(location) = info.location() {
+        let _ = write!(writer, "  at {}:{}\r\n", location.file(), location.line());
+    }
+    let _ = write!(writer, "  {}\r\n", info.message());
     halt_forever()
 }

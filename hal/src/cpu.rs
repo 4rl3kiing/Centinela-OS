@@ -6,6 +6,7 @@ const EFER_NXE: u64 = 1 << 11;
 const CR0_WP: u64 = 1 << 16;
 
 const CR4_UMIP: u64 = 1 << 11;
+const CR4_LA57: u64 = 1 << 12;
 const CR4_SMEP: u64 = 1 << 20;
 const CR4_SMAP: u64 = 1 << 21;
 
@@ -22,6 +23,8 @@ pub struct CpuHardening {
 pub enum CpuHardeningError {
     NxUnsupported,
     FeatureEnableFailed,
+    /// 5-level paging is active; the VMM only implements 4-level paging.
+    UnsupportedPagingMode,
 }
 
 /// Detects supported CPU features and enables NXE, UMIP, SMEP and SMAP.
@@ -33,24 +36,27 @@ pub enum CpuHardeningError {
 ///
 /// Unsupported optional CR4 features are left disabled. NX is mandatory and
 /// failure to enable it aborts bootstrap.
-pub fn enable_boot_hardening() -> Result<CpuHardening, CpuHardeningError> {
-    // SAFETY: CPUID is available on all x86_64 processors.
+///
+/// # Safety
+/// Must run at CPL 0 on the bootstrap CPU with interrupts disabled, while every
+/// active mapping is a supervisor mapping (SMAP/SMEP would otherwise fault).
+pub unsafe fn enable_boot_hardening() -> Result<CpuHardening, CpuHardeningError> {
+    // CPUID is architecturally available on every x86_64 processor.
     let basic = core::arch::x86_64::__cpuid(0);
     let leaf7_supported = basic.eax >= 7;
-    let leaf7 = if leaf7_supported {
-        // SAFETY: The maximum basic leaf advertises leaf 7.
-        core::arch::x86_64::__cpuid_count(7, 0)
+    let (leaf7_ebx, leaf7_ecx) = if leaf7_supported {
+        let leaf7 = core::arch::x86_64::__cpuid_count(7, 0);
+        (leaf7.ebx, leaf7.ecx)
     } else {
-        // No feature bits are advertised when the leaf is unavailable.
-        core::arch::x86_64::__cpuid(0)
+        // No structured feature bits exist when leaf 7 is unavailable.
+        (0, 0)
     };
 
-    // SAFETY: Query the maximum supported extended CPUID leaf first.
+    // Query the maximum supported extended CPUID leaf first.
     let extended = core::arch::x86_64::__cpuid(0x8000_0000);
     if extended.eax < 0x8000_0001 {
         return Err(CpuHardeningError::NxUnsupported);
     }
-    // SAFETY: The maximum extended leaf confirms this leaf exists.
     let extended_features = core::arch::x86_64::__cpuid(0x8000_0001);
     let nx_supported = (extended_features.edx & (1 << 20)) != 0;
     if !nx_supported {
@@ -79,7 +85,9 @@ pub fn enable_boot_hardening() -> Result<CpuHardening, CpuHardeningError> {
             in("ecx") IA32_EFER,
             in("eax") efer as u32,
             in("edx") (efer >> 32) as u32,
-            options(nomem, nostack, preserves_flags)
+            // No `nomem`: changing paging semantics must also be a compiler
+            // memory barrier so no access is reordered across it.
+            options(nostack, preserves_flags)
         );
     }
     let verified_efer_low: u32;
@@ -109,7 +117,8 @@ pub fn enable_boot_hardening() -> Result<CpuHardening, CpuHardeningError> {
     cr0 |= CR0_WP;
     // SAFETY: Preserve existing CR0 state and set only the architectural WP bit.
     unsafe {
-        core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack, preserves_flags));
+        // No `nomem`: CR0.WP changes write semantics (compiler barrier).
+        core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nostack, preserves_flags));
     }
     let verified_cr0: u64;
     // SAFETY: Read back CR0 to confirm supervisor write protection is active.
@@ -131,9 +140,14 @@ pub fn enable_boot_hardening() -> Result<CpuHardening, CpuHardeningError> {
         core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
     }
 
-    let umip = leaf7_supported && (leaf7.ecx & (1 << 2)) != 0;
-    let smep = leaf7_supported && (leaf7.ebx & (1 << 7)) != 0;
-    let smap = leaf7_supported && (leaf7.ebx & (1 << 20)) != 0;
+    if cr4 & CR4_LA57 != 0 {
+        // Address validation and page walks assume 48-bit canonical addresses.
+        return Err(CpuHardeningError::UnsupportedPagingMode);
+    }
+
+    let umip = (leaf7_ecx & (1 << 2)) != 0;
+    let smep = (leaf7_ebx & (1 << 7)) != 0;
+    let smap = (leaf7_ebx & (1 << 20)) != 0;
     if umip {
         cr4 |= CR4_UMIP;
     }
@@ -146,7 +160,8 @@ pub fn enable_boot_hardening() -> Result<CpuHardening, CpuHardeningError> {
 
     // SAFETY: Only set CR4 feature bits advertised by CPUID; preserve other bits.
     unsafe {
-        core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
+        // No `nomem`: SMEP/SMAP change memory-access semantics (compiler barrier).
+        core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
     }
     let verified_cr4: u64;
     // SAFETY: Read back CR4 to confirm all advertised hardening bits were set.
@@ -239,11 +254,14 @@ pub fn current_page_table_root() -> u64 {
     value & 0x000f_ffff_ffff_f000
 }
 
-
 const fn is_canonical_address(address: u64) -> bool {
     let sign = (address >> 47) & 1;
     let upper = address >> 48;
-    if sign == 0 { upper == 0 } else { upper == 0xffff }
+    if sign == 0 {
+        upper == 0
+    } else {
+        upper == 0xffff
+    }
 }
 
 #[cfg(test)]
@@ -258,4 +276,3 @@ mod tlb_tests {
         assert!(!is_canonical_address(0xffff_7fff_ffff_ffff));
     }
 }
-

@@ -14,7 +14,9 @@ PHDRS
 
 SECTIONS
 {
-    __kernel_phys_start = KERNEL_LMA;
+    /* Limine chooses the physical load address; the kernel obtains it from
+       the executable-address response. Only virtual bounds are exported. */
+    __kernel_virt_start = KERNEL_VMA;
     . = KERNEL_VMA;
 
     .text ALIGN(4K) : AT(KERNEL_LMA)
@@ -23,6 +25,8 @@ SECTIONS
         *(.text .text.*)
     } :text
 
+    /* Limine writes request responses before entry; afterwards the kernel only
+       reads them, so keeping them in the read-only segment blocks tampering. */
     .rodata ALIGN(4K) : AT(ALIGN(LOADADDR(.text) + SIZEOF(.text), 4K))
     {
         KEEP(*(.limine_requests))
@@ -40,7 +44,7 @@ SECTIONS
         *(.bss .bss.*)
     } :data
 
-    __kernel_phys_end = LOADADDR(.bss) + SIZEOF(.bss);
+    __kernel_virt_end = ADDR(.bss) + SIZEOF(.bss);
 
     /DISCARD/ :
     {

@@ -4,8 +4,16 @@
 //! complete kernel entropy pool or a cryptographic random-number generator.
 //! Callers must mix independent entropy sources and handle instruction failure.
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
 const RDRAND_RETRIES: usize = 10;
 const RDSEED_RETRIES: usize = 10;
+
+/// Cached CPUID result: 0 = not yet probed, otherwise FEATURES_PROBED | bits.
+static FEATURE_CACHE: AtomicU8 = AtomicU8::new(0);
+const FEATURES_PROBED: u8 = 1 << 7;
+const FEATURE_RDRAND: u8 = 1 << 0;
+const FEATURE_RDSEED: u8 = 1 << 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuEntropyFeatures {
@@ -38,12 +46,41 @@ fn decode_features(max_basic_leaf: u32, leaf1_ecx: u32, leaf7_ebx: u32) -> CpuEn
     }
 }
 
+/// Returns cached entropy features, executing CPUID at most once per boot
+/// (CPUID is serializing and traps to the hypervisor inside virtual machines).
+fn cached_features() -> CpuEntropyFeatures {
+    let cached = FEATURE_CACHE.load(Ordering::Relaxed);
+    if cached & FEATURES_PROBED != 0 {
+        return CpuEntropyFeatures {
+            rdrand: cached & FEATURE_RDRAND != 0,
+            rdseed: cached & FEATURE_RDSEED != 0,
+        };
+    }
+    let features = detect_cpu_entropy();
+    let mut bits = FEATURES_PROBED;
+    if features.rdrand {
+        bits |= FEATURE_RDRAND;
+    }
+    if features.rdseed {
+        bits |= FEATURE_RDSEED;
+    }
+    FEATURE_CACHE.store(bits, Ordering::Relaxed);
+    features
+}
+
+/// Rejects samples known to come from defective implementations: several AMD
+/// generations returned all-ones with CF=1 after suspend/resume or with buggy
+/// microcode. All-zeros is rejected for the same fail-closed reason.
+const fn is_plausible_sample(value: u64) -> bool {
+    value != 0 && value != u64::MAX
+}
+
 /// Returns one RDSEED sample, retrying a bounded number of times.
 ///
 /// RDSEED can temporarily fail while its hardware conditioner is depleted.
 /// Failure is represented as `None`; this function never spins indefinitely.
 pub fn rdseed_u64() -> Option<u64> {
-    if !detect_cpu_entropy().rdseed {
+    if !cached_features().rdseed {
         return None;
     }
 
@@ -60,9 +97,10 @@ pub fn rdseed_u64() -> Option<u64> {
                 options(nomem, nostack)
             );
         }
-        if ready != 0 {
+        if ready != 0 && is_plausible_sample(value) {
             return Some(value);
         }
+        core::hint::spin_loop();
     }
 
     None
@@ -73,7 +111,7 @@ pub fn rdseed_u64() -> Option<u64> {
 /// RDRAND output must be mixed with other entropy sources before it is used
 /// for security-sensitive key generation or address-space randomization.
 pub fn rdrand_u64() -> Option<u64> {
-    if !detect_cpu_entropy().rdrand {
+    if !cached_features().rdrand {
         return None;
     }
 
@@ -90,9 +128,10 @@ pub fn rdrand_u64() -> Option<u64> {
                 options(nomem, nostack)
             );
         }
-        if ready != 0 {
+        if ready != 0 && is_plausible_sample(value) {
             return Some(value);
         }
+        core::hint::spin_loop();
     }
 
     None
@@ -100,7 +139,14 @@ pub fn rdrand_u64() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CpuEntropyFeatures, decode_features};
+    use super::{CpuEntropyFeatures, decode_features, is_plausible_sample};
+
+    #[test]
+    fn rejects_stuck_hardware_samples() {
+        assert!(!is_plausible_sample(u64::MAX));
+        assert!(!is_plausible_sample(0));
+        assert!(is_plausible_sample(0x1234_5678_9abc_def0));
+    }
 
     #[test]
     fn detects_rdrand_and_rdseed_only_when_their_leaves_exist() {

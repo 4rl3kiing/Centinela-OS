@@ -30,8 +30,11 @@ impl Rights {
     }
 }
 
-/// A typed, opaque handle. Its generation prevents stale-handle reuse.
+/// A typed, opaque handle. Its generation prevents stale-handle reuse and its
+/// table identifier prevents a handle minted by one table from resolving in
+/// another table of the same type (cross-task confused-deputy attacks).
 pub struct CapabilityHandle<T> {
+    table_id: u32,
     slot: u16,
     generation: u32,
     marker: PhantomData<fn() -> T>,
@@ -47,7 +50,9 @@ impl<T> Clone for CapabilityHandle<T> {
 
 impl<T> PartialEq for CapabilityHandle<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.slot == other.slot && self.generation == other.generation
+        self.table_id == other.table_id
+            && self.slot == other.slot
+            && self.generation == other.generation
     }
 }
 
@@ -57,6 +62,7 @@ impl<T> core::fmt::Debug for CapabilityHandle<T> {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
             .debug_struct("CapabilityHandle")
+            .field("table_id", &self.table_id)
             .field("slot", &self.slot)
             .field("generation", &self.generation)
             .finish()
@@ -82,7 +88,11 @@ impl<T> Slot<T> {
 }
 
 /// A no-allocation capability table for one resource type.
+///
+/// Every table must receive a unique `table_id` from the kernel object that
+/// owns it (for example, the task ID); handles from other tables are rejected.
 pub struct CapabilityTable<T, const N: usize> {
+    table_id: u32,
     slots: [Slot<T>; N],
 }
 
@@ -96,11 +106,12 @@ pub enum TableError {
 }
 
 impl<T, const N: usize> CapabilityTable<T, N> {
-    pub fn new() -> Result<Self, TableError> {
+    pub fn new(table_id: u32) -> Result<Self, TableError> {
         if N > u16::MAX as usize {
             return Err(TableError::CapacityTooLarge);
         }
         Ok(Self {
+            table_id,
             slots: core::array::from_fn(|_| Slot::empty()),
         })
     }
@@ -115,6 +126,7 @@ impl<T, const N: usize> CapabilityTable<T, N> {
                 slot.value = Some(value);
                 slot.rights = rights;
                 return Ok(CapabilityHandle {
+                    table_id: self.table_id,
                     slot: index as u16,
                     generation: slot.generation,
                     marker: PhantomData,
@@ -161,6 +173,9 @@ impl<T, const N: usize> CapabilityTable<T, N> {
     }
 
     fn validated_slot(&self, handle: CapabilityHandle<T>) -> Result<&Slot<T>, TableError> {
+        if handle.table_id != self.table_id {
+            return Err(TableError::InvalidHandle);
+        }
         let slot = self
             .slots
             .get(handle.slot as usize)
@@ -175,6 +190,9 @@ impl<T, const N: usize> CapabilityTable<T, N> {
         &mut self,
         handle: CapabilityHandle<T>,
     ) -> Result<&mut Slot<T>, TableError> {
+        if handle.table_id != self.table_id {
+            return Err(TableError::InvalidHandle);
+        }
         let slot = self
             .slots
             .get_mut(handle.slot as usize)
@@ -192,7 +210,7 @@ mod tests {
 
     #[test]
     fn typed_handles_enforce_rights() {
-        let mut table = CapabilityTable::<u64, 4>::new().expect("valid capacity");
+        let mut table = CapabilityTable::<u64, 4>::new(1).expect("valid capacity");
         let handle = table
             .insert(0xfeed, Rights::READ.union(Rights::WRITE))
             .expect("slot available");
@@ -222,7 +240,7 @@ mod tests {
 
     #[test]
     fn removed_handles_cannot_access_reused_slots() {
-        let mut table = CapabilityTable::<u32, 1>::new().expect("valid capacity");
+        let mut table = CapabilityTable::<u32, 1>::new(1).expect("valid capacity");
         let stale = table
             .insert(7, Rights::READ.union(Rights::CONTROL))
             .expect("slot available");
@@ -240,8 +258,25 @@ mod tests {
     }
 
     #[test]
+    fn handles_from_another_table_are_rejected() {
+        let mut task_a = CapabilityTable::<u32, 1>::new(1).expect("valid capacity");
+        let mut task_b = CapabilityTable::<u32, 1>::new(2).expect("valid capacity");
+        let handle_a = task_a
+            .insert(1, Rights::READ.union(Rights::CONTROL))
+            .expect("slot available");
+        task_b.insert(2, Rights::READ).expect("slot available");
+
+        // Same slot and generation, different table: must not resolve.
+        assert_eq!(
+            task_b.get(handle_a, Rights::READ),
+            Err(TableError::InvalidHandle)
+        );
+        assert_eq!(task_b.remove(handle_a), Err(TableError::InvalidHandle));
+    }
+
+    #[test]
     fn empty_rights_and_full_tables_are_rejected() {
-        let mut table = CapabilityTable::<u8, 1>::new().expect("valid capacity");
+        let mut table = CapabilityTable::<u8, 1>::new(1).expect("valid capacity");
         assert_eq!(table.insert(1, Rights::NONE), Err(TableError::EmptyRights));
         table.insert(1, Rights::READ).expect("slot available");
         assert_eq!(table.insert(2, Rights::READ), Err(TableError::Full));

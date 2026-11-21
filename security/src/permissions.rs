@@ -1,11 +1,16 @@
 //! Memory permission policy shared by paging and executable-loading code.
 
+/// Validated page permissions.
+///
+/// Fields are private so the W^X invariant cannot be bypassed with a struct
+/// literal: the only constructor is [`PagePermissions::new`], which rejects
+/// writable+executable combinations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PagePermissions {
-    pub readable: bool,
-    pub writable: bool,
-    pub executable: bool,
-    pub user_accessible: bool,
+    readable: bool,
+    writable: bool,
+    executable: bool,
+    user_accessible: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,6 +38,23 @@ impl PagePermissions {
         })
     }
 
+    pub const fn readable(self) -> bool {
+        self.readable
+    }
+
+    pub const fn writable(self) -> bool {
+        self.writable
+    }
+
+    pub const fn executable(self) -> bool {
+        self.executable
+    }
+
+    pub const fn user_accessible(self) -> bool {
+        self.user_accessible
+    }
+
+    /// Always true for values of this type; kept as an explicit audit hook.
     pub const fn is_write_xor_execute(self) -> bool {
         !(self.writable && self.executable)
     }
@@ -70,10 +92,13 @@ mod verification {
         let user_accessible: bool = kani::any();
 
         let result = PagePermissions::new(readable, writable, executable, user_accessible);
-        assert_eq!(result.is_ok(), !(writable && executable),);
-        if let Err(error) = result {
-            assert_eq!(error, PermissionError::WriteExecuteViolation);
-            assert!(writable && executable);
+        assert_eq!(result.is_ok(), !(writable && executable));
+        match result {
+            Ok(permissions) => assert!(permissions.is_write_xor_execute()),
+            Err(error) => {
+                assert_eq!(error, PermissionError::WriteExecuteViolation);
+                assert!(writable && executable);
+            }
         }
     }
 }
