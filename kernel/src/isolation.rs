@@ -38,11 +38,14 @@ const USER_STACK_PAGES: u64 = 4;
 /// Kernel-only virtual address of the local APIC registers (PML4 slot 511,
 /// shared supervisor-only by every address space; outside HHDM and image).
 const APIC_MMIO_VIRTUAL: u64 = 0xffff_ffff_7000_0000;
-/// APIC timer reload (bus clock / 16). Uncalibrated: one tick is about 16 ms
-/// on QEMU and longer on real buses; the budget is expressed in ticks.
-const WATCHDOG_INITIAL_COUNT: u32 = 1_000_000;
-/// CPU budget per task, in watchdog ticks.
-pub(crate) const CPU_BUDGET_TICKS: u32 = 50;
+/// Scheduler/watchdog tick length; the APIC timer is calibrated against the
+/// PIT so this is real time, not bus-clock dependent.
+pub(crate) const TICK_MS: u32 = 10;
+/// Total CPU time a task may consume before the watchdog terminates it.
+pub(crate) const CPU_BUDGET_MS: u32 = 2_000;
+pub(crate) const CPU_BUDGET_TICKS: u32 = CPU_BUDGET_MS / TICK_MS;
+/// Fallback reload if calibration fails (QEMU's 1 GHz bus / 16 ≈ 10 ms).
+const FALLBACK_INITIAL_COUNT: u32 = 625_000;
 
 /// A kernel stack preceded by a page that is unmapped at boot, so overflow
 /// faults instead of silently corrupting adjacent kernel data.
@@ -140,7 +143,21 @@ pub fn init_cpu_layer(memory: &mut HhdmFrameMemory<'_, '_>, kernel_root: PhysAdd
         gdt::init(stacks);
         idt::init(crate::system::trap_handler);
         syscall::init(crate::system::syscall_handler);
-        apic::init(APIC_MMIO_VIRTUAL, WATCHDOG_INITIAL_COUNT);
+        let per_ms = apic::calibrate(APIC_MMIO_VIRTUAL);
+        let reload = per_ms
+            .map(|counts| (counts * u64::from(TICK_MS)).min(u64::from(u32::MAX)) as u32)
+            .unwrap_or(FALLBACK_INITIAL_COUNT);
+        apic::init(APIC_MMIO_VIRTUAL, reload);
+        let mut writer = SerialWriter;
+        match per_ms {
+            Some(counts) => {
+                let _ = write!(
+                    writer,
+                    "Isolation: APIC timer calibrated against PIT: {counts} counts/ms; {TICK_MS} ms ticks.\r\n"
+                );
+            }
+            None => serial_write("Isolation: APIC calibration failed; using fallback tick.\r\n"),
+        }
     }
     serial_write("Isolation: GDT/TSS loaded (IST for #DF, NMI, #MC; no I/O bitmap).\r\n");
     serial_write("Isolation: IDT loaded; all gates DPL 0; Ring 0 faults fail closed.\r\n");

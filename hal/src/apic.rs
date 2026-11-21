@@ -24,7 +24,21 @@ pub const REG_LVT_TIMER: usize = 0x320;
 pub const REG_LVT_LINT0: usize = 0x350;
 pub const REG_LVT_ERROR: usize = 0x370;
 pub const REG_TIMER_INITIAL: usize = 0x380;
+pub const REG_TIMER_CURRENT: usize = 0x390;
 pub const REG_TIMER_DIVIDE: usize = 0x3E0;
+
+/// PIT input clock (Hz) and the calibration window.
+pub const PIT_FREQUENCY: u64 = 1_193_182;
+pub const CALIBRATION_MS: u64 = 10;
+
+/// APIC timer counts per millisecond from a calibration measurement.
+pub const fn counts_per_ms(elapsed_counts: u64, window_ms: u64) -> u64 {
+    if window_ms == 0 {
+        0
+    } else {
+        elapsed_counts / window_ms
+    }
+}
 
 #[cfg_attr(not(target_os = "none"), allow(dead_code))]
 const SVR_ENABLE: u32 = 1 << 8;
@@ -106,6 +120,61 @@ mod runtime {
         }
     }
 
+    fn read(register: usize) -> u32 {
+        let base = MMIO_BASE.load(Ordering::Relaxed);
+        // SAFETY: Same mapping contract as `write`.
+        unsafe { core::ptr::read_volatile((base as usize + register) as *const u32) }
+    }
+
+    fn inb(port: u16) -> u8 {
+        let value: u8;
+        // SAFETY: CPL 0; fixed legacy PIT/system-control ports.
+        unsafe {
+            core::arch::asm!("in al, dx", in("dx") port, out("al") value,
+                options(nomem, nostack, preserves_flags));
+        }
+        value
+    }
+
+    /// Measures APIC timer counts per millisecond against PIT channel 2
+    /// (fixed 1.193182 MHz clock, polled; no interrupts involved).
+    ///
+    /// Returns `None` if the PIT never signals completion (bounded wait).
+    ///
+    /// # Safety
+    /// CPL 0, interrupts disabled; `mmio_virtual` maps the local APIC as for
+    /// [`init`]. Must run before [`init`] (it reprograms the APIC timer).
+    pub unsafe fn calibrate(mmio_virtual: u64) -> Option<u64> {
+        MMIO_BASE.store(mmio_virtual, Ordering::Relaxed);
+        write(REG_TIMER_DIVIDE, TIMER_DIVIDE_BY_16);
+        write(REG_LVT_TIMER, LVT_MASKED);
+        // Gate channel 2 off, speaker off, then program a one-shot count.
+        let control = inb(0x61) & !0x03;
+        outb(0x61, control);
+        let reload = (PIT_FREQUENCY * CALIBRATION_MS / 1000) as u16;
+        outb(0x43, 0xB0); // Channel 2, lobyte/hibyte, mode 0.
+        outb(0x42, reload as u8);
+        outb(0x42, (reload >> 8) as u8);
+        write(REG_TIMER_INITIAL, u32::MAX);
+        outb(0x61, control | 0x01); // Gate high: start counting.
+        let mut completed = false;
+        for _ in 0..50_000_000u32 {
+            if inb(0x61) & 0x20 != 0 {
+                completed = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        let remaining = read(REG_TIMER_CURRENT);
+        write(REG_TIMER_INITIAL, 0);
+        outb(0x61, control);
+        if !completed {
+            return None;
+        }
+        let per_ms = counts_per_ms(u64::from(u32::MAX - remaining), CALIBRATION_MS);
+        (per_ms > 0).then_some(per_ms)
+    }
+
     /// Masks the legacy PICs and starts the periodic APIC timer.
     ///
     /// # Safety
@@ -131,7 +200,7 @@ mod runtime {
 }
 
 #[cfg(target_os = "none")]
-pub use runtime::{end_of_interrupt, init, physical_base};
+pub use runtime::{calibrate, end_of_interrupt, init, physical_base};
 
 #[cfg(test)]
 mod tests {
@@ -143,6 +212,13 @@ mod tests {
         assert_eq!(u64::from(lvt & 0xff), TIMER_VECTOR);
         assert_ne!(lvt & (1 << 17), 0);
         assert_eq!(lvt & (1 << 16), 0);
+    }
+
+    #[test]
+    fn calibration_math_is_safe() {
+        use super::counts_per_ms;
+        assert_eq!(counts_per_ms(1_000_000, 10), 100_000);
+        assert_eq!(counts_per_ms(5, 0), 0);
     }
 
     #[test]

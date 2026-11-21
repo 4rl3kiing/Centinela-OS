@@ -27,6 +27,7 @@ REQUIRED_MESSAGES=(
     "Isolation: IDT loaded; all gates DPL 0; Ring 0 faults fail closed."
     "Isolation: SYSCALL gate armed (TF/IF/DF/AC/NT/IOPL masked)."
     "Isolation: legacy PIC IRQs masked; APIC timer watchdog armed."
+    "Isolation: APIC timer calibrated against PIT:"
     "[task hello] hello from an isolated Ring 3 task .[2J"
     "[task hello] kernel pointer rejected with EFAULT"
     "Isolation: 12/12 tasks behaved as required; kernel still running."
