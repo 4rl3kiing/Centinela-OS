@@ -20,6 +20,8 @@ REQUIRED_MESSAGES=(
     "Drivers: 5/5 Ring 3 driver checks passed"
     "Services: 5/5 checks passed"
     "Capabilities: 5/5 badge and revocation checks passed."
+    "Network: 2/2 DMA driver checks passed; out-of-domain DMA blocked by the IOMMU."
+    "[task e1000-driver] e1000: link up; ARP reply from 10.0.2.2 at 52:55:0a:00:02:02"
     "[task shell] cat nota.txt: microkernel con capacidades"
     "[task shell] net: udp loopback echo 'ping' ok"
     "[task fs-fuzzer] fs-fuzzer: 8/8 malformed requests rejected by ramfs"
@@ -42,7 +44,7 @@ REQUIRED_MESSAGES=(
     "[task hello] kernel pointer rejected with EFAULT"
     "Isolation: 12/12 tasks behaved as required; kernel still running."
     "Scheduler: preemptive time slicing verified (both CPU-bound tasks finished)."
-    "Boot modules: 11 verified by the boot chain."
+    "Boot modules: 12 verified by the boot chain."
     "[task elf-hello] hello from a Rust ELF loaded from a verified boot module"
     "[task elf-hello] mapped 2 zeroed anonymous RW pages with MapMemory"
     "ELF loader: refused elf-wx: segment both writable and executable (W^X); nothing was mapped or executed."
@@ -90,7 +92,7 @@ run_and_check() {
     local stderr="build/logs/qemu-$mode.stderr"
     : >"$log"
     set +e
-    timeout "$TIMEOUT_SECONDS" "$QEMU" -machine q35 -m 512M -smp 4 -device intel-iommu -display none -monitor none \
+    timeout "$TIMEOUT_SECONDS" "$QEMU" -machine q35 -m 512M -smp 4 -device intel-iommu -device e1000,netdev=n0 -netdev user,id=n0 -display none -monitor none \
         -serial "file:$log" -serial null \
         -chardev "file,id=shellin,path=/dev/null,input-path=$SHELL_INPUT" -serial chardev:shellin \
         -no-reboot -no-shutdown "$@" >"$stderr" 2>&1

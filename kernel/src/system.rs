@@ -28,7 +28,9 @@ use centinela_kernel::ipc::{
 use centinela_kernel::memory::address_space::{create_task_root, destroy_user_address_space};
 use centinela_kernel::memory::hhdm_backend::{HhdmFrameMemory, HhdmReader};
 use centinela_kernel::memory::usercopy::copy_from_user;
-use centinela_kernel::memory::vmm::{HhdmOffset, PAGE_SIZE, PageTableWalker, PhysAddr};
+use centinela_kernel::memory::vmm::{
+    HhdmOffset, PAGE_SIZE, PageMapping, PageTableMapper, PageTableWalker, PhysAddr,
+};
 use centinela_security::capabilities::{Capability, CapabilitySet};
 use centinela_security::handles::{CapabilityTable, Rights, TableError};
 use centinela_security::syscall_policy::{
@@ -68,6 +70,12 @@ const MAX_WRITE_LENGTH: u64 = 256;
 const HEAP_BASE: u64 = 0x0000_7000_0000_0000;
 /// Anonymous pages a task may map in total.
 const HEAP_QUOTA_PAGES: u64 = 32;
+/// DMA window in a driver's address space, and its page quota.
+const DMA_BASE: u64 = 0x0000_6000_0000_0000;
+const DMA_QUOTA_PAGES: u64 = 16;
+/// Where a driver's device MMIO window is mapped, and its size limit.
+const MMIO_BASE: u64 = 0x0000_5000_0000_0000;
+const MMIO_LIMIT: u64 = 1 << 20;
 const ENOMEM: u64 = (-12_i64) as u64;
 const EFAULT: u64 = (-14_i64) as u64;
 const EINVAL: u64 = (-22_i64) as u64;
@@ -94,6 +102,7 @@ pub enum DeviceViolation {
     PortOutsideGrant(u16),
     InvalidOperation,
     NoInterruptGrant,
+    NoDmaDomain,
 }
 
 /// Hardware a Ring 3 driver may touch, granted by the kernel at start.
@@ -103,6 +112,10 @@ struct DeviceGrant {
     ports: [(u16, u16); 2],
     /// Legacy ISA IRQ, delivered as a kernel notice on this endpoint.
     irq: Option<(u8, usize)>,
+    /// PCI function whose DMA is confined to this driver's IOMMU domain.
+    dma: Option<crate::pci::Device>,
+    /// Device MMIO (physical base, bytes) mapped into the driver at MMIO_BASE.
+    mmio: Option<(u64, u64)>,
 }
 
 impl DeviceGrant {
@@ -286,6 +299,9 @@ struct Task {
     /// Next free address and pages used in the anonymous-memory window.
     heap_next: u64,
     heap_pages: u64,
+    /// Second-level root of this driver's IOMMU domain, and pages mapped in it.
+    dma_root: Option<PhysAddr>,
+    dma_pages: u64,
     /// True while this task holds a request it has not replied to.
     serving: bool,
     restarts: u32,
@@ -320,6 +336,8 @@ enum Event {
     Preempted,
     /// The current task asked for this many anonymous pages.
     MapMemory(u64),
+    /// The current driver asked for this many DMA pages.
+    DmaAlloc(u64),
 }
 
 struct System {
@@ -334,6 +352,7 @@ struct System {
     reader: HhdmReader,
     next_table_id: u32,
     irq_routes: [Option<IrqRoute>; MAX_IRQ_ROUTES],
+    hhdm: HhdmOffset,
 }
 
 static mut SYSTEM: Option<System> = None;
@@ -473,6 +492,17 @@ pub fn syscall_handler(frame: &mut SyscallFrame) {
         Ok(Syscall::PortIo) => port_io(system, frame),
         Ok(Syscall::IrqAck) => irq_ack(system, frame),
         Ok(Syscall::Revoke) => revoke(system, frame),
+        Ok(Syscall::DmaAlloc) => {
+            let allowed = current_task(system).is_some_and(|task| task.dma_root.is_some());
+            if !allowed {
+                terminate(system, TaskExit::Device(DeviceViolation::NoDmaDomain));
+            }
+            if frame.rdi == 0 || frame.rdi > DMA_QUOTA_PAGES {
+                frame.rax = EINVAL;
+            } else {
+                park(system, frame, TaskState::Ready, Event::DmaAlloc(frame.rdi));
+            }
+        }
         Ok(_) => frame.rax = ENOSYS,
     }
     if frame.sanitize_for_sysret().is_err() {
@@ -510,31 +540,59 @@ fn port_io(system: &mut System, frame: &mut SyscallFrame) {
         Some(grant) if !grant.allows_port(port) => {
             Some(DeviceViolation::PortOutsideGrant(port as u16))
         }
-        Some(_) if frame.rsi > 1 || frame.rdx > 0xff => Some(DeviceViolation::InvalidOperation),
+        // Ops: 0/1 = in/out 8-bit, 2/3 = 16-bit, 4/5 = 32-bit.
+        Some(_) if frame.rsi > 5 || frame.rdx >> (8 << (frame.rsi / 2)) != 0 => {
+            Some(DeviceViolation::InvalidOperation)
+        }
+        Some(grant) if !grant.allows_port(port + (1 << (frame.rsi / 2)) - 1) => {
+            Some(DeviceViolation::PortOutsideGrant(port as u16))
+        }
         Some(_) => None,
     };
     if let Some(violation) = violation {
         terminate(system, TaskExit::Device(violation));
     }
     let port = port as u16;
-    if frame.rsi == 1 {
-        let value = frame.rdx as u8;
-        // SAFETY: CPL 0; the port lies in a kernel-vetted driver grant that
-        // excludes every kernel-owned port range.
-        unsafe {
-            core::arch::asm!("out dx, al", in("dx") port, in("al") value,
-                options(nomem, nostack, preserves_flags));
+    let value = frame.rdx;
+    // SAFETY (all arms): CPL 0; every byte of the access lies in a
+    // kernel-vetted driver grant that excludes kernel-owned port ranges.
+    frame.rax = unsafe {
+        match frame.rsi {
+            0 => {
+                let v: u8;
+                core::arch::asm!("in al, dx", in("dx") port, out("al") v,
+                    options(nomem, nostack, preserves_flags));
+                u64::from(v)
+            }
+            2 => {
+                let v: u16;
+                core::arch::asm!("in ax, dx", in("dx") port, out("ax") v,
+                    options(nomem, nostack, preserves_flags));
+                u64::from(v)
+            }
+            4 => {
+                let v: u32;
+                core::arch::asm!("in eax, dx", in("dx") port, out("eax") v,
+                    options(nomem, nostack, preserves_flags));
+                u64::from(v)
+            }
+            1 => {
+                core::arch::asm!("out dx, al", in("dx") port, in("al") value as u8,
+                    options(nomem, nostack, preserves_flags));
+                0
+            }
+            3 => {
+                core::arch::asm!("out dx, ax", in("dx") port, in("ax") value as u16,
+                    options(nomem, nostack, preserves_flags));
+                0
+            }
+            _ => {
+                core::arch::asm!("out dx, eax", in("dx") port, in("eax") value as u32,
+                    options(nomem, nostack, preserves_flags));
+                0
+            }
         }
-        frame.rax = 0;
-    } else {
-        let value: u8;
-        // SAFETY: As above.
-        unsafe {
-            core::arch::asm!("in al, dx", in("dx") port, out("al") value,
-                options(nomem, nostack, preserves_flags));
-        }
-        frame.rax = u64::from(value);
-    }
+    };
 }
 
 /// `Revoke`: RDI = an unbadged endpoint capability holding GRANT (the
@@ -926,6 +984,91 @@ fn map_anonymous(memory: &mut HhdmFrameMemory<'_, '_>, task: &mut Task, pages: u
     base
 }
 
+/// Maps `pages` zeroed frames into the driver (RW, NX) and at the matching
+/// IOVA in its device domain. Returns (user address, IOVA) or (error, 0).
+fn map_dma(memory: &mut HhdmFrameMemory<'_, '_>, task: &mut Task, pages: u64) -> (u64, u64) {
+    let (Some(domain), Ok(rw)) = (task.dma_root, PagePermissions::new(true, true, false, true))
+    else {
+        return (EINVAL, 0);
+    };
+    if task.dma_pages + pages > DMA_QUOTA_PAGES {
+        return (ENOMEM, 0);
+    }
+    let offset = task.dma_pages * PAGE_SIZE;
+    for index in 0..pages {
+        let page = offset + index * PAGE_SIZE;
+        let Ok(frame) =
+            crate::isolation::map_user_page_frame(memory, task.root, DMA_BASE + page, rw)
+        else {
+            return (ENOMEM, 0);
+        };
+        if !crate::iommu::map(memory, domain, crate::iommu::IOVA_BASE + page, frame) {
+            return (ENOMEM, 0);
+        }
+        task.dma_pages += 1;
+    }
+    (DMA_BASE + offset, crate::iommu::IOVA_BASE + offset)
+}
+
+/// Gives every driver with a DMA grant its own IOMMU domain and enables bus
+/// mastering for that device only.
+fn attach_dma(memory: &mut HhdmFrameMemory<'_, '_>, system: &mut System) {
+    let hhdm = system.hhdm.get();
+    for (index, slot) in system.tasks.iter_mut().enumerate() {
+        let Some(task) = slot.as_mut() else { continue };
+        let Some(device) = task.spec.device.and_then(|device| device.dma) else {
+            continue;
+        };
+        task.dma_root = crate::iommu::attach(memory, hhdm, device, index as u16 + 1);
+        let mmio_ok = task
+            .spec
+            .device
+            .and_then(|device| device.mmio)
+            .is_none_or(|(base, size)| {
+                size <= MMIO_LIMIT
+                    && (0..size.div_ceil(PAGE_SIZE)).all(|page| {
+                        PageMapping::user_device(
+                            MMIO_BASE + page * PAGE_SIZE,
+                            base + page * PAGE_SIZE,
+                        )
+                        .is_ok_and(|mapping| {
+                            PageTableMapper::new(&mut *memory, task.root)
+                                .map_4k(mapping)
+                                .is_ok()
+                        })
+                    })
+            });
+        if task.dma_root.is_some() && mmio_ok {
+            crate::pci::enable_memory(device, true);
+        } else {
+            serial_write("Centinela-OS: could not create an IOMMU domain.\r\n");
+        }
+    }
+}
+
+/// Stops the device's DMA and removes its domain before frames are freed.
+fn detach_dma(memory: &mut HhdmFrameMemory<'_, '_>, system: &mut System, index: usize) {
+    let Some(task) = system.tasks[index].as_mut() else {
+        return;
+    };
+    let Some(device) = task.spec.device.and_then(|device| device.dma) else {
+        return;
+    };
+    if task.dma_root.take().is_none() {
+        return;
+    }
+    crate::pci::disable_dma(device);
+    let faults = crate::iommu::detach(memory, device);
+    let mut writer = SerialWriter;
+    let _ = write!(
+        writer,
+        "IOMMU: domain of {:02x}:{:02x}.{} torn down; {faults} blocked DMA fault(s) recorded.\r\n",
+        device.bus,
+        device.devfn >> 3,
+        device.devfn & 7
+    );
+}
+
 fn elf_error_text(error: ElfError) -> &'static str {
     match error {
         ElfError::Truncated => "truncated image",
@@ -1096,6 +1239,8 @@ fn spawn(
         preemptions: 0,
         heap_next: HEAP_BASE,
         heap_pages: 0,
+        dma_root: None,
+        dma_pages: 0,
         serving: false,
         restarts,
         exit: None,
@@ -1156,6 +1301,7 @@ fn run_system(
             reader,
             next_table_id: 1,
             irq_routes: [None; MAX_IRQ_ROUTES],
+            hhdm,
         });
     }
     let Some(system) = system_state() else {
@@ -1164,6 +1310,7 @@ fn run_system(
     for (index, spec) in specs.iter().take(MAX_TASKS).enumerate() {
         start_task(memory, kernel_root, system, index, *spec, 0, &mut outcomes);
     }
+    attach_dma(memory, system);
     if !bind_irqs(system) {
         serial_write("Centinela-OS: could not route a driver IRQ.\r\n");
     }
@@ -1220,6 +1367,13 @@ fn run_system(
             Event::MapMemory(pages) => {
                 if let Some(task) = system.tasks[next].as_mut() {
                     task.context.rax = map_anonymous(memory, task, pages);
+                }
+            }
+            Event::DmaAlloc(pages) => {
+                if let Some(task) = system.tasks[next].as_mut() {
+                    let (address, iova) = map_dma(memory, task, pages);
+                    task.context.rax = address;
+                    task.context.rdx = iova;
                 }
             }
             Event::Blocked | Event::Preempted => {}
@@ -1356,6 +1510,7 @@ fn reap(
     };
     let (spec, serving, restarts, exit) = (task.spec, task.serving, task.restarts, task.exit);
     unbind_irqs(system, index);
+    detach_dma(memory, system, index);
     for endpoint in system.endpoints.iter_mut() {
         if let Some(caller) = endpoint.rendezvous.on_task_death(index, serving)
             && let Some(caller) = system.tasks[caller].as_mut()
@@ -1396,6 +1551,7 @@ fn reap_final(
     outcomes: &mut [Option<Outcome>; MAX_TASKS],
 ) {
     unbind_irqs(system, index);
+    detach_dma(memory, system, index);
     let Some(task) = system.tasks[index].take() else {
         return;
     };
@@ -1471,6 +1627,9 @@ fn describe(exit: TaskExit, writer: &mut SerialWriter) {
         }
         TaskExit::Device(DeviceViolation::InvalidOperation) => {
             write!(writer, "terminated: invalid port operation")
+        }
+        TaskExit::Device(DeviceViolation::NoDmaDomain) => {
+            write!(writer, "terminated: DMA request without an IOMMU domain")
         }
         TaskExit::Device(DeviceViolation::NoInterruptGrant) => {
             write!(writer, "terminated: acknowledged an IRQ it does not own")
@@ -1866,6 +2025,7 @@ pub fn run_self_test(
     let drivers_ok = run_driver_scenario(memory, kernel_root, hhdm, &module);
     let services_ok = run_services_scenario(memory, kernel_root, hhdm, &module);
     let badges_ok = run_badge_scenario(memory, kernel_root, hhdm, &module);
+    let network_ok = run_network_scenario(memory, kernel_root, hhdm, &module);
     isolation_ok
         && preemption_ok
         && elf_ok
@@ -1873,6 +2033,90 @@ pub fn run_self_test(
         && drivers_ok
         && services_ok
         && badges_ok
+        && network_ok
+}
+
+/// A real DMA driver: the e1000 NIC is confined to its own IOMMU domain.
+fn run_network_scenario(
+    memory: &mut HhdmFrameMemory<'_, '_>,
+    kernel_root: PhysAddr,
+    hhdm: HhdmOffset,
+    module: &dyn Fn(&str) -> Option<&'static [u8]>,
+) -> bool {
+    let mut writer = SerialWriter;
+    let Some(image) = module("e1000-driver") else {
+        serial_write("Centinela-OS: e1000 driver module missing.\r\n");
+        return false;
+    };
+    let Some(nic) = crate::pci::find(0x8086, 0x100e) else {
+        serial_write("Network: no e1000 NIC present; DMA driver scenario skipped.\r\n");
+        return true;
+    };
+    let Some(mmio) = crate::pci::mem_bar0(nic) else {
+        serial_write("Centinela-OS: e1000 has no memory BAR.\r\n");
+        return false;
+    };
+    let faults_before = crate::iommu::faults_seen();
+    let tasks = [
+        TaskSpec {
+            name: "e1000-driver",
+            role: "Ring 3 NIC driver: MMIO BAR + IOMMU-confined DMA",
+            program: Image::Elf(image),
+            extra_syscalls: 1 << Syscall::DmaAlloc as u8,
+            endpoints: [None, None, None],
+            process: None,
+            manage_processes: false,
+            manage_memory: false,
+            priority: false,
+            supervisor: None,
+            device: Some(DeviceGrant {
+                ports: [(0, 0), (0, 0)],
+                irq: None,
+                dma: Some(nic),
+                mmio: Some(mmio),
+            }),
+            arg: MMIO_BASE,
+            expect: Expect::Exit(0),
+        },
+        TaskSpec {
+            name: "dma-rogue",
+            role: "DMA request without an IOMMU domain",
+            program: Image::Flat(user_programs::dma_rogue),
+            extra_syscalls: 1 << Syscall::DmaAlloc as u8,
+            endpoints: [None, None, None],
+            process: None,
+            manage_processes: false,
+            manage_memory: false,
+            priority: false,
+            supervisor: None,
+            device: Some(DeviceGrant {
+                ports: [(0x278, 3), (0, 0)],
+                irq: None,
+                dma: None,
+                mmio: None,
+            }),
+            arg: 0,
+            expect: Expect::Device(DeviceViolation::NoDmaDomain),
+        },
+    ];
+    let outcomes = run_system(memory, kernel_root, hhdm, &tasks);
+    let passed = outcomes
+        .iter()
+        .flatten()
+        .filter(|outcome| report(outcome))
+        .count();
+    let blocked = crate::iommu::faults_seen() > faults_before;
+    let _ = write!(
+        writer,
+        "Network: {passed}/{} DMA driver checks passed; out-of-domain DMA {}.\r\n",
+        tasks.len(),
+        if blocked {
+            "blocked by the IOMMU"
+        } else {
+            "NOT BLOCKED"
+        }
+    );
+    passed == tasks.len() && blocked
 }
 
 /// Identity and revocation: a broker mints badged filesystem capabilities;
@@ -2018,6 +2262,8 @@ fn run_services_scenario(
     console.device = Some(DeviceGrant {
         ports: [(0x3e8, 8), (0, 0)],
         irq: Some((4, ENDPOINT_CONSOLE)),
+        dma: None,
+        mmio: None,
     });
     let tasks = [
         console,
@@ -2112,6 +2358,8 @@ fn run_driver_scenario(
             Some(DeviceGrant {
                 ports: [(0x2f8, 8), (0, 0)],
                 irq: Some((3, ENDPOINT_UART)),
+                dma: None,
+                mmio: None,
             }),
             Expect::Exit(0),
         ),
@@ -2123,6 +2371,8 @@ fn run_driver_scenario(
             Some(DeviceGrant {
                 ports: [(0x60, 1), (0x64, 1)],
                 irq: Some((1, ENDPOINT_KBD)),
+                dma: None,
+                mmio: None,
             }),
             Expect::Exit(0),
         ),
@@ -2134,6 +2384,8 @@ fn run_driver_scenario(
             Some(DeviceGrant {
                 ports: [(0x2e8, 8), (0, 0)],
                 irq: None,
+                dma: None,
+                mmio: None,
             }),
             Expect::Device(DeviceViolation::PortOutsideGrant(0x3f8)),
         ),
@@ -2145,6 +2397,8 @@ fn run_driver_scenario(
             Some(DeviceGrant {
                 ports: [(0x278, 3), (0, 0)],
                 irq: None,
+                dma: None,
+                mmio: None,
             }),
             Expect::Device(DeviceViolation::NoInterruptGrant),
         ),

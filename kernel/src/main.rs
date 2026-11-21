@@ -11,6 +11,8 @@ mod iommu;
 #[cfg(target_os = "none")]
 mod isolation;
 #[cfg(target_os = "none")]
+mod pci;
+#[cfg(target_os = "none")]
 mod smp;
 #[cfg(target_os = "none")]
 mod system;

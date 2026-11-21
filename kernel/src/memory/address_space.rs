@@ -146,6 +146,10 @@ fn free_subtree<M: PageTableMutationMemory>(
             continue;
         }
         if level == 1 {
+            // Device MMIO granted to a driver is not RAM: never free it.
+            if entry & crate::memory::vmm::DEVICE_MEMORY != 0 {
+                continue;
+            }
             let frame = PhysAddr::new(entry & PHYSICAL_ADDRESS_MASK)
                 .map_err(|_| AddressSpaceError::CorruptEntry)?;
             memory.release_table_frame(frame)?;

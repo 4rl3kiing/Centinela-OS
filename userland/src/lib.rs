@@ -18,6 +18,7 @@ pub const STATUS_NO_RECEIVER: u64 = (-3_i64) as u64;
 pub const SYS_PORT_IO: u64 = 15;
 pub const SYS_IRQ_ACK: u64 = 16;
 pub const SYS_REVOKE: u64 = 17;
+pub const SYS_DMA_ALLOC: u64 = 18;
 /// Transfer: mint the transferred capability with the badge in word 2.
 pub const FLAG_MINT_BADGE: u64 = 1 << 18;
 /// SEND right bits, for capability transfers (flags bits 8-15).
@@ -78,6 +79,49 @@ pub fn port_out(port: u16, value: u8) {
     unsafe {
         syscall3(SYS_PORT_IO, u64::from(port), 1, u64::from(value));
     }
+}
+
+/// Mediated 32-bit port read.
+pub fn port_in32(port: u16) -> u32 {
+    // SAFETY: As in `port_in`.
+    unsafe { syscall3(SYS_PORT_IO, u64::from(port), 4, 0) as u32 }
+}
+
+/// Mediated 32-bit port write.
+pub fn port_out32(port: u16, value: u32) {
+    // SAFETY: As in `port_in`.
+    unsafe {
+        syscall3(SYS_PORT_IO, u64::from(port), 5, u64::from(value));
+    }
+}
+
+/// DMA memory: mapped in this task and at `iova` in our device's IOMMU
+/// domain. The device can reach nothing else.
+pub struct DmaRegion {
+    pub address: *mut u8,
+    pub iova: u64,
+}
+
+/// Allocates `pages` zeroed DMA pages.
+pub fn dma_alloc(pages: u64) -> Option<DmaRegion> {
+    let (address, iova): (u64, u64);
+    // SAFETY: The kernel chooses both addresses and enforces the quota.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_DMA_ALLOC => address,
+            in("rdi") pages,
+            in("rsi") 0u64,
+            inlateout("rdx") 0u64 => iova,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack)
+        );
+    }
+    ((address as i64) > 0).then_some(DmaRegion {
+        address: address as *mut u8,
+        iova,
+    })
 }
 
 /// Re-arms our bound interrupt line.

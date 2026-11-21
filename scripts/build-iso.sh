@@ -42,7 +42,7 @@ grep -Fq "centinela-kernel#$KERNEL_B2SUM" "$CONFIG" || { echo "Kernel hash was n
 
 # User programs travel as boot modules, each pinned by its BLAKE2b hash.
 mkdir -p "$ISO_ROOT/boot/user"
-for module in elf-hello elf-wx uart-driver kbd-driver serial-service ramfs netsvc shell fs-fuzzer broker badge-client; do
+for module in elf-hello elf-wx uart-driver kbd-driver serial-service ramfs netsvc shell fs-fuzzer broker badge-client e1000-driver; do
     source="$ROOT/target/x86_64-unknown-none/release/$module"
     test -f "$source" || { echo "Missing user module: $module" >&2; exit 1; }
     install -m 0644 "$source" "$ISO_ROOT/boot/user/$module"

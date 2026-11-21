@@ -390,6 +390,32 @@ pub(crate) fn map_task_image(
 /// Allocates a zeroed frame (optionally filled with `contents`) and maps it.
 /// On failure the frame is released here; frames already mapped are
 /// reclaimed by `destroy_user_address_space`.
+/// Maps one zeroed user page and returns its frame (for DMA domains).
+pub(crate) fn map_user_page_frame(
+    memory: &mut HhdmFrameMemory<'_, '_>,
+    root: PhysAddr,
+    address: u64,
+    permissions: PagePermissions,
+) -> Result<PhysAddr, &'static str> {
+    let frame = memory
+        .allocate_zeroed_table_frame()
+        .map_err(|_| "out of memory for DMA page")?;
+    let mapping =
+        PageMapping::new(address, frame.get(), permissions).map_err(|_| "invalid mapping");
+    let mapped = mapping.and_then(|mapping| {
+        PageTableMapper::new(&mut *memory, root)
+            .map_4k(mapping)
+            .map_err(|_| "page mapping failed")
+    });
+    match mapped {
+        Ok(_) => Ok(frame),
+        Err(reason) => {
+            let _ = memory.release_table_frame(frame);
+            Err(reason)
+        }
+    }
+}
+
 pub(crate) fn map_user_page(
     memory: &mut HhdmFrameMemory<'_, '_>,
     root: PhysAddr,

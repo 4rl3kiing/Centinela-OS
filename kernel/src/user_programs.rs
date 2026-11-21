@@ -473,6 +473,20 @@ core::arch::global_asm!(
     "    ud2",
     ".global centinela_user_no_device_cap_end",
     "centinela_user_no_device_cap_end:",
+    "",
+    // Attack: ask for DMA memory without an IOMMU-confined device.
+    ".balign 16",
+    ".global centinela_user_dma_rogue_start",
+    "centinela_user_dma_rogue_start:",
+    "    mov edi, 1",
+    "    mov eax, 18",
+    "    syscall",
+    "    xor edi, edi",
+    "    mov eax, 12",
+    "    syscall",
+    "    ud2",
+    ".global centinela_user_dma_rogue_end",
+    "centinela_user_dma_rogue_end:",
     ".text",
 );
 
@@ -599,4 +613,9 @@ program!(
     no_device_cap,
     centinela_user_no_device_cap_start,
     centinela_user_no_device_cap_end
+);
+program!(
+    dma_rogue,
+    centinela_user_dma_rogue_start,
+    centinela_user_dma_rogue_end
 );

@@ -17,6 +17,9 @@ pub(crate) const WRITABLE: u64 = 1 << 1;
 pub(crate) const USER: u64 = 1 << 2;
 const WRITE_THROUGH: u64 = 1 << 3;
 const CACHE_DISABLE: u64 = 1 << 4;
+/// Software bit (AVL): the frame is device memory, never owned RAM, so
+/// address-space teardown must not return it to the frame allocator.
+pub const DEVICE_MEMORY: u64 = 1 << 9;
 const NO_EXECUTE: u64 = 1 << 63;
 #[cfg(test)]
 pub(crate) const NO_EXECUTE_FOR_TESTS: u64 = NO_EXECUTE;
@@ -157,6 +160,25 @@ impl PageMapping {
         }
     }
 
+    /// User-accessible, writable, non-executable, uncacheable MMIO mapping
+    /// of a device BAR granted to a Ring 3 driver.
+    pub const fn user_device(
+        virtual_address: u64,
+        physical_address: u64,
+    ) -> Result<Self, MappingError> {
+        let permissions = match PagePermissions::new(true, true, false, true) {
+            Ok(permissions) => permissions,
+            Err(_) => return Err(MappingError::WriteExecuteViolation),
+        };
+        match Self::new(virtual_address, physical_address, permissions) {
+            Ok(mapping) => Ok(Self {
+                device: true,
+                ..mapping
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
     pub const fn is_device(self) -> bool {
         self.device
     }
@@ -184,7 +206,7 @@ impl PageMapping {
             raw |= NO_EXECUTE;
         }
         if self.device {
-            raw |= CACHE_DISABLE | WRITE_THROUGH;
+            raw |= CACHE_DISABLE | WRITE_THROUGH | DEVICE_MEMORY;
         }
         PageTableEntry(raw)
     }

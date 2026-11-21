@@ -75,3 +75,9 @@ name = "badge-client"
 path = "src/bin/badge_client.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "e1000-driver"
+path = "src/bin/e1000_driver.rs"
+test = false
+bench = false
