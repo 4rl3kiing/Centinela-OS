@@ -39,6 +39,24 @@ Use measurement, not assumptions, to decide which mechanisms may remain in Ring 
 
 The architecture is not considered implemented merely because this ADR exists. The first end-to-end microkernel acceptance milestone requires: a user process entering Ring 3; capability-checked IPC with bounds validation; a service performing a request; and proof by fault injection that terminating/restarting that service does not corrupt or halt the kernel. BIOS and UEFI QEMU boot tests must continue to pass.
 
+### Acceptance status (2026-11-21)
+
+Met. Every boot verifies, under BIOS, BIOS `-cpu max` and UEFI:
+
+1. **Ring 3:** user tasks run in their own address spaces (ADR-0003).
+2. **Capability-checked IPC with bounds validation:** synchronous endpoint
+   IPC (`IpcCall` / `IpcReplyWait`); SEND and RECEIVE are separate rights;
+   handles are resolved only in the caller's own table; messages are capped at
+   4 register words. Forged handles, missing rights and oversized messages
+   terminate the sender.
+3. **A service performing a request:** `adder-service` runs in Ring 3 and
+   answers a client's request through the endpoint.
+4. **Fault injection and restart:** the client sends a crash request; the
+   service is terminated, the waiting client gets `EPIPE` instead of hanging,
+   the supervisor reclaims the service and restarts it with fresh memory and a
+   fresh capability table (handles of the dead instance stay revoked), and the
+   next request succeeds. The kernel keeps running.
+
 ## Consequences
 
 This decision increases implementation complexity and requires careful ABI, IPC, memory ownership, and driver isolation work. It reduces the amount of code executing with full kernel privilege and enables independent service failure/restart. A hybrid approach allows only benchmark- and security-justified fast paths to remain in Ring 0 without reverting to a broadly monolithic kernel.

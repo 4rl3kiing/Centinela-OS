@@ -3,7 +3,7 @@
 **Status:** Migration target approved; staged implementation  
 **Target:** x86_64, legacy BIOS + UEFI  
 **Kernel language:** Rust (`no_std`)  
-**Kernel model:** Capability-based hybrid microkernel (target); current bootstrap remains monolithic
+**Kernel model:** Capability-based hybrid microkernel; ADR-0002 acceptance met: Ring 3, capability IPC, Ring 3 service with supervised restart (ADR-0003)
 
 ## 1. Goals and non-goals
 

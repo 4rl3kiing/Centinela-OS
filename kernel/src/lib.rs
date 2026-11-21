@@ -4,4 +4,5 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod ipc;
 pub mod memory;

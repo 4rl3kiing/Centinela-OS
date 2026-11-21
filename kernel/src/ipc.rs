@@ -1,0 +1,197 @@
+//! Synchronous, capability-checked IPC (pure logic, host-tested).
+//!
+//! Model (seL4-style rendezvous, one request in flight per endpoint):
+//! - A client holding an endpoint capability with the SEND right issues
+//!   `call`: the message is delivered only if a server is already waiting, and
+//!   the client then blocks until the reply. There is no kernel queue to fill.
+//! - A server holding the RECEIVE right issues `reply_wait`: it replies to the
+//!   pending caller (if any) and blocks for the next request.
+//! - Messages travel in registers: at most `MAX_MESSAGE_WORDS` words plus a
+//!   length. Anything longer is malformed and the sender is terminated, so no
+//!   kernel buffer is ever sized by user input.
+//! - If the server dies while a caller waits, the caller is woken with an
+//!   error instead of hanging: a failed service cannot stall its clients.
+
+use centinela_security::handles::Rights;
+
+/// Maximum message size in 64-bit words (all carried in registers).
+pub const MAX_MESSAGE_WORDS: usize = 4;
+
+/// Right required to send requests on an endpoint.
+pub const SEND: Rights = Rights::WRITE;
+/// Right required to receive requests on (and reply through) an endpoint.
+pub const RECEIVE: Rights = Rights::READ;
+
+/// Status codes returned to user mode in RAX.
+pub const STATUS_OK: u64 = 0;
+/// No server is waiting on the endpoint right now (try again later).
+pub const STATUS_NO_RECEIVER: u64 = (-3_i64) as u64;
+/// The server died before replying.
+pub const STATUS_PEER_DIED: u64 = (-32_i64) as u64;
+
+pub type TaskId = usize;
+
+/// Why an IPC syscall was refused; each one terminates the caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IpcViolation {
+    /// The raw handle does not name a live capability in the caller's table.
+    InvalidHandle,
+    /// The capability exists but lacks the right this operation requires.
+    MissingRights,
+    /// The declared length exceeds `MAX_MESSAGE_WORDS`.
+    MalformedMessage,
+}
+
+/// A validated, register-sized message.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Message {
+    length: usize,
+    words: [u64; MAX_MESSAGE_WORDS],
+}
+
+impl Message {
+    /// Builds a message from syscall registers. Words beyond `length` are
+    /// zeroed so no stale register content crosses the address-space boundary.
+    pub fn from_registers(
+        length: u64,
+        words: [u64; MAX_MESSAGE_WORDS],
+    ) -> Result<Self, IpcViolation> {
+        if length > MAX_MESSAGE_WORDS as u64 {
+            return Err(IpcViolation::MalformedMessage);
+        }
+        let length = length as usize;
+        let mut clean = [0; MAX_MESSAGE_WORDS];
+        clean[..length].copy_from_slice(&words[..length]);
+        Ok(Self {
+            length,
+            words: clean,
+        })
+    }
+
+    pub const fn length(&self) -> usize {
+        self.length
+    }
+
+    pub const fn words(&self) -> [u64; MAX_MESSAGE_WORDS] {
+        self.words
+    }
+}
+
+/// Result of a `call` attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallOutcome {
+    /// The message was handed to this waiting server; the caller now blocks.
+    Delivered { server: TaskId },
+    /// No server is waiting; the caller gets `STATUS_NO_RECEIVER`.
+    NoReceiver,
+}
+
+/// Rendezvous state of one endpoint.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Endpoint {
+    receiver: Option<TaskId>,
+    caller: Option<TaskId>,
+}
+
+impl Endpoint {
+    pub const fn new() -> Self {
+        Self {
+            receiver: None,
+            caller: None,
+        }
+    }
+
+    pub const fn receiver(&self) -> Option<TaskId> {
+        self.receiver
+    }
+
+    pub const fn caller(&self) -> Option<TaskId> {
+        self.caller
+    }
+
+    /// A client sends a request.
+    pub fn call(&mut self, caller: TaskId) -> CallOutcome {
+        match self.receiver.take() {
+            Some(server) => {
+                self.caller = Some(caller);
+                CallOutcome::Delivered { server }
+            }
+            None => CallOutcome::NoReceiver,
+        }
+    }
+
+    /// A server replies (to the returned caller, if any) and starts waiting.
+    pub fn reply_wait(&mut self, server: TaskId) -> Option<TaskId> {
+        let caller = self.caller.take();
+        self.receiver = Some(server);
+        caller
+    }
+
+    /// Clears every reference to a dead task. Returns a caller that was
+    /// waiting on a reply from it and must be woken with `STATUS_PEER_DIED`.
+    pub fn on_task_death(&mut self, task: TaskId, was_serving: bool) -> Option<TaskId> {
+        if self.receiver == Some(task) {
+            self.receiver = None;
+        }
+        if self.caller == Some(task) {
+            self.caller = None;
+            return None;
+        }
+        if was_serving {
+            self.caller.take()
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CallOutcome, Endpoint, IpcViolation, MAX_MESSAGE_WORDS, Message};
+
+    #[test]
+    fn oversized_messages_are_rejected_and_unused_words_cleared() {
+        assert_eq!(
+            Message::from_registers(MAX_MESSAGE_WORDS as u64 + 1, [1; MAX_MESSAGE_WORDS]),
+            Err(IpcViolation::MalformedMessage)
+        );
+        assert!(Message::from_registers(u64::MAX, [0; MAX_MESSAGE_WORDS]).is_err());
+        let message = Message::from_registers(2, [7, 8, 0xdead, 0xbeef]).unwrap();
+        assert_eq!(
+            message.words(),
+            [7, 8, 0, 0],
+            "stale registers must not leak"
+        );
+        assert_eq!(message.length(), 2);
+    }
+
+    #[test]
+    fn rendezvous_delivers_only_to_a_waiting_server() {
+        let mut endpoint = Endpoint::new();
+        assert_eq!(endpoint.call(1), CallOutcome::NoReceiver);
+        assert_eq!(endpoint.reply_wait(0), None);
+        assert_eq!(endpoint.call(1), CallOutcome::Delivered { server: 0 });
+        assert_eq!(endpoint.call(2), CallOutcome::NoReceiver, "server is busy");
+        assert_eq!(endpoint.reply_wait(0), Some(1), "reply goes to the caller");
+        assert_eq!(endpoint.receiver(), Some(0));
+    }
+
+    #[test]
+    fn server_death_wakes_the_waiting_caller() {
+        let mut endpoint = Endpoint::new();
+        endpoint.reply_wait(0);
+        endpoint.call(1);
+        assert_eq!(endpoint.on_task_death(0, true), Some(1));
+        assert_eq!(endpoint.caller(), None);
+        assert_eq!(endpoint.receiver(), None);
+    }
+
+    #[test]
+    fn caller_death_cancels_its_pending_request() {
+        let mut endpoint = Endpoint::new();
+        endpoint.reply_wait(0);
+        endpoint.call(1);
+        assert_eq!(endpoint.on_task_death(1, false), None);
+        assert_eq!(endpoint.reply_wait(0), None, "no reply to a dead caller");
+    }
+}

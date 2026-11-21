@@ -2,7 +2,7 @@ name: Miri memory and policy checks
 
 on:
   push:
-    branches: [main, "hardening/**"]
+    branches: [main, "hardening/**", "microkernel/**"]
   pull_request:
     branches: [main]
   workflow_dispatch:

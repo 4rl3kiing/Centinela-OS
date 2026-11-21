@@ -2,6 +2,15 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+// The isolation runtime drives real hardware; it only exists for the kernel
+// target (host builds of this binary are used solely for linting).
+#[cfg(target_os = "none")]
+mod isolation;
+#[cfg(target_os = "none")]
+mod system;
+#[cfg(target_os = "none")]
+mod user_programs;
+
 use core::mem::MaybeUninit;
 use core::panic::PanicInfo;
 use core::ptr::{addr_of, addr_of_mut};
@@ -10,9 +19,11 @@ use centinela_hal::cpu::{
     CpuHardeningError, current_page_table_root, enable_boot_hardening, halt_forever,
 };
 use centinela_hal::serial::{SerialWriter, init as serial_init, write as serial_write};
+use centinela_kernel::memory::hhdm_backend::HhdmFrameMemory;
 use centinela_kernel::memory::pmm::{BITMAP_WORDS, LimineMemoryMapResponse, Pmm};
 use centinela_kernel::memory::vmm::{
-    BootPagingInfo, HhdmOffset, HhdmPageTableMemory, PageTableMemory, PageTableWalker, VirtAddr,
+    BootPagingInfo, HhdmOffset, HhdmPageTableMemory, PageTableMemory, PageTableWalker, PhysAddr,
+    VirtAddr,
 };
 
 const LIMINE_COMMON_MAGIC: [u64; 2] = [0xc7b1_dd30_df4c_8b88, 0x0a82_e883_a194_f07b];
@@ -124,14 +135,21 @@ static mut ALLOCATED_BITMAP: [u64; BITMAP_WORDS] = [0; BITMAP_WORDS];
 static mut PMM_STATE: MaybeUninit<Pmm<'static>> = MaybeUninit::uninit();
 static mut BOOT_PAGING_INFO: MaybeUninit<BootPagingInfo> = MaybeUninit::uninit();
 
-fn initialize_memory() -> bool {
+/// Validated boot memory state handed to the isolation layer.
+struct BootMemory {
+    pmm: &'static mut Pmm<'static>,
+    hhdm: HhdmOffset,
+    kernel_root: PhysAddr,
+}
+
+fn initialize_memory() -> Option<BootMemory> {
     // Limine sets the third base-revision field to zero when the requested
     // protocol revision is supported.
     let revision_supported =
         unsafe { addr_of!(LIMINE_REQUESTS.base_revision[2]).read_volatile() == 0 };
     if !revision_supported {
         serial_write("Centinela-OS: unsupported Limine base revision.\r\n");
-        return false;
+        return None;
     }
     serial_write("Limine base revision 5 accepted.\r\n");
 
@@ -150,7 +168,7 @@ fn initialize_memory() -> bool {
 
     if memory_map.is_null() || hhdm.is_null() {
         serial_write("Centinela-OS: required Limine memory response missing.\r\n");
-        return false;
+        return None;
     }
 
     // SAFETY: Limine supplies a valid HHDM response for the lifetime of boot.
@@ -158,21 +176,21 @@ fn initialize_memory() -> bool {
     let hhdm_offset = unsafe { addr_of!((*hhdm).offset).read() };
     if hhdm_revision != 0 || hhdm_offset & 0xfff != 0 {
         serial_write("Centinela-OS: unsupported or invalid HHDM response.\r\n");
-        return false;
+        return None;
     }
 
     let hhdm_offset = match HhdmOffset::new(hhdm_offset) {
         Ok(offset) => offset,
         Err(_) => {
             serial_write("Centinela-OS: HHDM offset is not canonical.\r\n");
-            return false;
+            return None;
         }
     };
     let paging_info = match BootPagingInfo::new(current_page_table_root(), hhdm_offset) {
         Ok(info) => info,
         Err(_) => {
             serial_write("Centinela-OS: active CR3 root is invalid or not HHDM-addressable.\r\n");
-            return false;
+            return None;
         }
     };
     // The Limine protocol guarantees that its page-table pages are in
@@ -184,7 +202,7 @@ fn initialize_memory() -> bool {
         Ok(memory) => memory,
         Err(_) => {
             serial_write("Centinela-OS: invalid HHDM page-table memory map.\r\n");
-            return false;
+            return None;
         }
     };
     let walker = PageTableWalker::new(&table_memory, paging_info.root_physical());
@@ -192,31 +210,31 @@ fn initialize_memory() -> bool {
         Ok(translation) => translation,
         Err(_) => {
             serial_write("Centinela-OS: active page-table root is not readable through HHDM.\r\n");
-            return false;
+            return None;
         }
     };
     if root_alias.physical_address != paging_info.root_physical().get() {
         serial_write("Centinela-OS: HHDM root translation mismatch.\r\n");
-        return false;
+        return None;
     }
 
     let kernel_entry = match VirtAddr::new(_start as *const () as usize as u64) {
         Ok(address) => address,
         Err(_) => {
             serial_write("Centinela-OS: kernel entry virtual address is invalid.\r\n");
-            return false;
+            return None;
         }
     };
     let entry_mapping = match walker.translate(kernel_entry) {
         Ok(translation) => translation,
         Err(_) => {
             serial_write("Centinela-OS: kernel entry mapping could not be verified.\r\n");
-            return false;
+            return None;
         }
     };
     if !entry_mapping.executable || entry_mapping.writable {
         serial_write("Centinela-OS: kernel entry mapping violates RX permissions.\r\n");
-        return false;
+        return None;
     }
     serial_write("VMM bootstrap: Limine page-table frames validated through HHDM.\r\n");
     serial_write("VMM bootstrap: HHDM root alias and kernel RX mapping verified.\r\n");
@@ -233,9 +251,7 @@ fn initialize_memory() -> bool {
     // from the executable-address response (not a link-time constant) and is
     // cross-checked against the live page tables. The image size, including
     // the PMM bitmaps in BSS, comes from linker-exported virtual bounds.
-    let Some((kernel_start, kernel_end)) = kernel_physical_range(&walker) else {
-        return false;
-    };
+    let (kernel_start, kernel_end) = kernel_physical_range(&walker)?;
 
     // SAFETY: The bitmap is a unique static buffer. The kernel is single-core
     // and interrupts are not enabled at this bootstrap stage.
@@ -250,7 +266,7 @@ fn initialize_memory() -> bool {
         Ok(pmm) => pmm,
         Err(_) => {
             serial_write("Centinela-OS: PMM bitmap initialization failed.\r\n");
-            return false;
+            return None;
         }
     };
 
@@ -258,16 +274,16 @@ fn initialize_memory() -> bool {
     // information, and all PMM access is serialized on this single CPU.
     if unsafe { pmm.initialize_from_limine(memory_map, kernel_start, kernel_end) }.is_err() {
         serial_write("Centinela-OS: invalid physical memory map.\r\n");
-        return false;
+        return None;
     }
 
     let Some(test_frame) = pmm.allocate_frame() else {
         serial_write("Centinela-OS: no usable physical frames detected.\r\n");
-        return false;
+        return None;
     };
     if pmm.free_frame(test_frame).is_err() {
         serial_write("Centinela-OS: PMM allocation self-test failed.\r\n");
-        return false;
+        return None;
     }
 
     // Keep the initialized manager alive for subsequent kernel subsystems.
@@ -278,7 +294,14 @@ fn initialize_memory() -> bool {
 
     serial_write("PMM initialized: 4 KiB frames, 64 GiB address ceiling.\r\n");
     serial_write("PMM allocation/free self-test passed.\r\n");
-    true
+    // SAFETY: PMM_STATE was initialized just above and is never moved; this
+    // is the only reference handed out.
+    let pmm = unsafe { (*addr_of_mut!(PMM_STATE)).assume_init_mut() };
+    Some(BootMemory {
+        pmm,
+        hhdm: hhdm_offset,
+        kernel_root: paging_info.root_physical(),
+    })
 }
 
 /// Returns the kernel image's physical `[start, end)` range, or `None` after
@@ -342,8 +365,40 @@ fn kernel_physical_range<M: PageTableMemory>(
     Some((physical_base, physical_end))
 }
 
+/// Size of the kernel's own execution stack.
+const KERNEL_STACK_SIZE: usize = 64 * 1024;
+
+/// Kernel execution stack, preceded by a guard page that the isolation layer
+/// unmaps, so a kernel stack overflow faults (double fault on an IST stack)
+/// instead of silently corrupting memory. The bootloader's stack is abandoned
+/// at the first instruction because it has no guard page.
+#[repr(C, align(4096))]
+pub(crate) struct KernelStack {
+    guard: [u8; 4096],
+    stack: [u8; KERNEL_STACK_SIZE],
+}
+
+pub(crate) static mut KERNEL_STACK: KernelStack = KernelStack {
+    guard: [0; 4096],
+    stack: [0; KERNEL_STACK_SIZE],
+};
+
+/// Entry point: switch to the guarded kernel stack, then run `kernel_main`.
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "lea rsp, [rip + {stack} + {top}]",
+        "xor ebp, ebp",
+        "call {main}",
+        "ud2",
+        stack = sym KERNEL_STACK,
+        top = const core::mem::size_of::<KernelStack>(),
+        main = sym kernel_main,
+    )
+}
+
+extern "C" fn kernel_main() -> ! {
     // Best effort: without a UART the boot continues silently instead of hanging.
     let _ = serial_init();
     serial_write("\r\nCentinela-OS: Rust kernel entry reached.\r\n");
@@ -380,14 +435,35 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    if !initialize_memory() {
+    let Some(boot) = initialize_memory() else {
         halt_forever();
-    }
-
+    };
     serial_write("Bootstrap milestone: memory map validated and PMM online.\r\n");
-    serial_write("HHDM response accepted.\r\n");
+
+    // SAFETY: The HHDM (base revision 5) maps every usable and bootloader-
+    // reclaimable frame, including Limine's page tables; single CPU, IF=0.
+    let mut memory = unsafe { HhdmFrameMemory::new(boot.hhdm, boot.pmm) };
+    run_isolation(&mut memory, boot.kernel_root, boot.hhdm);
     halt_forever()
 }
+
+#[cfg(target_os = "none")]
+fn run_isolation(memory: &mut HhdmFrameMemory<'_, '_>, kernel_root: PhysAddr, hhdm: HhdmOffset) {
+    if !isolation::init_cpu_layer(memory, kernel_root) {
+        halt_forever();
+    }
+    if system::run_self_test(memory, kernel_root, hhdm) {
+        serial_write(
+            "Microkernel milestone: ADR-0002 acceptance met (Ring 3 service, capability IPC, \
+             supervised restart); every hostile task contained.\r\n",
+        );
+    } else {
+        serial_write("Centinela-OS: microkernel self-test failed.\r\n");
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+fn run_isolation(_: &mut HhdmFrameMemory<'_, '_>, _: PhysAddr, _: HhdmOffset) {}
 
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {

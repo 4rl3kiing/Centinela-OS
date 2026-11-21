@@ -19,9 +19,83 @@ pub enum Syscall {
     MapMemory = 10,
     CreateProcess = 11,
     Exit = 12,
+    /// Synchronous IPC: send a request on an endpoint and wait for the reply.
+    IpcCall = 13,
+    /// Synchronous IPC: reply to the pending caller, then wait for a request.
+    IpcReplyWait = 14,
 }
 
-const VALID_SYSCALL_BITS: u64 = (1 << 13) - 1;
+const VALID_SYSCALL_BITS: u64 = (1 << 15) - 1;
+
+impl Syscall {
+    /// Decodes a raw syscall number from Ring 3. Unknown numbers are `None`.
+    pub const fn from_number(number: u64) -> Option<Self> {
+        Some(match number {
+            0 => Self::Read,
+            1 => Self::Write,
+            2 => Self::Open,
+            3 => Self::Close,
+            4 => Self::Exec,
+            5 => Self::Socket,
+            6 => Self::Connect,
+            7 => Self::Accept,
+            8 => Self::Send,
+            9 => Self::Receive,
+            10 => Self::MapMemory,
+            11 => Self::CreateProcess,
+            12 => Self::Exit,
+            13 => Self::IpcCall,
+            14 => Self::IpcReplyWait,
+            _ => return None,
+        })
+    }
+
+    /// Capability a task must hold, in addition to the syscall policy, before
+    /// this syscall is dispatched. `None` means the policy alone decides.
+    pub const fn required_capability(self) -> Option<crate::capabilities::Capability> {
+        use crate::capabilities::Capability;
+        match self {
+            Self::Read => Some(Capability::ReadConsole),
+            Self::Write => Some(Capability::WriteConsole),
+            Self::Open | Self::Close | Self::Exec => Some(Capability::AccessBlockDevices),
+            Self::Socket | Self::Connect | Self::Accept | Self::Send | Self::Receive => {
+                Some(Capability::AccessNetwork)
+            }
+            Self::MapMemory => Some(Capability::ManageMemory),
+            Self::CreateProcess => Some(Capability::ManageProcesses),
+            // IPC authority comes from the endpoint handle's rights
+            // (object capability), checked by the IPC layer.
+            Self::Exit | Self::IpcCall | Self::IpcReplyWait => None,
+        }
+    }
+}
+
+/// Why a syscall was refused. Every refusal is fatal for the calling task:
+/// a task that probes outside its granted surface is treated as compromised.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyscallViolation {
+    UnknownSyscall(u64),
+    DeniedByPolicy(Syscall),
+    MissingCapability(Syscall),
+}
+
+/// Two independent checks (allow-list and capability) must both pass.
+pub fn authorize(
+    policy: &SyscallPolicy,
+    capabilities: crate::capabilities::CapabilitySet,
+    number: u64,
+) -> Result<Syscall, SyscallViolation> {
+    let syscall = Syscall::from_number(number).ok_or(SyscallViolation::UnknownSyscall(number))?;
+    if !policy.allows(syscall) {
+        return Err(SyscallViolation::DeniedByPolicy(syscall));
+    }
+    if let Some(required) = syscall.required_capability()
+        && !capabilities.contains(required)
+    {
+        return Err(SyscallViolation::MissingCapability(syscall));
+    }
+    Ok(syscall)
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SyscallSet(u64);
@@ -102,6 +176,42 @@ mod tests {
         assert!(policy.allows(Syscall::Exit));
         assert!(!policy.allows(Syscall::Write));
         assert!(!policy.allows(Syscall::Exec));
+    }
+
+    #[test]
+    fn authorization_requires_policy_and_capability() {
+        use super::{SyscallViolation, authorize};
+        use crate::capabilities::{Capability, CapabilitySet};
+
+        let policy = SyscallPolicy::new(SyscallSet::from_bits(
+            (1 << Syscall::Write as u8) | (1 << Syscall::Exit as u8) | (1 << Syscall::Socket as u8),
+        ));
+        let mut capabilities = CapabilitySet::EMPTY;
+        capabilities.grant(Capability::WriteConsole);
+
+        assert_eq!(authorize(&policy, capabilities, 1), Ok(Syscall::Write));
+        assert_eq!(authorize(&policy, capabilities, 12), Ok(Syscall::Exit));
+        assert_eq!(
+            authorize(&policy, capabilities, 5),
+            Err(SyscallViolation::MissingCapability(Syscall::Socket))
+        );
+        assert_eq!(
+            authorize(&policy, capabilities, 11),
+            Err(SyscallViolation::DeniedByPolicy(Syscall::CreateProcess))
+        );
+        assert_eq!(
+            authorize(&policy, capabilities, 999),
+            Err(SyscallViolation::UnknownSyscall(999))
+        );
+    }
+
+    #[test]
+    fn every_syscall_number_round_trips() {
+        for number in 0..15 {
+            let syscall = Syscall::from_number(number).expect("defined syscall");
+            assert_eq!(syscall as u64, number);
+        }
+        assert_eq!(Syscall::from_number(15), None);
     }
 
     #[test]

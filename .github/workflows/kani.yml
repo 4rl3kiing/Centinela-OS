@@ -2,7 +2,7 @@ name: Kani bounded formal proofs
 
 on:
   push:
-    branches: ["hardening/**"]
+    branches: ["hardening/**", "microkernel/**"]
   workflow_dispatch:
   schedule:
     - cron: "17 5 * * 1"
