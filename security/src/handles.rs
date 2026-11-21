@@ -40,6 +40,15 @@ pub struct CapabilityHandle<T> {
     marker: PhantomData<fn() -> T>,
 }
 
+impl<T> CapabilityHandle<T> {
+    /// Opaque integer form handed to user mode: `generation << 16 | slot`.
+    /// The table identifier is deliberately omitted; a raw handle can only be
+    /// resolved against the table of the task that presents it.
+    pub const fn to_raw(self) -> u64 {
+        ((self.generation as u64) << 16) | self.slot as u64
+    }
+}
+
 impl<T> Copy for CapabilityHandle<T> {}
 
 impl<T> Clone for CapabilityHandle<T> {
@@ -114,6 +123,21 @@ impl<T, const N: usize> CapabilityTable<T, N> {
             table_id,
             slots: core::array::from_fn(|_| Slot::empty()),
         })
+    }
+
+    /// Interprets a user-supplied raw handle in this table's namespace. Any
+    /// value is accepted here; forged or stale values fail validation later.
+    pub const fn handle_from_raw(&self, raw: u64) -> CapabilityHandle<T> {
+        CapabilityHandle {
+            table_id: self.table_id,
+            slot: raw as u16,
+            generation: if raw >> 48 != 0 {
+                0
+            } else {
+                (raw >> 16) as u32
+            },
+            marker: PhantomData,
+        }
     }
 
     pub fn insert(&mut self, value: T, rights: Rights) -> Result<CapabilityHandle<T>, TableError> {
@@ -272,6 +296,25 @@ mod tests {
             Err(TableError::InvalidHandle)
         );
         assert_eq!(task_b.remove(handle_a), Err(TableError::InvalidHandle));
+    }
+
+    #[test]
+    fn raw_handles_round_trip_and_forgeries_fail() {
+        let mut table = CapabilityTable::<u32, 4>::new(7).expect("valid capacity");
+        let handle = table.insert(5, Rights::READ).expect("slot available");
+        let raw = handle.to_raw();
+        assert_eq!(table.handle_from_raw(raw), handle);
+        assert_eq!(
+            *table.get(table.handle_from_raw(raw), Rights::READ).unwrap(),
+            5
+        );
+
+        for forged in [0, 0xdead_beef, raw + 1, raw | (1 << 60), u64::MAX] {
+            assert_eq!(
+                table.get(table.handle_from_raw(forged), Rights::READ),
+                Err(TableError::InvalidHandle)
+            );
+        }
     }
 
     #[test]

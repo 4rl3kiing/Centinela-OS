@@ -9,7 +9,7 @@ The project has a freestanding Rust kernel with a Limine BIOS/UEFI boot path and
 - CPU architecture: x86_64.
 - Firmware boot: legacy BIOS and UEFI through a common boot protocol.
 - Bootloader/protocol candidate: Limine.
-- Kernel model: capability-based hybrid microkernel. The zero-trust layer-isolation foundation (Ring 3 tasks, syscall gate, per-task address spaces) is implemented; IPC, scheduler and user-space services are next.
+- Kernel model: capability-based hybrid microkernel. ADR-0002 acceptance is met: Ring 3 tasks, capability-checked IPC, a Ring 3 service and supervised restart under fault injection.
 - Kernel language: Rust, `no_std` in privileged code.
 - Initial binary target: `x86_64-unknown-none`.
 - Initial execution environments: QEMU first; physical hardware after repeatable virtual-machine validation.
@@ -61,4 +61,6 @@ Bootstrap, PMM and hardening milestones passed under BIOS and UEFI in QEMU, with
 
 **Microkernel foundation (zero-trust layer isolation):** GDT/TSS with IST stacks, IDT with fail-closed Ring 0 handling, guard pages on every kernel stack (including the kernel's own execution stack), per-task address spaces with a supervisor-only kernel half, a SYSCALL gate with policy plus capability authorization, validated user-memory copies that never dereference user addresses, and a local APIC watchdog. Every boot runs one benign and eleven hostile Ring 3 tasks; each attack (kernel memory reads, privileged instructions, port I/O, W^X and NX violations, spoofed interrupts, forbidden/unknown/uncapable syscalls, CPU monopolization, stack overflow) is contained, its memory reclaimed, and the kernel keeps running. See ADR-0003.
 
-Not yet implemented: IPC and capability transfer, scheduler, service restart, SMP, ELF loading, KASLR, KPTI, heap hardening and IOMMU.
+**Microkernel milestone (ADR-0002 acceptance):** a Ring 3 service is reached only through an endpoint capability (separate SEND/RECEIVE rights, 4-word bounded messages). A client injects a fault into it; the kernel returns `EPIPE` to the client, the supervisor restarts the service with fresh memory and capabilities, and the next request succeeds. Forged handles, missing rights, oversized messages and capability-less IPC terminate the offender.
+
+Not yet implemented: capability transfer over IPC, user-space service manager, preemptive scheduler, SMP, ELF loading, KASLR, KPTI, heap hardening and IOMMU.

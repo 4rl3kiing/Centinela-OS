@@ -156,9 +156,11 @@ mod runtime {
         "    pop rsp",
         "    sysretq",
         "",
-        // u64 centinela_enter_user(u64 *saved_rsp, u64 rip, u64 rsp)
-        ".global centinela_enter_user",
-        "centinela_enter_user:",
+        // u64 centinela_resume_user(u64 *saved_rsp, const SyscallFrame *frame)
+        // Loads every user register from `frame` and enters Ring 3. Used both
+        // to start a task (fresh frame) and to resume one blocked in a syscall.
+        ".global centinela_resume_user",
+        "centinela_resume_user:",
         "    push rbx",
         "    push rbp",
         "    push r12",
@@ -166,23 +168,24 @@ mod runtime {
         "    push r14",
         "    push r15",
         "    mov [rdi], rsp",
-        "    mov rcx, rsi",
+        "    mov rcx, [rsi + {off_rip}]",
         "    mov r11, {user_rflags}",
-        "    mov rsp, rdx",
-        // Start the task with no kernel data in any register.
-        "    xor eax, eax",
-        "    xor ebx, ebx",
-        "    xor edx, edx",
-        "    xor esi, esi",
-        "    xor edi, edi",
-        "    xor ebp, ebp",
-        "    xor r8d, r8d",
-        "    xor r9d, r9d",
-        "    xor r10d, r10d",
-        "    xor r12d, r12d",
-        "    xor r13d, r13d",
-        "    xor r14d, r14d",
-        "    xor r15d, r15d",
+        "    mov rax, [rsi + {off_rax}]",
+        "    mov r9, [rsi + {off_r9}]",
+        "    mov r8, [rsi + {off_r8}]",
+        "    mov r10, [rsi + {off_r10}]",
+        "    mov rdx, [rsi + {off_rdx}]",
+        "    mov rdi, [rsi + {off_rdi}]",
+        "    mov rbp, [rsi + {off_rbp}]",
+        "    mov rbx, [rsi + {off_rbx}]",
+        "    mov r12, [rsi + {off_r12}]",
+        "    mov r13, [rsi + {off_r13}]",
+        "    mov r14, [rsi + {off_r14}]",
+        "    mov r15, [rsi + {off_r15}]",
+        // The frame lives in kernel memory, which stays mapped (supervisor)
+        // after the stack switch; RSI is loaded last because it is the base.
+        "    mov rsp, [rsi + {off_rsp}]",
+        "    mov rsi, [rsi + {off_rsi}]",
         "    sysretq",
         "",
         // ! centinela_resume_kernel(u64 saved_rsp, u64 result)
@@ -199,11 +202,26 @@ mod runtime {
         "    ret",
         entry = sym syscall_entry,
         user_rflags = const USER_RFLAGS,
+        off_rax = const core::mem::offset_of!(SyscallFrame, rax),
+        off_r9 = const core::mem::offset_of!(SyscallFrame, r9),
+        off_r8 = const core::mem::offset_of!(SyscallFrame, r8),
+        off_r10 = const core::mem::offset_of!(SyscallFrame, r10),
+        off_rdx = const core::mem::offset_of!(SyscallFrame, rdx),
+        off_rsi = const core::mem::offset_of!(SyscallFrame, rsi),
+        off_rdi = const core::mem::offset_of!(SyscallFrame, rdi),
+        off_rbp = const core::mem::offset_of!(SyscallFrame, rbp),
+        off_rbx = const core::mem::offset_of!(SyscallFrame, rbx),
+        off_r12 = const core::mem::offset_of!(SyscallFrame, r12),
+        off_r13 = const core::mem::offset_of!(SyscallFrame, r13),
+        off_r14 = const core::mem::offset_of!(SyscallFrame, r14),
+        off_r15 = const core::mem::offset_of!(SyscallFrame, r15),
+        off_rip = const core::mem::offset_of!(SyscallFrame, rip),
+        off_rsp = const core::mem::offset_of!(SyscallFrame, rsp),
     );
 
     unsafe extern "C" {
         fn centinela_syscall_entry();
-        fn centinela_enter_user(saved_rsp: *mut u64, rip: u64, rsp: u64) -> u64;
+        fn centinela_resume_user(saved_rsp: *mut u64, frame: *const SyscallFrame) -> u64;
         fn centinela_resume_kernel(saved_rsp: u64, result: u64) -> !;
     }
 
@@ -261,31 +279,37 @@ mod runtime {
         }
     }
 
-    /// Runs user code until the kernel calls [`resume_kernel`]; returns the
-    /// value passed to it.
+    /// Enters Ring 3 with the registers in `frame` and runs until the kernel
+    /// calls [`resume_kernel`]; returns the value passed to it.
+    ///
+    /// The return address is re-validated here so a corrupted frame can never
+    /// reach SYSRET with a non-user RIP.
     ///
     /// # Safety
-    /// The active CR3 must map `rip` (user, executable) and `rsp` (user,
-    /// writable); `kernel_stack_top` must be a dedicated kernel stack that is
-    /// also installed as TSS.rsp0. `saved_rsp` must stay valid until resumed.
-    pub unsafe fn enter_user(
+    /// The active CR3 must map `frame.rip` (user, executable) and `frame.rsp`
+    /// (user, writable); `kernel_stack_top` must be a dedicated kernel stack
+    /// that is also installed as TSS.rsp0. `saved_rsp` must stay valid until
+    /// resumed.
+    pub unsafe fn resume_user(
         saved_rsp: *mut u64,
-        rip: u64,
-        rsp: u64,
+        frame: &SyscallFrame,
         kernel_stack_top: u64,
-    ) -> u64 {
+    ) -> Result<u64, ReturnFrameError> {
+        if frame.rip >= USER_ADDRESS_LIMIT || frame.rsp > USER_ADDRESS_LIMIT {
+            return Err(ReturnFrameError::NonUserReturnAddress);
+        }
         // SAFETY: Guaranteed by the caller; single CPU with IF=0.
         unsafe {
             core::ptr::addr_of_mut!(CENTINELA_SYSCALL_KERNEL_RSP).write(kernel_stack_top);
-            centinela_enter_user(saved_rsp, rip, rsp)
+            Ok(centinela_resume_user(saved_rsp, frame))
         }
     }
 
     /// Abandons the current trap/syscall stack and returns `result` from the
-    /// matching [`enter_user`] call.
+    /// matching [`resume_user`] call.
     ///
     /// # Safety
-    /// `saved_rsp` must be the value stored by the active `enter_user` call
+    /// `saved_rsp` must be the value stored by the active `resume_user` call
     /// and the caller must not hold references into the abandoned stack.
     pub unsafe fn resume_kernel(saved_rsp: u64, result: u64) -> ! {
         // SAFETY: Guaranteed by the caller.
@@ -294,7 +318,7 @@ mod runtime {
 }
 
 #[cfg(target_os = "none")]
-pub use runtime::{enter_user, init, resume_kernel};
+pub use runtime::{init, resume_kernel, resume_user};
 
 #[cfg(test)]
 mod tests {

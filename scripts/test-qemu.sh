@@ -30,7 +30,12 @@ REQUIRED_MESSAGES=(
     "[task hello] hello from an isolated Ring 3 task .[2J"
     "[task hello] kernel pointer rejected with EFAULT"
     "Isolation: 12/12 tasks behaved as required; kernel still running."
-    "Microkernel milestone: layer isolation verified; every hostile task contained."
+    "[task client] service replied 40 + 2 = 42"
+    "Supervisor: service adder-service restarted with fresh memory and capabilities (restart 1)."
+    "[task client] service crashed mid-request; kernel returned EPIPE"
+    "[task client] restarted service replied 40 + 2 = 42"
+    "Microkernel: 6/6 IPC/service checks passed; kernel still running."
+    "Microkernel milestone: ADR-0002 acceptance met (Ring 3 service, capability IPC, supervised restart); every hostile task contained."
 )
 
 fail() {

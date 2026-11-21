@@ -7,6 +7,8 @@
 #[cfg(target_os = "none")]
 mod isolation;
 #[cfg(target_os = "none")]
+mod system;
+#[cfg(target_os = "none")]
 mod user_programs;
 
 use core::mem::MaybeUninit;
@@ -450,12 +452,13 @@ fn run_isolation(memory: &mut HhdmFrameMemory<'_, '_>, kernel_root: PhysAddr, hh
     if !isolation::init_cpu_layer(memory, kernel_root) {
         halt_forever();
     }
-    if isolation::run_isolation_self_test(memory, kernel_root, hhdm) {
+    if system::run_self_test(memory, kernel_root, hhdm) {
         serial_write(
-            "Microkernel milestone: layer isolation verified; every hostile task contained.\r\n",
+            "Microkernel milestone: ADR-0002 acceptance met (Ring 3 service, capability IPC, \
+             supervised restart); every hostile task contained.\r\n",
         );
     } else {
-        serial_write("Centinela-OS: isolation self-test failed.\r\n");
+        serial_write("Centinela-OS: microkernel self-test failed.\r\n");
     }
 }
 

@@ -19,9 +19,13 @@ pub enum Syscall {
     MapMemory = 10,
     CreateProcess = 11,
     Exit = 12,
+    /// Synchronous IPC: send a request on an endpoint and wait for the reply.
+    IpcCall = 13,
+    /// Synchronous IPC: reply to the pending caller, then wait for a request.
+    IpcReplyWait = 14,
 }
 
-const VALID_SYSCALL_BITS: u64 = (1 << 13) - 1;
+const VALID_SYSCALL_BITS: u64 = (1 << 15) - 1;
 
 impl Syscall {
     /// Decodes a raw syscall number from Ring 3. Unknown numbers are `None`.
@@ -40,6 +44,8 @@ impl Syscall {
             10 => Self::MapMemory,
             11 => Self::CreateProcess,
             12 => Self::Exit,
+            13 => Self::IpcCall,
+            14 => Self::IpcReplyWait,
             _ => return None,
         })
     }
@@ -57,7 +63,9 @@ impl Syscall {
             }
             Self::MapMemory => Some(Capability::ManageMemory),
             Self::CreateProcess => Some(Capability::ManageProcesses),
-            Self::Exit => None,
+            // IPC authority comes from the endpoint handle's rights
+            // (object capability), checked by the IPC layer.
+            Self::Exit | Self::IpcCall | Self::IpcReplyWait => None,
         }
     }
 }
@@ -199,11 +207,11 @@ mod tests {
 
     #[test]
     fn every_syscall_number_round_trips() {
-        for number in 0..13 {
+        for number in 0..15 {
             let syscall = Syscall::from_number(number).expect("defined syscall");
             assert_eq!(syscall as u64, number);
         }
-        assert_eq!(Syscall::from_number(13), None);
+        assert_eq!(Syscall::from_number(15), None);
     }
 
     #[test]
