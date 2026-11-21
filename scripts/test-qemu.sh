@@ -70,6 +70,16 @@ fail() {
     exit 1
 }
 
+# KVM=1: hardware virtualization (real CPU execution, timing and SMP
+# concurrency). Logs get a "kvm-" prefix so TCG and KVM results coexist.
+ACCEL=()
+P=""
+if [[ "${KVM:-0}" == "1" ]]; then
+    test -w /dev/kvm || { echo "KVM=1 but /dev/kvm is not accessible" >&2; exit 1; }
+    ACCEL=(-accel kvm,kernel-irqchip=split)
+    P="kvm-"
+fi
+
 # Commands typed into the Ring 3 shell through COM3.
 SHELL_INPUT=build/shell-input.txt
 mkdir -p build
@@ -90,11 +100,11 @@ run_and_check() {
     local -a extra=()
     while [[ "$1" != "--" ]]; do extra+=("$1"); shift; done
     shift
-    local log="build/logs/qemu-$mode.log"
-    local stderr="build/logs/qemu-$mode.stderr"
+    local log="build/logs/qemu-$P$mode.log"
+    local stderr="build/logs/qemu-$P$mode.stderr"
     : >"$log"
     set +e
-    timeout "$TIMEOUT_SECONDS" "$QEMU" -machine q35 -m 512M -smp 4 -device intel-iommu -device e1000,netdev=n0 -netdev user,id=n0 -display none -monitor none \
+    timeout "$TIMEOUT_SECONDS" "$QEMU" -machine q35 -m 512M -smp 4 "${ACCEL[@]}" -device intel-iommu -device e1000,netdev=n0 -netdev user,id=n0 -display none -monitor none \
         -serial "file:$log" -serial null \
         -chardev "file,id=shellin,path=/dev/null,input-path=$SHELL_INPUT" -serial chardev:shellin \
         -no-reboot -no-shutdown "$@" >"$stderr" 2>&1
@@ -166,7 +176,7 @@ if [[ "${SECURE_BOOT_TEST:-0}" == "1" ]]; then
         -drive "if=pflash,format=raw,file=build/OVMF_VARS.secboot.fd" \
         -cdrom "$ISO" -boot d
     sb_vars wrong-db build/OVMF_VARS.wrongkey.fd
-    log=build/logs/qemu-uefi-secureboot-wrongkey.log
+    log=build/logs/qemu-${P}uefi-secureboot-wrongkey.log
     : >"$log"
     set +e
     timeout "$TIMEOUT_SECONDS" "$QEMU" "${SB_MACHINE[@]}" -m 512M -display none -monitor none \
@@ -183,7 +193,7 @@ if [[ "${SECURE_BOOT_TEST:-0}" == "1" ]]; then
 fi
 
 # KASLR: the three boots must not all share one kernel virtual base.
-bases=$(grep -h -o "KASLR virtual base 0x[0-9a-f]*" build/logs/qemu-bios.log build/logs/qemu-bios-cpu-max.log build/logs/qemu-uefi.log | sort -u | wc -l)
+bases=$(grep -h -o "KASLR virtual base 0x[0-9a-f]*" "build/logs/qemu-${P}bios.log" "build/logs/qemu-${P}bios-cpu-max.log" "build/logs/qemu-${P}uefi.log" | sort -u | wc -l)
 if [[ "$bases" -lt 2 ]]; then
     echo "KASLR check failed: kernel virtual base did not change across boots" >&2
     exit 1

@@ -54,6 +54,7 @@ The PMM is an initial single-core implementation. It is not yet a complete virtu
 - [ADR-0002: capability-based hybrid microkernel](docs/decisions/0002-hybrid-microkernel.md)
 - [ADR-0003: zero-trust layer isolation](docs/decisions/0003-layer-isolation-zero-trust.md)
 - [ADR-0004: SMP, IOMMU, Ring 3 drivers and first services](docs/decisions/0004-smp-iommu-drivers-services.md)
+- [Hardware testing procedure](docs/hardware-testing.md)
 - [Layered security hardening implementation plan](docs/security/hardening-implementation-plan.md)
 
 ## Current status
