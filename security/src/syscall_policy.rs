@@ -27,9 +27,11 @@ pub enum Syscall {
     PortIo = 15,
     /// Re-arms the caller's own bound interrupt line after servicing it.
     IrqAck = 16,
+    /// Revokes every copy of a badge minted from the caller's endpoint capability.
+    Revoke = 17,
 }
 
-const VALID_SYSCALL_BITS: u64 = (1 << 17) - 1;
+const VALID_SYSCALL_BITS: u64 = (1 << 18) - 1;
 
 impl Syscall {
     /// Decodes a raw syscall number from Ring 3. Unknown numbers are `None`.
@@ -52,6 +54,7 @@ impl Syscall {
             14 => Self::IpcReplyWait,
             15 => Self::PortIo,
             16 => Self::IrqAck,
+            17 => Self::Revoke,
             _ => return None,
         })
     }
@@ -74,7 +77,8 @@ impl Syscall {
             Self::PortIo | Self::IrqAck => Some(Capability::DeviceAccess),
             // IPC authority comes from the endpoint handle's rights
             // (object capability), checked by the IPC layer.
-            Self::Exit | Self::IpcCall | Self::IpcReplyWait => None,
+            // Revocation authority is the unbadged GRANT capability itself.
+            Self::Exit | Self::IpcCall | Self::IpcReplyWait | Self::Revoke => None,
         }
     }
 }
@@ -216,11 +220,11 @@ mod tests {
 
     #[test]
     fn every_syscall_number_round_trips() {
-        for number in 0..17 {
+        for number in 0..18 {
             let syscall = Syscall::from_number(number).expect("defined syscall");
             assert_eq!(syscall as u64, number);
         }
-        assert_eq!(Syscall::from_number(17), None);
+        assert_eq!(Syscall::from_number(18), None);
     }
 
     #[test]

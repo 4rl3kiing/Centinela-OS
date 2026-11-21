@@ -17,6 +17,11 @@ pub const FLAG_DEFER_REPLY: u64 = 1 << 17;
 pub const STATUS_NO_RECEIVER: u64 = (-3_i64) as u64;
 pub const SYS_PORT_IO: u64 = 15;
 pub const SYS_IRQ_ACK: u64 = 16;
+pub const SYS_REVOKE: u64 = 17;
+/// Transfer: mint the transferred capability with the badge in word 2.
+pub const FLAG_MINT_BADGE: u64 = 1 << 18;
+/// SEND right bits, for capability transfers (flags bits 8-15).
+pub const RIGHT_SEND: u64 = 1 << 1;
 /// Set by the kernel in delivered flags for kernel-originated messages.
 pub const FLAG_KERNEL_ORIGIN: u64 = 1 << 16;
 /// Label of the kernel notice sent when a bound IRQ fires.
@@ -108,6 +113,8 @@ pub unsafe fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 {
 /// A message received from an endpoint.
 pub struct Received {
     pub status: u64,
+    /// Badge of the capability the sender used (0: unbadged, reply, notice).
+    pub badge: u64,
     pub flags: u64,
     pub words: [u64; 4],
 }
@@ -124,14 +131,14 @@ impl Received {
 
 /// Raw IPC syscall: `flags` holds the length (bits 0-7) and option bits.
 pub fn ipc(number: u64, endpoint: u64, flags: u64, words: [u64; 4]) -> Received {
-    let (status, out_flags, w0, w1, w2, w3): (u64, u64, u64, u64, u64, u64);
+    let (status, badge, out_flags, w0, w1, w2, w3): (u64, u64, u64, u64, u64, u64, u64);
     // SAFETY: Register ABI of the IPC syscalls; the kernel validates the
     // handle, the flags and the message bounds.
     unsafe {
         core::arch::asm!(
             "syscall",
             inlateout("rax") number => status,
-            in("rdi") endpoint,
+            inlateout("rdi") endpoint => badge,
             inlateout("rsi") flags => out_flags,
             inlateout("rdx") words[0] => w0,
             inlateout("r10") words[1] => w1,
@@ -144,6 +151,7 @@ pub fn ipc(number: u64, endpoint: u64, flags: u64, words: [u64; 4]) -> Received 
     }
     Received {
         status,
+        badge,
         flags: out_flags,
         words: [w0, w1, w2, w3],
     }
@@ -175,6 +183,22 @@ pub fn call(endpoint: u64, words: [u64; 4]) -> Option<Received> {
         core::hint::spin_loop();
     }
     None
+}
+
+/// Replies granting a SEND copy of `cap`, minted with `badge`, then waits.
+pub fn reply_minting(endpoint: u64, cap: u64, badge: u64) -> Received {
+    ipc(
+        SYS_IPC_REPLY_WAIT,
+        endpoint,
+        3 | (RIGHT_SEND << 8) | FLAG_MINT_BADGE,
+        [0, 0, badge, cap],
+    )
+}
+
+/// Revokes every copy of `badge` minted from the unbadged capability `cap`.
+pub fn revoke(cap: u64, badge: u64) -> u64 {
+    // SAFETY: The kernel checks that `cap` is an unbadged GRANT capability.
+    unsafe { syscall2(SYS_REVOKE, cap, badge) }
 }
 
 /// Packs up to 8 bytes into a word (little endian).

@@ -218,6 +218,26 @@ impl<T, const N: usize> CapabilityTable<T, N> {
         Ok(value)
     }
 
+    /// Kernel-initiated revocation: removes every capability whose value
+    /// matches, bumping each slot's generation so outstanding raw handles go
+    /// stale. Returns how many were revoked. Holders need no CONTROL right:
+    /// revocation is decided by the kernel on behalf of the object's minter.
+    pub fn revoke_matching(&mut self, matches: impl Fn(&T) -> bool) -> usize {
+        let mut revoked = 0;
+        for slot in self.slots.iter_mut() {
+            if slot.value.as_ref().is_some_and(&matches) {
+                slot.value = None;
+                slot.rights = Rights::NONE;
+                match slot.generation.checked_add(1) {
+                    Some(next) => slot.generation = next,
+                    None => slot.retired = true,
+                }
+                revoked += 1;
+            }
+        }
+        revoked
+    }
+
     fn validated_slot(&self, handle: CapabilityHandle<T>) -> Result<&Slot<T>, TableError> {
         if handle.table_id != self.table_id {
             return Err(TableError::InvalidHandle);
@@ -252,6 +272,27 @@ impl<T, const N: usize> CapabilityTable<T, N> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn revoke_matching_invalidates_outstanding_handles() {
+        let mut table: super::CapabilityTable<(usize, u64), 4> =
+            super::CapabilityTable::new(7).unwrap();
+        let read = super::Rights::READ;
+        let a = table.insert((1, 10), read).unwrap();
+        let b = table.insert((1, 20), read).unwrap();
+        let c = table.insert((2, 10), read).unwrap();
+        assert_eq!(
+            table.revoke_matching(|&(e, badge)| e == 1 && badge == 10),
+            1
+        );
+        assert_eq!(table.get(a, read), Err(super::TableError::InvalidHandle));
+        assert!(table.get(b, read).is_ok());
+        assert!(table.get(c, read).is_ok());
+        // A fresh capability in the same slot gets a new handle.
+        let d = table.insert((1, 30), read).unwrap();
+        assert_ne!(a.to_raw(), d.to_raw());
+        assert_eq!(table.get(a, read), Err(super::TableError::InvalidHandle));
+    }
+
     use super::{CapabilityTable, Rights, TableError};
 
     #[test]

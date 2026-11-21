@@ -2,6 +2,9 @@
 //! descriptors, offsets and lengths are bounds-checked and answered with an
 //! error code, so a hostile client can neither crash the service nor reach
 //! memory outside the file it names.
+//!
+//! Each client sees only its own namespace: files are owned by the badge of
+//! the capability used to create them (minted by a broker, unforgeable).
 #![no_std]
 #![no_main]
 
@@ -22,13 +25,16 @@ const ENOENT: u64 = 4;
 struct Fs {
     storage: *mut u8,
     names: [u64; MAX_FILES],
+    owners: [u64; MAX_FILES],
     sizes: [usize; MAX_FILES],
+    /// Badge of the client being served.
+    badge: u64,
 }
 
 impl Fs {
     fn file(&mut self, fd: u64) -> Option<usize> {
         let fd = usize::try_from(fd).ok()?;
-        (fd < MAX_FILES && self.names[fd] != 0).then_some(fd)
+        (fd < MAX_FILES && self.names[fd] != 0 && self.owners[fd] == self.badge).then_some(fd)
     }
 
     fn data(&mut self, fd: usize) -> &mut [u8] {
@@ -44,7 +50,10 @@ impl Fs {
                 if name == 0 {
                     return [EINVAL, 0, 0, 0];
                 }
-                if let Some(fd) = self.names.iter().position(|&n| n == name) {
+                let badge = self.badge;
+                if let Some(fd) =
+                    (0..MAX_FILES).find(|&fd| self.names[fd] == name && self.owners[fd] == badge)
+                {
                     return [0, fd as u64, self.sizes[fd] as u64, 0];
                 }
                 if !create {
@@ -53,6 +62,7 @@ impl Fs {
                 match self.names.iter().position(|&n| n == 0) {
                     Some(fd) => {
                         self.names[fd] = name;
+                        self.owners[fd] = badge;
                         self.sizes[fd] = 0;
                         [0, fd as u64, 0, 0]
                     }
@@ -115,12 +125,15 @@ pub extern "C" fn _start(endpoint: u64) -> ! {
     let mut fs = Fs {
         storage,
         names: [0; MAX_FILES],
+        owners: [0; MAX_FILES],
         sizes: [0; MAX_FILES],
+        badge: 0,
     };
     write("ramfs: serving 8 files x 4 KiB over IPC");
     let mut message = reply_wait(endpoint);
     loop {
         let reply = if message.status == 0 && message.flags & FLAG_KERNEL_ORIGIN == 0 {
+            fs.badge = message.badge;
             fs.handle(message.words)
         } else {
             [EINVAL, 0, 0, 0]

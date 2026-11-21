@@ -63,3 +63,15 @@ name = "fs-fuzzer"
 path = "src/bin/fs_fuzzer.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "broker"
+path = "src/bin/broker.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "badge-client"
+path = "src/bin/badge_client.rs"
+test = false
+bench = false

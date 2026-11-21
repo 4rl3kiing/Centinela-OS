@@ -44,7 +44,7 @@ use centinela_kernel::elf::{self, ElfError};
 use centinela_security::permissions::PagePermissions;
 
 const MAX_TASKS: usize = 8;
-const ENDPOINT_COUNT: usize = 7;
+const ENDPOINT_COUNT: usize = 8;
 /// Interrupt vectors reserved for IRQs bound to Ring 3 drivers.
 pub(crate) const DEVICE_VECTOR_BASE: u64 = 0x24;
 const MAX_IRQ_ROUTES: usize = 4;
@@ -85,6 +85,8 @@ const ENDPOINT_KBD: usize = 3;
 const ENDPOINT_CONSOLE: usize = 4;
 const ENDPOINT_FS: usize = 5;
 const ENDPOINT_NET: usize = 6;
+/// Capability broker that mints badged filesystem capabilities.
+const ENDPOINT_BROKER: usize = 7;
 
 /// Why a driver's device access was refused (always fatal for the task).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,6 +122,14 @@ impl DeviceGrant {
             })
         })
     }
+}
+
+/// An endpoint capability: the endpoint plus the badge the server sees on
+/// every request sent through it (0 = unbadged minter capability).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EndpointCap {
+    endpoint: usize,
+    badge: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -245,6 +255,8 @@ struct TaskSpec {
     supervisor: Option<usize>,
     /// Ports and IRQ of a Ring 3 driver (grants DeviceAccess).
     device: Option<DeviceGrant>,
+    /// Start-up argument delivered in RCX (4th SysV argument of `_start`).
+    arg: u64,
     expect: Expect,
 }
 
@@ -262,7 +274,7 @@ struct Task {
     root: PhysAddr,
     policy: SyscallPolicy,
     capabilities: CapabilitySet,
-    endpoints: CapabilityTable<usize, 8>,
+    endpoints: CapabilityTable<EndpointCap, 8>,
     processes: CapabilityTable<usize, 4>,
     /// Raw handle this task holds for the process capability it was granted.
     process_handle: Option<(usize, u64)>,
@@ -460,6 +472,7 @@ pub fn syscall_handler(frame: &mut SyscallFrame) {
         Ok(Syscall::MapMemory) => map_memory_request(system, frame),
         Ok(Syscall::PortIo) => port_io(system, frame),
         Ok(Syscall::IrqAck) => irq_ack(system, frame),
+        Ok(Syscall::Revoke) => revoke(system, frame),
         Ok(_) => frame.rax = ENOSYS,
     }
     if frame.sanitize_for_sysret().is_err() {
@@ -522,6 +535,31 @@ fn port_io(system: &mut System, frame: &mut SyscallFrame) {
         }
         frame.rax = u64::from(value);
     }
+}
+
+/// `Revoke`: RDI = an unbadged endpoint capability holding GRANT (the
+/// minter), RSI = badge. Removes every badged copy from every task, so all
+/// outstanding handles go stale at once. Returns the number revoked.
+fn revoke(system: &mut System, frame: &mut SyscallFrame) {
+    let minter = current_task(system)
+        .ok_or(IpcViolation::InvalidHandle)
+        .and_then(|task| resolve_endpoint(task, frame.rdi, Rights::GRANT));
+    let cap = match minter {
+        Ok(cap) if cap.badge == 0 && frame.rsi != 0 => cap,
+        Ok(_) => terminate(system, TaskExit::Ipc(IpcViolation::BadgeForgery)),
+        Err(violation) => terminate(system, TaskExit::Ipc(violation)),
+    };
+    let target = EndpointCap {
+        endpoint: cap.endpoint,
+        badge: frame.rsi,
+    };
+    let revoked: usize = system
+        .tasks
+        .iter_mut()
+        .flatten()
+        .map(|task| task.endpoints.revoke_matching(|held| *held == target))
+        .sum();
+    frame.rax = revoked as u64;
 }
 
 /// `IrqAck`: re-arms the caller's own bound line; no arguments to forge.
@@ -630,7 +668,7 @@ fn table_violation(error: TableError) -> IpcViolation {
 }
 
 /// Resolves the endpoint named by a raw user handle, requiring `rights`.
-fn resolve_endpoint(task: &Task, raw: u64, rights: Rights) -> Result<usize, IpcViolation> {
+fn resolve_endpoint(task: &Task, raw: u64, rights: Rights) -> Result<EndpointCap, IpcViolation> {
     let handle = task.endpoints.handle_from_raw(raw);
     task.endpoints
         .get(handle, rights)
@@ -641,7 +679,7 @@ fn resolve_endpoint(task: &Task, raw: u64, rights: Rights) -> Result<usize, IpcV
 /// A validated outgoing message, possibly carrying an attenuated capability.
 struct Outgoing {
     message: Message,
-    transfer: Option<(usize, Rights)>,
+    transfer: Option<(EndpointCap, Rights)>,
     defer_reply: bool,
 }
 
@@ -654,8 +692,16 @@ fn outgoing(task: &Task, frame: &SyscallFrame) -> Result<Outgoing, IpcViolation>
             // The capability to pass travels in the last word (R9).
             let handle = task.endpoints.handle_from_raw(frame.r9);
             let held = task.endpoints.rights(handle).map_err(table_violation)?;
-            let endpoint = *task.endpoints.get(handle, held).map_err(table_violation)?;
-            Some((endpoint, attenuate(held, requested)?))
+            let mut cap = *task.endpoints.get(handle, held).map_err(table_violation)?;
+            if flags.mint_badge {
+                // Only the unbadged minter capability may mint, never badge 0.
+                if cap.badge != 0 || frame.r8 == 0 {
+                    return Err(IpcViolation::BadgeForgery);
+                }
+                cap.badge = frame.r8;
+            }
+            let rights = attenuate(held, requested)?;
+            Some((cap, rights))
         }
     };
     let message =
@@ -670,7 +716,7 @@ fn outgoing(task: &Task, frame: &SyscallFrame) -> Result<Outgoing, IpcViolation>
 /// Writes a status, message and optional new capability into a receiver's
 /// saved registers. The flags word is rebuilt by the kernel, so a sender can
 /// never make a message look kernel-originated.
-fn deliver(receiver: &mut Task, status: u64, outgoing: &Outgoing, kernel_origin: bool) {
+fn deliver(receiver: &mut Task, status: u64, outgoing: &Outgoing, kernel_origin: bool, badge: u64) {
     let words = outgoing.message.words();
     let mut granted = None;
     let mut last_word = words[3];
@@ -686,6 +732,8 @@ fn deliver(receiver: &mut Task, status: u64, outgoing: &Outgoing, kernel_origin:
     }
     let frame = &mut receiver.context;
     frame.rax = status;
+    // The badge of the capability the sender used (0 for replies/notices).
+    frame.rdi = badge;
     frame.rsi = MessageFlags::delivered(outgoing.message.length() as u64, granted, kernel_origin);
     frame.rdx = words[0];
     frame.r10 = words[1];
@@ -699,7 +747,7 @@ fn deliver_status(receiver: &mut Task, status: u64) {
         transfer: None,
         defer_reply: false,
     };
-    deliver(receiver, status, &empty, false);
+    deliver(receiver, status, &empty, false, 0);
 }
 
 fn deliver_notice(receiver: &mut Task, process_handle: u64, code: u64) {
@@ -709,7 +757,7 @@ fn deliver_notice(receiver: &mut Task, process_handle: u64, code: u64) {
         transfer: None,
         defer_reply: false,
     };
-    deliver(receiver, STATUS_OK, &notice, true);
+    deliver(receiver, STATUS_OK, &notice, true, 0);
 }
 
 fn ipc_call(system: &mut System, frame: &mut SyscallFrame) {
@@ -729,11 +777,12 @@ fn ipc_call(system: &mut System, frame: &mut SyscallFrame) {
         Ok(value) => value,
         Err(violation) => terminate(system, TaskExit::Ipc(violation)),
     };
+    let EndpointCap { endpoint, badge } = endpoint;
     match system.endpoints[endpoint].rendezvous.call(caller) {
         CallOutcome::NoReceiver => frame.rax = STATUS_NO_RECEIVER,
         CallOutcome::Delivered { server } => {
             if let Some(server) = system.tasks[server].as_mut() {
-                deliver(server, STATUS_OK, &request, false);
+                deliver(server, STATUS_OK, &request, false, badge);
                 server.serving = true;
                 server.state = TaskState::Ready;
             }
@@ -754,6 +803,7 @@ fn ipc_reply_wait(system: &mut System, frame: &mut SyscallFrame) {
         Ok(value) => value,
         Err(violation) => terminate(system, TaskExit::Ipc(violation)),
     };
+    let endpoint = endpoint.endpoint;
     let deferred = reply.defer_reply;
     if deferred {
         system.endpoints[endpoint].rendezvous.wait_deferred(server);
@@ -761,7 +811,7 @@ fn ipc_reply_wait(system: &mut System, frame: &mut SyscallFrame) {
         && let Some(caller) = system.tasks[caller].as_mut()
         && caller.state == TaskState::BlockedReply
     {
-        deliver(caller, STATUS_OK, &reply, false);
+        deliver(caller, STATUS_OK, &reply, false, 0);
         caller.state = TaskState::Ready;
     }
     if let Some(task) = current_task(system) {
@@ -796,7 +846,7 @@ fn deliver_pending_notice(system: &mut System, endpoint: usize) {
                 transfer: None,
                 defer_reply: false,
             };
-            deliver(task, STATUS_OK, &notice, true);
+            deliver(task, STATUS_OK, &notice, true, 0);
             task.state = TaskState::Ready;
         }
         return;
@@ -988,7 +1038,7 @@ fn spawn(
     for (slot, grant) in raw.iter_mut().zip(spec.endpoints) {
         if let Some((endpoint, rights)) = grant {
             *slot = endpoints
-                .insert(endpoint, rights)
+                .insert(EndpointCap { endpoint, badge: 0 }, rights)
                 .map_err(fail("capability grant failed"))?
                 .to_raw();
         }
@@ -996,6 +1046,7 @@ fn spawn(
     frame.rdi = raw[0];
     frame.rsi = raw[1];
     frame.rdx = raw[2];
+    frame.rcx = spec.arg;
     let mut process_handle = None;
     if spec.process.is_some() && spec.endpoints[2].is_some() {
         let _ = destroy_user_address_space(memory, root);
@@ -1403,6 +1454,9 @@ fn describe(exit: TaskExit, writer: &mut SerialWriter) {
             writer,
             "terminated: malformed IPC message (over {MAX_MESSAGE_WORDS} words or invalid flags)"
         ),
+        TaskExit::Ipc(IpcViolation::BadgeForgery) => {
+            write!(writer, "terminated: tried to mint or forge a badge")
+        }
         TaskExit::Ipc(IpcViolation::RightsAmplification) => {
             write!(writer, "terminated: tried to grant rights it does not hold")
         }
@@ -1491,6 +1545,7 @@ const fn isolated(
         priority: false,
         supervisor: None,
         device: None,
+        arg: 0,
         expect,
     }
 }
@@ -1516,6 +1571,7 @@ const fn init_client(
         priority: false,
         supervisor: None,
         device: None,
+        arg: 0,
         expect,
     }
 }
@@ -1681,6 +1737,7 @@ pub fn run_self_test(
                 priority: false,
                 supervisor: None,
                 device: None,
+                arg: 0,
                 expect,
             };
             let elf_tasks = [
@@ -1739,6 +1796,7 @@ pub fn run_self_test(
             priority: true,
             supervisor: None,
             device: None,
+            arg: 0,
             expect: Expect::Service { restarts: 0 },
         },
         TaskSpec {
@@ -1753,6 +1811,7 @@ pub fn run_self_test(
             priority: true,
             supervisor: Some(ENDPOINT_INIT),
             device: None,
+            arg: 0,
             expect: Expect::Service { restarts: 1 },
         },
         init_client(
@@ -1806,12 +1865,112 @@ pub fn run_self_test(
     );
     let drivers_ok = run_driver_scenario(memory, kernel_root, hhdm, &module);
     let services_ok = run_services_scenario(memory, kernel_root, hhdm, &module);
+    let badges_ok = run_badge_scenario(memory, kernel_root, hhdm, &module);
     isolation_ok
         && preemption_ok
         && elf_ok
         && scenario_passed == scenario.len()
         && drivers_ok
         && services_ok
+        && badges_ok
+}
+
+/// Identity and revocation: a broker mints badged filesystem capabilities;
+/// tenants get disjoint namespaces, a relinquished badge is revoked in every
+/// task at once, and re-minting a badge is refused.
+fn run_badge_scenario(
+    memory: &mut HhdmFrameMemory<'_, '_>,
+    kernel_root: PhysAddr,
+    hhdm: HhdmOffset,
+    module: &dyn Fn(&str) -> Option<&'static [u8]>,
+) -> bool {
+    let (Some(ramfs), Some(broker), Some(client)) =
+        (module("ramfs"), module("broker"), module("badge-client"))
+    else {
+        serial_write("Centinela-OS: required badge boot modules are missing.\r\n");
+        return false;
+    };
+    let spec = |name, role, image, endpoints, extra: u64, arg, expect| TaskSpec {
+        name,
+        role,
+        program: Image::Elf(image),
+        extra_syscalls: IPC_SYSCALLS | extra,
+        endpoints,
+        process: None,
+        manage_processes: false,
+        manage_memory: extra & (1 << Syscall::MapMemory as u8) != 0,
+        priority: matches!(expect, Expect::Service { .. }),
+        supervisor: None,
+        device: None,
+        arg,
+        expect,
+    };
+    let tenant = |name, role, arg, expect| {
+        spec(
+            name,
+            role,
+            client,
+            [Some((ENDPOINT_BROKER, SEND)), None, None],
+            0,
+            arg,
+            expect,
+        )
+    };
+    let tasks = [
+        spec(
+            "ramfs",
+            "filesystem keyed by caller badge",
+            ramfs,
+            [Some((ENDPOINT_FS, RECEIVE)), None, None],
+            1 << Syscall::MapMemory as u8,
+            0,
+            Expect::Service { restarts: 0 },
+        ),
+        spec(
+            "broker",
+            "holds the only minter capability to the filesystem",
+            broker,
+            [
+                Some((ENDPOINT_BROKER, RECEIVE)),
+                Some((ENDPOINT_FS, SEND.union(Rights::GRANT))),
+                None,
+            ],
+            1 << Syscall::Revoke as u8,
+            0,
+            Expect::Service { restarts: 0 },
+        ),
+        tenant(
+            "tenant-a",
+            "badged tenant: private namespace",
+            1,
+            Expect::Exit(0),
+        ),
+        tenant(
+            "tenant-b",
+            "relinquishes its badge, then reuses the handle",
+            2,
+            Expect::Ipc(IpcViolation::InvalidHandle),
+        ),
+        tenant(
+            "badge-forger",
+            "re-mints its badge to impersonate tenant-a",
+            3,
+            Expect::Ipc(IpcViolation::BadgeForgery),
+        ),
+    ];
+    let outcomes = run_system(memory, kernel_root, hhdm, &tasks);
+    let passed = outcomes
+        .iter()
+        .flatten()
+        .filter(|outcome| report(outcome))
+        .count();
+    let mut writer = SerialWriter;
+    let _ = write!(
+        writer,
+        "Capabilities: {passed}/{} badge and revocation checks passed.\r\n",
+        tasks.len()
+    );
+    passed == tasks.len()
 }
 
 /// Phase 5: a shell on the serial console driving a RAM filesystem and a
@@ -1844,6 +2003,7 @@ fn run_services_scenario(
         priority: matches!(expect, Expect::Service { .. }),
         supervisor: None,
         device: None,
+        arg: 0,
         expect,
     };
     let device_syscalls = (1 << Syscall::PortIo as u8) | (1 << Syscall::IrqAck as u8);
@@ -1940,6 +2100,7 @@ fn run_driver_scenario(
         priority: false,
         supervisor: None,
         device,
+        arg: 0,
         expect,
     };
     let tasks = [

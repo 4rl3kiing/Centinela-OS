@@ -40,6 +40,8 @@ pub enum IpcViolation {
     MissingRights,
     /// The declared length exceeds `MAX_MESSAGE_WORDS`, or flag bits are invalid.
     MalformedMessage,
+    /// Tried to mint a badge from an already badged capability, or a zero badge.
+    BadgeForgery,
     /// A capability transfer asked for rights the sender does not hold, or
     /// the sender's capability lacks GRANT.
     RightsAmplification,
@@ -52,6 +54,10 @@ pub const FLAG_KERNEL_ORIGIN: u64 = 1 << 16;
 /// ReplyWait only: keep the current caller blocked (no reply yet) and wait
 /// for a kernel notice, e.g. a driver waiting for its device to have data.
 pub const FLAG_DEFER_REPLY: u64 = 1 << 17;
+/// With a capability transfer: mint the transferred copy with the badge in
+/// word 2. Only an unbadged (minter) capability can mint; badges are never
+/// changed afterwards, so a client cannot launder or impersonate identity.
+pub const FLAG_MINT_BADGE: u64 = 1 << 18;
 /// Words available for data when a capability rides in the last word.
 pub const MAX_WORDS_WITH_TRANSFER: usize = MAX_MESSAGE_WORDS - 1;
 /// Label of the kernel notice sent to a supervisor when a service dies.
@@ -65,6 +71,7 @@ pub struct MessageFlags {
     pub length: u64,
     pub grant: Option<Rights>,
     pub defer_reply: bool,
+    pub mint_badge: bool,
 }
 
 impl MessageFlags {
@@ -72,10 +79,11 @@ impl MessageFlags {
     /// are malformed; with a transfer the last word carries the capability.
     pub fn parse(raw: u64) -> Result<Self, IpcViolation> {
         // Bit 16 (kernel origin) can never be set by a task.
-        if raw >> 18 != 0 || raw & FLAG_KERNEL_ORIGIN != 0 {
+        if raw >> 19 != 0 || raw & FLAG_KERNEL_ORIGIN != 0 {
             return Err(IpcViolation::MalformedMessage);
         }
         let defer_reply = raw & FLAG_DEFER_REPLY != 0;
+        let mint_badge = raw & FLAG_MINT_BADGE != 0;
         let length = raw & 0xff;
         let grant_bits = ((raw >> 8) & 0xff) as u16;
         let grant = if grant_bits == 0 {
@@ -88,13 +96,14 @@ impl MessageFlags {
         } else {
             MAX_MESSAGE_WORDS
         };
-        if length > limit as u64 {
+        if length > limit as u64 || (mint_badge && grant.is_none()) {
             return Err(IpcViolation::MalformedMessage);
         }
         Ok(Self {
             length,
             grant,
             defer_reply,
+            mint_badge,
         })
     }
 
@@ -257,7 +266,16 @@ mod tests {
         use super::{FLAG_DEFER_REPLY, FLAG_KERNEL_ORIGIN, MessageFlags};
         assert!(MessageFlags::parse(FLAG_DEFER_REPLY).unwrap().defer_reply);
         assert!(MessageFlags::parse(FLAG_DEFER_REPLY | FLAG_KERNEL_ORIGIN).is_err());
-        assert!(MessageFlags::parse(1 << 18).is_err());
+        assert!(MessageFlags::parse(1 << 19).is_err());
+        use super::FLAG_MINT_BADGE;
+        // Minting without a transfer is meaningless and rejected.
+        assert!(MessageFlags::parse(FLAG_MINT_BADGE).is_err());
+        let grant = u64::from(super::SEND.bits()) << 8;
+        assert!(
+            MessageFlags::parse(3 | grant | FLAG_MINT_BADGE)
+                .unwrap()
+                .mint_badge
+        );
     }
 
     #[test]

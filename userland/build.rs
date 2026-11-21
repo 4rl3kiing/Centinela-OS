@@ -16,6 +16,8 @@ fn main() {
             ("netsvc", "link.ld"),
             ("shell", "link.ld"),
             ("fs-fuzzer", "link.ld"),
+            ("broker", "link.ld"),
+            ("badge-client", "link.ld"),
         ] {
             println!("cargo:rustc-link-arg-bin={bin}=-T{manifest}/{script}");
             // Fixed-address static executable (ET_EXEC) from PIC code.
