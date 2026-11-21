@@ -55,6 +55,7 @@ The PMM is an initial single-core implementation. It is not yet a complete virtu
 - [ADR-0003: zero-trust layer isolation](docs/decisions/0003-layer-isolation-zero-trust.md)
 - [ADR-0004: SMP, IOMMU, Ring 3 drivers and first services](docs/decisions/0004-smp-iommu-drivers-services.md)
 - [ADR-0005: desktop-first roadmap to version 1.0](docs/decisions/0005-desktop-v1-roadmap.md)
+- [ADR-0006: phase 6 hardware bring-up](docs/decisions/0006-phase6-hardware-bringup.md)
 - [Hardware testing procedure](docs/hardware-testing.md)
 - [Layered security hardening implementation plan](docs/security/hardening-implementation-plan.md)
 
@@ -76,4 +77,6 @@ Bootstrap, PMM and hardening milestones passed under BIOS and UEFI in QEMU, with
 
 Phases 6–12 are defined in ADR-0005: hardware bring-up with a framebuffer console, kernel heap, AMD-Vi and interrupt remapping (6); NVMe/AHCI, VFS and a journaled filesystem (7); processes from signed executables, threads, shared memory, Rust `std`, users (8); xHCI and USB input (9); compositor, toolkit and desktop applications (10); TCP/IP, TLS and real NIC drivers (11); installer, signed A/B updates, production keys and an external review (12).
 
-Not yet implemented: physical-hardware testing, a framebuffer console, a kernel heap allocator, AMD-Vi, interrupt remapping and MSI/MSI-X, storage drivers and a persistent filesystem, a TCP/IP stack, USB, graphics and a desktop.
+**Phase 6 (in progress, ADR-0006):** framebuffer console with readback check, hardened kernel heap (canaries, poisoning, randomized slots), HHDM sealed non-executable (Limine leaves it W+X), ACPI S5 power-off with kernel-owned power ports, CMOS wall clock, and VT-d queued invalidation with interrupt remapping (compatibility-format interrupts blocked).
+
+Not yet implemented: physical-hardware testing, AMD-Vi, MSI/MSI-X for drivers, storage drivers and a persistent filesystem, a TCP/IP stack, USB, graphics and a desktop.

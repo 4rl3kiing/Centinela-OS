@@ -7,8 +7,13 @@
 //! later runs in Ring 3) cannot read or write physical memory until the
 //! kernel grants it an explicit, capability-backed mapping.
 //!
-//! Interrupts are unaffected: without interrupt remapping, MSIs keep using
-//! the compatibility format (interrupt remapping is a later step).
+//! Interrupt remapping (phase 6): when every unit supports it, interrupts
+//! are delivered only through the kernel's interrupt remapping table (IRT).
+//! Compatibility-format interrupts stay blocked (GCMD.CFI is never set), so
+//! a device cannot inject an arbitrary vector with a forged MSI write; it
+//! can raise only the entries the kernel programmed. All invalidations go
+//! through the queued-invalidation interface, which interrupt remapping
+//! requires.
 //!
 //! Policy: a machine without a DMAR table boots with a warning (no IOMMU to
 //! program). A DMAR table that is malformed, or a unit that refuses to
@@ -36,6 +41,29 @@ const REG_CCMD: usize = 0x28;
 const REG_CAP: usize = 0x08;
 const REG_FSTS: usize = 0x34;
 const GCMD_WBF: u32 = 1 << 27;
+const REG_IQT: usize = 0x88;
+const REG_IQA: usize = 0x90;
+const REG_IRTA: usize = 0xb8;
+const GCMD_QIE: u32 = 1 << 26;
+const GCMD_IRE: u32 = 1 << 25;
+const GCMD_SIRTP: u32 = 1 << 24;
+const GSTS_CFIS: u32 = 1 << 23;
+const FSTS_IQE: u32 = 1 << 4;
+const ECAP_QI: u64 = 1 << 1;
+const ECAP_IR: u64 = 1 << 3;
+/// Invalidation queue: one 4 KiB page of 128-bit descriptors.
+const QUEUE_ENTRIES: u64 = 256;
+/// Interrupt remapping table: one 4 KiB page of 128-bit entries.
+pub(crate) const IRT_ENTRIES: u16 = 256;
+
+/// Per-unit invalidation queue (physical address; 0 = register-based).
+static QUEUES: [AtomicU64; MAX_UNITS] = [const { AtomicU64::new(0) }; MAX_UNITS];
+static QUEUE_TAILS: [AtomicU64; MAX_UNITS] = [const { AtomicU64::new(0) }; MAX_UNITS];
+/// Frame holding one wait-descriptor status word per unit.
+static WAIT_STATUS: AtomicU64 = AtomicU64::new(0);
+static WAIT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+/// Interrupt remapping table (physical; 0 = remapping off).
+static IRT: AtomicU64 = AtomicU64::new(0);
 
 /// Persistent IOMMU state for per-device domains.
 static ROOT_TABLE: AtomicU64 = AtomicU64::new(0);
@@ -148,7 +176,76 @@ fn invalidate_all(registers: &Registers) -> bool {
     registers.wait64_clear(iotlb + 8, IOTLB_IVT)
 }
 
-fn enable_unit(registers: &Registers, root_table: PhysAddr) -> Result<(), &'static str> {
+fn hhdm_pointer(physical: u64) -> *mut u64 {
+    (HHDM.load(Ordering::Relaxed) + physical) as *mut u64
+}
+
+/// Queues `descriptors` plus a wait descriptor on `unit` and spins (bounded)
+/// until the hardware has processed them all.
+fn submit(unit: usize, registers: &Registers, descriptors: &[[u64; 2]]) -> bool {
+    let queue = QUEUES[unit].load(Ordering::Relaxed);
+    let status = WAIT_STATUS.load(Ordering::Relaxed);
+    if queue == 0 || status == 0 || descriptors.len() as u64 >= QUEUE_ENTRIES - 1 {
+        return false;
+    }
+    let sequence = WAIT_SEQUENCE.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff;
+    let status_address = status + unit as u64 * 8;
+    // SAFETY: Kernel-owned status frame, HHDM-mapped.
+    unsafe { hhdm_pointer(status_address).write_volatile(0) };
+    let wait = [5 | 1 << 5 | sequence << 32, status_address];
+    let mut tail = QUEUE_TAILS[unit].load(Ordering::Relaxed);
+    for descriptor in descriptors.iter().chain(core::iter::once(&wait)) {
+        let slot = hhdm_pointer(queue + tail * 16);
+        // SAFETY: `tail` < QUEUE_ENTRIES, so the slot is inside the queue
+        // page the kernel owns; the hardware only reads up to IQT.
+        unsafe {
+            slot.write_volatile(descriptor[0]);
+            slot.add(1).write_volatile(descriptor[1]);
+            core::arch::x86_64::_mm_clflush(slot as *const u8);
+        }
+        tail = (tail + 1) % QUEUE_ENTRIES;
+    }
+    // SAFETY: Orders the descriptor stores before the tail doorbell.
+    unsafe { core::arch::x86_64::_mm_sfence() };
+    QUEUE_TAILS[unit].store(tail, Ordering::Relaxed);
+    registers.write64(REG_IQT, tail << 4);
+    (0..POLL_LIMIT).any(|_| {
+        // SAFETY: As above.
+        let done =
+            unsafe { hhdm_pointer(status_address).read_volatile() } & 0xffff_ffff == sequence;
+        if !done {
+            core::hint::spin_loop();
+        }
+        done && registers.read32(REG_FSTS) & FSTS_IQE == 0
+    })
+}
+
+/// Global context-cache and IOTLB invalidation (and interrupt entry cache
+/// when remapping is on) through the queue, or the registers before the
+/// queue is enabled.
+fn invalidate_unit(unit: usize, registers: &Registers) -> bool {
+    if QUEUES[unit].load(Ordering::Relaxed) == 0 {
+        return invalidate_all(registers);
+    }
+    flush_write_buffer(registers);
+    // Context cache (type 1) and IOTLB (type 2), global granularity, with
+    // drain-reads/drain-writes for the IOTLB; IEC (type 4), global.
+    let descriptors = [[1 | 1 << 4, 0], [2 | 1 << 4 | 1 << 6 | 1 << 7, 0], [4, 0]];
+    let count = if IRT.load(Ordering::Relaxed) != 0 {
+        3
+    } else {
+        2
+    };
+    submit(unit, registers, &descriptors[..count])
+}
+
+fn enable_unit(
+    unit: usize,
+    registers: &Registers,
+    root_table: PhysAddr,
+    queue: Option<PhysAddr>,
+    irt: Option<PhysAddr>,
+) -> Result<(), &'static str> {
     let ecap = registers.read64(REG_ECAP);
     let iotlb = (((ecap >> 8) & 0x3ff) * 16) as usize;
     if iotlb == 0 || iotlb + 16 > 4096 {
@@ -167,6 +264,35 @@ fn enable_unit(registers: &Registers, root_table: PhysAddr) -> Result<(), &'stat
     if !registers.wait64_clear(iotlb + 8, IOTLB_IVT) {
         return Err("IOTLB invalidation timed out");
     }
+    if let Some(queue) = queue {
+        registers.write64(REG_IQT, 0);
+        // 128-bit descriptors, queue size 2^0 pages.
+        registers.write64(REG_IQA, queue.get());
+        QUEUE_TAILS[unit].store(0, Ordering::Relaxed);
+        registers.command(GCMD_QIE);
+        if !registers.wait32(REG_GSTS, GCMD_QIE, true) {
+            return Err("queued invalidation not enabled");
+        }
+        QUEUES[unit].store(queue.get(), Ordering::Relaxed);
+    }
+    if let Some(irt) = irt {
+        // xAPIC format (EIME = 0); size field 7 = 2^(7+1) = 256 entries.
+        registers.write64(REG_IRTA, irt.get() | 7);
+        registers.command(GCMD_SIRTP);
+        if !registers.wait32(REG_GSTS, GCMD_SIRTP, true) {
+            return Err("interrupt remapping table pointer not latched");
+        }
+        if !submit(unit, registers, &[[4, 0]]) {
+            return Err("interrupt entry cache invalidation failed");
+        }
+        registers.command(GCMD_IRE);
+        if !registers.wait32(REG_GSTS, GCMD_IRE, true) {
+            return Err("interrupt remapping not enabled");
+        }
+        if registers.read32(REG_GSTS) & GSTS_CFIS != 0 {
+            return Err("compatibility-format interrupts still allowed");
+        }
+    }
     registers.command(GCMD_TE);
     if !registers.wait32(REG_GSTS, GCMD_TE, true) {
         return Err("translation enable not confirmed");
@@ -179,8 +305,10 @@ fn enable_unit(registers: &Registers, root_table: PhysAddr) -> Result<(), &'stat
 pub(crate) fn init<R: PhysicalReader>(
     memory: &mut HhdmFrameMemory<'_, '_>,
     kernel_root: PhysAddr,
+    hhdm: u64,
     reader: Option<(&R, u64)>,
 ) -> bool {
+    HHDM.store(hhdm, Ordering::Relaxed);
     let mut writer = SerialWriter;
     let Some((reader, rsdp)) = reader else {
         serial_write("IOMMU: no ACPI tables; DMA is not remapped on this machine.\r\n");
@@ -217,6 +345,9 @@ pub(crate) fn init<R: PhysicalReader>(
     ROOT_TABLE.store(root_table.get(), Ordering::Relaxed);
     let mut sagaw = 0x1f;
     let mut coherent = true;
+    let mut queued = true;
+    let mut remapping = true;
+    // Pass 1: map every unit's registers and learn what all of them support.
     for unit in &units[..dmar.unit_count] {
         let Some(window) = crate::isolation::free_kernel_slot_address(memory, kernel_root) else {
             serial_write("Centinela-OS: no kernel slot for IOMMU registers.\r\n");
@@ -233,13 +364,37 @@ pub(crate) fn init<R: PhysicalReader>(
             return false;
         }
         let registers = Registers(window);
-        let version = registers.read32(REG_VERSION);
+        let ecap = registers.read64(REG_ECAP);
         sagaw &= (registers.read64(REG_CAP) >> 8) & 0x1f;
-        coherent &= registers.read64(REG_ECAP) & 1 != 0;
+        coherent &= ecap & 1 != 0;
+        queued &= ecap & ECAP_QI != 0;
+        remapping &= ecap & ECAP_QI != 0 && ecap & ECAP_IR != 0;
         let index = UNIT_COUNT.load(Ordering::Relaxed);
         UNIT_WINDOWS[index].store(window, Ordering::Relaxed);
         UNIT_COUNT.store(index + 1, Ordering::Relaxed);
-        if let Err(reason) = enable_unit(&registers, root_table) {
+    }
+    // Shared frames: wait-status words and the interrupt remapping table.
+    let frame = |memory: &mut HhdmFrameMemory<'_, '_>| memory.allocate_zeroed_table_frame().ok();
+    if queued {
+        let Some(status) = frame(memory) else {
+            return false;
+        };
+        WAIT_STATUS.store(status.get(), Ordering::Relaxed);
+    }
+    let irt = if remapping { frame(memory) } else { None };
+    if remapping && irt.is_none() {
+        return false;
+    }
+    // Pass 2: enable translation (and queued invalidation and interrupt
+    // remapping where every unit supports them).
+    for (index, unit) in units[..dmar.unit_count].iter().enumerate() {
+        let registers = Registers(UNIT_WINDOWS[index].load(Ordering::Relaxed));
+        let version = registers.read32(REG_VERSION);
+        let queue = if queued { frame(memory) } else { None };
+        if queued && queue.is_none() {
+            return false;
+        }
+        if let Err(reason) = enable_unit(index, &registers, root_table, queue, irt) {
             let _ = write!(
                 writer,
                 "Centinela-OS: IOMMU unit at {:#x} failed: {reason}.\r\n",
@@ -255,6 +410,16 @@ pub(crate) fn init<R: PhysicalReader>(
             version & 0xf,
             unit.segment,
             registers.read32(REG_FSTS)
+        );
+    }
+    if let Some(irt) = irt {
+        IRT.store(irt.get(), Ordering::Relaxed);
+        serial_write(
+            "IOMMU: interrupt remapping enabled (remappable format only; compatibility format blocked).\r\n",
+        );
+    } else {
+        serial_write(
+            "IOMMU: interrupt remapping unsupported by this hardware; interrupts not remapped.\r\n",
         );
     }
     let levels = if sagaw & 0b010 != 0 {
@@ -311,7 +476,45 @@ fn read_entry(memory: &HhdmFrameMemory<'_, '_>, table: PhysAddr, index: u64) -> 
 
 fn invalidate() -> bool {
     (0..UNIT_COUNT.load(Ordering::Relaxed))
-        .all(|unit| invalidate_all(&Registers(UNIT_WINDOWS[unit].load(Ordering::Relaxed))))
+        .all(|unit| invalidate_unit(unit, &Registers(UNIT_WINDOWS[unit].load(Ordering::Relaxed))))
+}
+
+/// True once interrupt remapping is active on every unit.
+pub(crate) fn interrupt_remapping() -> bool {
+    IRT.load(Ordering::Relaxed) != 0
+}
+
+/// Programs remapping-table entry `index`: fixed delivery of `vector` to
+/// the local APIC `destination`, edge or level triggered. When `source` is
+/// given, the hardware checks the requester ID, so only that PCI function
+/// can raise the entry. Returns false if remapping is off or the
+/// invalidation failed.
+pub(crate) fn program_interrupt(
+    index: u16,
+    vector: u8,
+    destination: u8,
+    level: bool,
+    source: Option<u16>,
+) -> bool {
+    let irt = IRT.load(Ordering::Relaxed);
+    if irt == 0 || index >= IRT_ENTRIES {
+        return false;
+    }
+    // Low: present, physical destination mode, fixed delivery, trigger mode,
+    // vector, xAPIC destination in bits 47:40.
+    let low = 1 | u64::from(level) << 4 | u64::from(vector) << 16 | u64::from(destination) << 40;
+    // High: source-id with SVT = 01 (verify requester ID, all bits).
+    let high = source.map_or(0, |sid| u64::from(sid) | 1 << 18);
+    let entry = hhdm_pointer(irt + u64::from(index) * 16);
+    // SAFETY: `index` < IRT_ENTRIES, inside the kernel-owned IRT page.
+    // Present (low) is written last so the entry is never half-valid.
+    unsafe {
+        entry.write_volatile(0);
+        entry.add(1).write_volatile(high);
+        entry.write_volatile(low);
+        core::arch::x86_64::_mm_clflush(entry as *const u8);
+    }
+    invalidate()
 }
 
 /// Present context-table frame for `bus`, created on demand.

@@ -289,6 +289,38 @@ pub unsafe fn load_page_table_root(root_physical: u64) {
     }
 }
 
+/// Flushes every TLB entry on this CPU, global entries included.
+///
+/// Toggling CR4.PGE invalidates global translations; reloading CR3 covers
+/// the case where PGE is clear.
+///
+/// # Safety
+/// The active page tables must remain valid for the running code.
+pub unsafe fn flush_tlb_all() {
+    const CR4_PGE: u64 = 1 << 7;
+    let cr4: u64;
+    // SAFETY: Reading CR4 at CPL 0 has no side effects.
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+    }
+    if cr4 & CR4_PGE != 0 {
+        // SAFETY: Clearing and restoring PGE only drops TLB entries; no
+        // `nomem`, so this is also a compiler barrier.
+        unsafe {
+            core::arch::asm!(
+                "mov cr4, {off}",
+                "mov cr4, {on}",
+                off = in(reg) cr4 & !CR4_PGE,
+                on = in(reg) cr4,
+                options(nostack, preserves_flags)
+            );
+        }
+    } else {
+        // SAFETY: Reloading the current root keeps the same address space.
+        unsafe { load_page_table_root(current_page_table_root() & !0xfff) };
+    }
+}
+
 #[cfg(test)]
 mod tlb_tests {
     use super::is_canonical_address;

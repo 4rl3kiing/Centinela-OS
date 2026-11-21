@@ -89,14 +89,18 @@ fn write_byte(byte: u8) {
 }
 
 /// Write a UTF-8 string to COM1 with a bounded wait for each byte.
+///
+/// The same text is mirrored to the framebuffer console when one is active,
+/// so machines without COM1 still show the log.
 pub fn write(message: &str) {
-    if !is_present() {
-        return;
-    }
+    let serial = is_present();
     console(|_| {
-        for byte in message.bytes() {
-            write_byte(byte);
+        if serial {
+            for byte in message.bytes() {
+                write_byte(byte);
+            }
         }
+        crate::framebuffer::write(message);
     });
 }
 

@@ -129,9 +129,32 @@ pub(crate) fn route(isa_irq: u8, vector: u8, masked: bool) -> bool {
     let Some((index, flags)) = entry_for(isa_irq) else {
         return false;
     };
-    write(0x11 + 2 * index, apic::local_id() << 24);
     let mask = if masked { MASKED } else { 0 };
-    write(0x10 + 2 * index, u32::from(vector) | flags | mask);
+    if crate::iommu::interrupt_remapping() {
+        // Remappable format: the entry only names remapping-table index
+        // `index`; the IOMMU supplies vector and destination. The vector
+        // field must still match for EOI broadcast.
+        let destination = (apic::local_id() & 0xff) as u8;
+        if index >= u32::from(crate::iommu::IRT_ENTRIES)
+            || !crate::iommu::program_interrupt(
+                index as u16,
+                vector,
+                destination,
+                flags & LEVEL != 0,
+                None,
+            )
+        {
+            return false;
+        }
+        write(0x11 + 2 * index, (index & 0x7fff) << 17 | 1 << 16);
+        write(
+            0x10 + 2 * index,
+            u32::from(vector) | flags | mask | ((index >> 15) & 1) << 11,
+        );
+    } else {
+        write(0x11 + 2 * index, apic::local_id() << 24);
+        write(0x10 + 2 * index, u32::from(vector) | flags | mask);
+    }
     true
 }
 

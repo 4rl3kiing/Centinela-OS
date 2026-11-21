@@ -123,6 +123,128 @@ pub fn find_table<'r, R: PhysicalReader>(
     Err(AcpiError::NotFound)
 }
 
+/// How to power the machine off (ACPI S5) and reset it, from the FADT and
+/// the DSDT's `\_S5` object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PowerControl {
+    /// PM1a/PM1b control block I/O ports (0 = absent).
+    pub pm1a_control: u16,
+    pub pm1b_control: u16,
+    /// SLP_TYP values for S5, if the DSDT declares them.
+    pub s5: Option<(u8, u8)>,
+    /// ACPI reset register when it is an I/O port: (port, value).
+    pub reset_port: Option<(u16, u8)>,
+}
+
+/// Largest DSDT scanned for `\_S5`.
+const MAX_DSDT_SCAN: usize = MAX_TABLE_LENGTH;
+
+/// Reads the FADT ("FACP") and the DSDT it points to.
+pub fn parse_power<R: PhysicalReader>(reader: &R, rsdp: u64) -> Result<PowerControl, AcpiError> {
+    let fadt = find_table(reader, rsdp, b"FACP")?;
+    let port = |offset: usize| -> u16 {
+        u32_at(fadt, offset)
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or(0)
+    };
+    let mut pm1a_control = port(64);
+    let pm1b_control = port(68);
+    // ACPI 2.0+: extended PM1a control block (GAS) when the legacy field is 0.
+    if pm1a_control == 0 && fadt.get(172) == Some(&1) {
+        pm1a_control = u64_at(fadt, 176)
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or(0);
+    }
+    let flags = u32_at(fadt, 112).unwrap_or(0);
+    let reset_port = if flags & (1 << 10) != 0 && fadt.get(116) == Some(&1) {
+        match (u64_at(fadt, 120).map(u16::try_from), fadt.get(128)) {
+            (Some(Ok(port)), Some(&value)) if port != 0 => Some((port, value)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let x_dsdt = if fadt.len() >= 148 {
+        u64_at(fadt, 140).unwrap_or(0)
+    } else {
+        0
+    };
+    let dsdt = if x_dsdt != 0 {
+        x_dsdt
+    } else {
+        u64::from(u32_at(fadt, 40).unwrap_or(0))
+    };
+    let s5 = if dsdt == 0 {
+        None
+    } else {
+        read_table(reader, dsdt)
+            .ok()
+            .filter(|table| &table[..4] == b"DSDT")
+            .and_then(find_s5)
+    };
+    Ok(PowerControl {
+        pm1a_control,
+        pm1b_control,
+        s5,
+        reset_port,
+    })
+}
+
+/// Finds `Name(\_S5, Package() { a, b, ... })` and returns (SLP_TYPa,
+/// SLP_TYPb). Only the AML encodings firmware uses for this object are
+/// accepted; anything else returns `None` (no guessing).
+pub fn find_s5(dsdt: &[u8]) -> Option<(u8, u8)> {
+    let body = dsdt.get(HEADER_LENGTH..dsdt.len().min(MAX_DSDT_SCAN))?;
+    let mut start = 0;
+    while let Some(position) = body.get(start..)?.windows(4).position(|w| w == b"_S5_") {
+        let at = start + position;
+        start = at + 1;
+        // NameOp (0x08), optionally followed by the root prefix '\'.
+        let named = match at {
+            0 => false,
+            1 => body[0] == 0x08,
+            _ => body[at - 1] == 0x08 || (body[at - 1] == b'\\' && body[at - 2] == 0x08),
+        };
+        if !named || body.get(at + 4) != Some(&0x12) {
+            continue;
+        }
+        let lead = *body.get(at + 5)?;
+        let length_bytes = usize::from(lead >> 6);
+        let mut cursor = at + 6 + length_bytes;
+        let elements = *body.get(cursor)?;
+        cursor += 1;
+        if elements < 2 {
+            continue;
+        }
+        let mut value = || -> Option<u8> {
+            let op = *body.get(cursor)?;
+            let (v, used) = match op {
+                0x00 => (0, 1),
+                0x01 => (1, 1),
+                0x0a => (*body.get(cursor + 1)?, 2),
+                _ => return None,
+            };
+            cursor += used;
+            (v <= 7).then_some(v)
+        };
+        if let (Some(a), Some(b)) = (value(), value()) {
+            return Some((a, b));
+        }
+    }
+    None
+}
+
+/// CMOS index of the RTC century register from the FADT (0 = none).
+pub fn rtc_century_register<R: PhysicalReader>(reader: &R, rsdp: u64) -> u8 {
+    find_table(reader, rsdp, b"FACP")
+        .ok()
+        .and_then(|fadt| fadt.get(108).copied())
+        // Indexes 0x00-0x0d are the clock itself; anything past 0x7f does
+        // not exist in standard CMOS.
+        .filter(|&index| (0x0e..0x80).contains(&index))
+        .unwrap_or(0)
+}
+
 /// One DMA-remapping hardware unit (DRHD) from the DMAR table.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DrhdUnit {
@@ -325,6 +447,91 @@ mod tests {
         fix_checksum(&mut r[..20], 8);
         fix_checksum(&mut r, 32);
         r
+    }
+
+    fn fadt(dsdt: u32, pm1a: u32, reset: Option<(u16, u8)>) -> Vec<u8> {
+        let mut body = vec![0u8; 244 - HEADER_LENGTH];
+        let at = |o: usize| o - HEADER_LENGTH;
+        body[at(40)..at(44)].copy_from_slice(&dsdt.to_le_bytes());
+        body[at(64)..at(68)].copy_from_slice(&pm1a.to_le_bytes());
+        if let Some((port, value)) = reset {
+            body[at(112)..at(116)].copy_from_slice(&(1u32 << 10).to_le_bytes());
+            body[at(116)] = 1;
+            body[at(120)..at(128)].copy_from_slice(&u64::from(port).to_le_bytes());
+            body[at(128)] = value;
+        }
+        table(b"FACP", &body)
+    }
+
+    fn s5_dsdt(aml: &[u8]) -> Vec<u8> {
+        table(b"DSDT", aml)
+    }
+
+    #[test]
+    fn finds_s5_in_common_encodings() {
+        // Name(_S5, Package(4) { 5, 5, 0, 0 }) with byte prefixes (QEMU).
+        let qemu = s5_dsdt(&[
+            0x10, 0x08, b'_', b'S', b'5', b'_', 0x12, 0x0a, 0x04, 0x0a, 0x05, 0x0a, 0x05, 0x00,
+            0x00,
+        ]);
+        assert_eq!(find_s5(&qemu), Some((5, 5)));
+        // Name(\_S5, Package(2) { Zero, One }).
+        let rooted = s5_dsdt(&[
+            0x08, b'\\', b'_', b'S', b'5', b'_', 0x12, 0x06, 0x02, 0x00, 0x01,
+        ]);
+        assert_eq!(find_s5(&rooted), Some((0, 1)));
+    }
+
+    #[test]
+    fn refuses_hostile_s5() {
+        // Not a Name object, truncated package, out-of-range value, method body.
+        for aml in [
+            &[0x14, b'_', b'S', b'5', b'_', 0x12, 0x06, 0x02, 0x00, 0x00][..],
+            &[0x08, b'_', b'S', b'5', b'_', 0x12][..],
+            &[
+                0x08, b'_', b'S', b'5', b'_', 0x12, 0x06, 0x02, 0x0a, 0xff, 0x00,
+            ][..],
+            &[
+                0x08, b'_', b'S', b'5', b'_', 0x12, 0x06, 0x02, 0x0b, 0x05, 0x00,
+            ][..],
+            &[][..],
+        ] {
+            assert_eq!(find_s5(&s5_dsdt(aml)), None, "{aml:x?}");
+        }
+    }
+
+    #[test]
+    fn parses_power_control_from_fadt_and_dsdt() {
+        let dsdt = s5_dsdt(&[
+            0x08, b'_', b'S', b'5', b'_', 0x12, 0x06, 0x02, 0x0a, 0x05, 0x0a, 0x05,
+        ]);
+        let mut xsdt_body = Vec::new();
+        xsdt_body.extend_from_slice(&0x3000u64.to_le_bytes());
+        let xsdt = table(b"XSDT", &xsdt_body);
+        let fake = Fake(vec![
+            (0x1000, rsdp_v2(0x2000)),
+            (0x2000, xsdt),
+            (0x3000, fadt(0x4000, 0x604, Some((0xcf9, 0x06)))),
+            (0x4000, dsdt),
+        ]);
+        let power = parse_power(&fake, 0x1000).unwrap();
+        assert_eq!(power.pm1a_control, 0x604);
+        assert_eq!(power.s5, Some((5, 5)));
+        assert_eq!(power.reset_port, Some((0xcf9, 0x06)));
+        // A DSDT with a bad checksum yields no S5 rather than garbage.
+        let mut broken = s5_dsdt(&[
+            0x08, b'_', b'S', b'5', b'_', 0x12, 0x06, 0x02, 0x0a, 0x05, 0x0a, 0x05,
+        ]);
+        broken[9] ^= 0xff;
+        let fake = Fake(vec![
+            (0x1000, rsdp_v2(0x2000)),
+            (0x2000, table(b"XSDT", &xsdt_body)),
+            (0x3000, fadt(0x4000, 0x604, None)),
+            (0x4000, broken),
+        ]);
+        let power = parse_power(&fake, 0x1000).unwrap();
+        assert_eq!(power.s5, None);
+        assert_eq!(power.reset_port, None);
     }
 
     fn system(dmar_table: Vec<u8>) -> Fake {
