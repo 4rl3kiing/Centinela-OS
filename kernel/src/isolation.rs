@@ -16,7 +16,7 @@
 //! continuing in an unknown state.
 
 use core::fmt::Write;
-use core::ptr::addr_of;
+use core::ptr::{addr_of, addr_of_mut};
 
 use centinela_hal::apic;
 use centinela_hal::cpu::{halt_forever, page_fault_address};
@@ -24,10 +24,11 @@ use centinela_hal::gdt::{self, TssStacks};
 use centinela_hal::idt::{self, TrapFrame, exception_name};
 use centinela_hal::serial::{SerialWriter, write as serial_write};
 use centinela_hal::syscall;
-use centinela_kernel::memory::hhdm_backend::HhdmFrameMemory;
+use centinela_kernel::memory::address_space::{create_task_root, destroy_user_address_space};
+use centinela_kernel::memory::hhdm_backend::{HhdmFrameMemory, HhdmReader};
 use centinela_kernel::memory::vmm::{
-    MappingTransactionError, PAGE_SIZE, PageMapping, PageTableMapper, PageTableMutationMemory,
-    PhysAddr, VirtAddr,
+    HhdmOffset, MappingTransactionError, PAGE_SIZE, PageMapping, PageTableMapper,
+    PageTableMutationMemory, PageTableWalker, PhysAddr, VirtAddr, WalkError,
 };
 use centinela_security::permissions::PagePermissions;
 
@@ -75,10 +76,139 @@ impl GuardedStack {
     }
 }
 
+// KPTI: the CPU pushes trap frames onto these stacks while the task's page
+// tables are still active, so they live in the entry trampoline.
+#[unsafe(link_section = ".bss.entry")]
 static mut TRAP_STACK: GuardedStack = GuardedStack::new();
+#[unsafe(link_section = ".bss.entry")]
 static mut DOUBLE_FAULT_STACK: GuardedStack = GuardedStack::new();
+#[unsafe(link_section = ".bss.entry")]
 static mut NMI_STACK: GuardedStack = GuardedStack::new();
+#[unsafe(link_section = ".bss.entry")]
 static mut MACHINE_CHECK_STACK: GuardedStack = GuardedStack::new();
+
+unsafe extern "C" {
+    static __entry_text_start: u8;
+    static __entry_text_end: u8;
+    static __entry_data_start: u8;
+    static __entry_data_end: u8;
+    static __entry_bss_start: u8;
+    static __entry_bss_end: u8;
+}
+
+/// Kernel-half top-level entries shared by every task root (KPTI trampoline).
+static mut TRAMPOLINE: [(u16, u64); 4] = [(0, 0); 4];
+static mut TRAMPOLINE_LEN: usize = 0;
+
+/// The KPTI trampoline entries every task root receives.
+pub(crate) fn trampoline_entries() -> &'static [(u16, u64)] {
+    // SAFETY: Written once by `build_trampoline` during single-CPU boot,
+    // read-only afterwards.
+    unsafe {
+                let len = *addr_of!(TRAMPOLINE_LEN);
+        let entries: &'static [(u16, u64); 4] = &*addr_of!(TRAMPOLINE);
+        &entries[..len]
+    }
+}
+
+/// Builds the page tables of the KPTI entry trampoline: a private subtree
+/// mapping only the entry code, entry data (GDT/IDT/TSS/switch variables) and
+/// entry stacks, supervisor-only, at their kernel addresses. Returns the
+/// number of mapped pages.
+fn build_trampoline(
+    memory: &mut HhdmFrameMemory<'_, '_>,
+    kernel_root: PhysAddr,
+    hhdm: HhdmOffset,
+) -> Option<usize> {
+    let regions = [
+        (
+            addr_of!(__entry_text_start) as u64,
+            addr_of!(__entry_text_end) as u64,
+            true,
+        ),
+        (
+            addr_of!(__entry_data_start) as u64,
+            addr_of!(__entry_data_end) as u64,
+            false,
+        ),
+        (
+            addr_of!(__entry_bss_start) as u64,
+            addr_of!(__entry_bss_end) as u64,
+            false,
+        ),
+    ];
+    let shadow = memory.allocate_zeroed_table_frame().ok()?;
+    // SAFETY: Kernel page tables are HHDM-mapped (base revision 5).
+    let reader = unsafe { HhdmReader::new(hhdm) };
+    let walker = PageTableWalker::new(&reader, kernel_root);
+    let rx = PagePermissions::new(true, false, true, false).ok()?;
+    let rw = PagePermissions::new(true, true, false, false).ok()?;
+    let mut pages = 0;
+    for (start, end, executable) in regions {
+        let mut page = start & !(PAGE_SIZE - 1);
+        while page < end {
+            match walker.translate(VirtAddr::new(page).ok()?) {
+                Ok(translation) => {
+                    let frame = translation.physical_address & !(PAGE_SIZE - 1);
+                    let permissions = if executable { rx } else { rw };
+                    let mapping = PageMapping::new(page, frame, permissions).ok()?;
+                    PageTableMapper::new(&mut *memory, shadow)
+                        .map_4k(mapping)
+                        .ok()?;
+                    pages += 1;
+                }
+                // Guard pages are unmapped in the kernel and stay unmapped here.
+                Err(WalkError::NotMapped) => {}
+                Err(_) => return None,
+            }
+            page += PAGE_SIZE;
+        }
+    }
+    let mut count = 0;
+    for index in 256u16..512 {
+        let entry = memory.read_entry(shadow, index).ok()?;
+        if entry & 1 != 0 {
+            if count == 4 {
+                return None;
+            }
+            // SAFETY: Single-CPU boot; no reader exists yet.
+            unsafe { (*addr_of_mut!(TRAMPOLINE))[count] = (index, entry) };
+            count += 1;
+        }
+    }
+    // SAFETY: As above.
+    unsafe { *addr_of_mut!(TRAMPOLINE_LEN) = count };
+    // The shadow root itself is only a construction aid; its subtrees live on.
+    let _ = memory.release_table_frame(shadow);
+    Some(pages)
+}
+
+/// Verifies on a probe task root that the kernel image and the HHDM are not
+/// reachable while the entry trampoline is.
+fn verify_kpti(
+    memory: &mut HhdmFrameMemory<'_, '_>,
+    hhdm: HhdmOffset,
+    kernel_root: PhysAddr,
+) -> bool {
+    let Ok(probe) = create_task_root(memory, trampoline_entries()) else {
+        return false;
+    };
+    // SAFETY: Task and trampoline tables are HHDM-mapped.
+    let reader = unsafe { HhdmReader::new(hhdm) };
+    let walker = PageTableWalker::new(&reader, probe);
+    let mapped = |address: u64| VirtAddr::new(address).is_ok_and(|va| walker.translate(va).is_ok());
+    let kernel_text = crate::_start as *const () as usize as u64;
+    let hhdm_alias = hhdm
+        .physical_to_virtual(kernel_root)
+        .map(|va| va.get())
+        .unwrap_or(0);
+    let ok = mapped(addr_of!(__entry_text_start) as u64)
+        && mapped(stack_bounds(addr_of!(TRAP_STACK)).1 - 8)
+        && !mapped(kernel_text)
+        && !mapped(hhdm_alias);
+    let _ = destroy_user_address_space(memory, probe);
+    ok
+}
 
 /// Top of the kernel stack used for traps and syscalls from Ring 3.
 pub(crate) fn trap_stack_top() -> u64 {
@@ -123,12 +253,32 @@ fn install_guard_pages(memory: &mut HhdmFrameMemory<'_, '_>, kernel_root: PhysAd
 
 /// Installs the CPU protection layer: guard pages, GDT/TSS/IST, IDT, the
 /// SYSCALL gate and the watchdog timer.
-pub fn init_cpu_layer(memory: &mut HhdmFrameMemory<'_, '_>, kernel_root: PhysAddr) -> bool {
+pub fn init_cpu_layer(
+    memory: &mut HhdmFrameMemory<'_, '_>,
+    kernel_root: PhysAddr,
+    hhdm: HhdmOffset,
+) -> bool {
     if !install_guard_pages(memory, kernel_root) {
         serial_write("Centinela-OS: failed to install kernel stack guard pages.\r\n");
         return false;
     }
     serial_write("Isolation: kernel stacks protected by unmapped guard pages.\r\n");
+
+    let Some(trampoline_pages) = build_trampoline(memory, kernel_root, hhdm) else {
+        serial_write("Centinela-OS: failed to build the KPTI entry trampoline.\r\n");
+        return false;
+    };
+    // SAFETY: The kernel root maps the whole kernel.
+    unsafe { syscall::set_kernel_root(kernel_root.get()) };
+    if !verify_kpti(memory, hhdm, kernel_root) {
+        serial_write("Centinela-OS: KPTI verification failed.\r\n");
+        return false;
+    }
+    let mut writer = SerialWriter;
+    let _ = write!(
+        writer,
+        "KPTI: task page tables map only the {trampoline_pages}-page entry trampoline; kernel image and HHDM are unmapped.\r\n"
+    );
 
     let apic_physical = apic::physical_base();
     let Some(apic_virtual) = free_kernel_slot_address(memory, kernel_root) else {

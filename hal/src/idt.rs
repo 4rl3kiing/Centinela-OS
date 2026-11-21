@@ -167,12 +167,15 @@ mod runtime {
     /// Number of gates with dedicated stubs (exceptions + 16 PIC IRQs).
     const STUB_COUNT: usize = 48;
 
+    // KPTI: the IDT is read by the CPU while the task's CR3 is still active.
+    #[unsafe(link_section = ".data.entry")]
     static mut IDT: [IdtEntry; 256] = [IdtEntry::MISSING; 256];
     static HANDLER: AtomicUsize = AtomicUsize::new(0);
 
     macro_rules! stubs {
         ($($vector:literal),* $(,)?) => {
-            core::arch::global_asm!(
+                        core::arch::global_asm!(
+                ".pushsection .text.entry, \"ax\"",
                 $(
                     concat!(".global centinela_isr_", $vector),
                     concat!("centinela_isr_", $vector, ":"),
@@ -183,13 +186,15 @@ mod runtime {
                     "    push 0",
                     ".endif",
                     concat!("    push ", $vector),
-                    "    jmp centinela_isr_common",
+                                        "    jmp centinela_isr_common",
                 )*
+                ".popsection",
             );
         };
     }
 
     core::arch::global_asm!(
+        ".pushsection .text.entry, \"ax\"",
         ".global centinela_isr_unexpected",
         "centinela_isr_unexpected:",
         "    push 0",
@@ -210,10 +215,23 @@ mod runtime {
         "    push rdx",
         "    push rcx",
         "    push rbx",
-        "    push rax",
+                "    push rax",
+        // KPTI: coming from Ring 3 (saved CS at rsp + 144), switch to the
+        // kernel page tables before touching anything outside the trampoline.
+        "    test qword ptr [rsp + 144], 3",
+        "    jz 1f",
+        "    mov rax, [rip + CENTINELA_KERNEL_CR3]",
+        "    mov cr3, rax",
+        "1:",
         "    mov rdi, rsp",
         "    cld",
         "    call {entry}",
+        // Returning to Ring 3: restore the task's page tables first.
+        "    test qword ptr [rsp + 144], 3",
+        "    jz 2f",
+        "    mov rax, [rip + CENTINELA_USER_CR3]",
+        "    mov cr3, rax",
+        "2:",
         "    pop rax",
         "    pop rbx",
         "    pop rcx",
@@ -229,8 +247,9 @@ mod runtime {
         "    pop r13",
         "    pop r14",
         "    pop r15",
-        "    add rsp, 16",
+                "    add rsp, 16",
         "    iretq",
+        ".popsection",
         entry = sym trap_entry,
     );
 

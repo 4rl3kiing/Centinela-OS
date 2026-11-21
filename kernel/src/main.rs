@@ -568,7 +568,7 @@ fn run_isolation(
     hhdm: HhdmOffset,
     modules: &[(&'static str, &'static [u8])],
 ) {
-    if !isolation::init_cpu_layer(memory, kernel_root) {
+    if !isolation::init_cpu_layer(memory, kernel_root, hhdm) {
         halt_forever();
     }
     if system::run_self_test(memory, kernel_root, hhdm, modules) {

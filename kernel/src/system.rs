@@ -15,7 +15,7 @@
 
 use core::fmt::Write;
 
-use centinela_hal::cpu::{halt_forever, load_page_table_root, page_fault_address};
+use centinela_hal::cpu::{halt_forever, page_fault_address};
 use centinela_hal::gdt;
 use centinela_hal::idt::{TrapFrame, exception_name};
 use centinela_hal::serial::{SerialWriter, write as serial_write};
@@ -25,9 +25,7 @@ use centinela_kernel::ipc::{
     NOTICE_SERVICE_DIED, RECEIVE, SEND, STATUS_NO_RECEIVER, STATUS_OK, STATUS_PEER_DIED, TaskId,
     attenuate,
 };
-use centinela_kernel::memory::address_space::{
-    create_user_address_space, destroy_user_address_space,
-};
+use centinela_kernel::memory::address_space::{create_task_root, destroy_user_address_space};
 use centinela_kernel::memory::hhdm_backend::{HhdmFrameMemory, HhdmReader};
 use centinela_kernel::memory::usercopy::copy_from_user;
 use centinela_kernel::memory::vmm::{HhdmOffset, PAGE_SIZE, PageTableWalker, PhysAddr};
@@ -39,7 +37,7 @@ use centinela_security::syscall_policy::{
 
 use crate::isolation::{
     CPU_BUDGET_TICKS, QUANTUM_TICKS, USER_CODE_BASE, USER_STACK_TOP, fatal_kernel_trap,
-    map_task_image, map_user_page, map_user_stack, trap_stack_top,
+    map_task_image, map_user_page, map_user_stack, trampoline_entries, trap_stack_top,
 };
 use crate::user_programs;
 use centinela_kernel::elf::{self, ElfError};
@@ -694,7 +692,8 @@ enum SpawnError {
 /// Builds a task's address space and initial register state.
 fn spawn(
     memory: &mut HhdmFrameMemory<'_, '_>,
-    kernel_root: PhysAddr,
+    // Unused since KPTI: task roots share only the entry trampoline.
+    _kernel_root: PhysAddr,
     spec: TaskSpec,
     table_id: u32,
     restarts: u32,
@@ -710,9 +709,9 @@ fn spawn(
             None
         }
     };
-    let (root, report) = create_user_address_space(memory, kernel_root)
+    // KPTI: the task root holds the user half plus the entry trampoline only.
+    let root = create_task_root(memory, trampoline_entries())
         .map_err(|_| SpawnError::Failed("address space creation failed"))?;
-    report_user_strip(report.user_bits_stripped);
     let mapped = match (spec.program, elf_plan) {
         (Image::Elf(bytes), Some(plan)) => map_elf(memory, root, bytes, &plan)
             .and_then(|entry| map_user_stack(memory, root).map(|()| entry)),
@@ -787,22 +786,6 @@ fn spawn(
         restarts,
         exit: None,
     })
-}
-
-fn report_user_strip(stripped: u16) {
-    static mut REPORTED: bool = false;
-    // SAFETY: Single CPU, IF=0; only the scheduler calls this.
-    let reported = unsafe { &mut *core::ptr::addr_of_mut!(REPORTED) };
-    if stripped != 0 && !*reported {
-        // Limine marks its upper-half PML4 entries user-accessible; task
-        // roots never inherit that.
-        let mut writer = SerialWriter;
-        let _ = write!(
-            writer,
-            "Isolation: kernel half shared supervisor-only ({stripped} bootloader USER bits stripped).\r\n"
-        );
-        *reported = true;
-    }
 }
 
 /// Picks the next ready task: priority tasks first, then round-robin.
@@ -883,12 +866,11 @@ fn run_system(
         // SAFETY: The task root shares the kernel half (code, stacks, tables
         // are mapped); its entry/stack are mapped; the trap stack is dedicated
         // and installed as rsp0. CR3 is restored before any other use.
+        // KPTI: the entry stubs switch CR3 to the task root on the way in and
+        // back to the kernel root on every trap or syscall.
         let started = unsafe {
             gdt::set_privilege0_stack(trap_top);
-            load_page_table_root(root.get());
-            let result = syscall::resume_user(saved, &context, trap_top);
-            load_page_table_root(kernel_root.get());
-            result
+            syscall::resume_user(saved, &context, trap_top, root.get())
         };
         let Some(system) = system_state() else { break };
         system.current = None;

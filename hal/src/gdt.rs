@@ -115,7 +115,11 @@ mod runtime {
     use super::*;
     use core::ptr::{addr_of, addr_of_mut};
 
+    // KPTI: the CPU reads the GDT and TSS on every ring transition, so they
+    // live in the entry trampoline that stays mapped in task page tables.
+    #[unsafe(link_section = ".data.entry")]
     static mut TSS: TaskStateSegment = TaskStateSegment::new();
+    #[unsafe(link_section = ".data.entry")]
     static mut GDT: [u64; 7] = [0, KERNEL_CODE, KERNEL_DATA, USER_DATA, USER_CODE, 0, 0];
 
     #[repr(C, packed)]

@@ -24,6 +24,7 @@ REQUIRED_MESSAGES=(
     "PMM allocation/free self-test passed."
     "Bootstrap milestone: memory map validated and PMM online."
     "Isolation: kernel stacks protected by unmapped guard pages."
+    "-page entry trampoline; kernel image and HHDM are unmapped."
     "Isolation: GDT/TSS loaded (IST for #DF, NMI, #MC; no I/O bitmap)."
     "Isolation: IDT loaded; all gates DPL 0; Ring 0 faults fail closed."
     "Isolation: SYSCALL gate armed (TF/IF/DF/AC/NT/IOPL masked)."

@@ -185,17 +185,62 @@ mod runtime {
 
     static HANDLER: AtomicUsize = AtomicUsize::new(0);
 
+    // KPTI trampoline data: everything the entry/exit stubs touch while the
+    // task's page tables are active lives in `.data.entry`.
     /// Kernel stack top used by the entry stub (written before entering Ring 3).
     #[unsafe(no_mangle)]
+    #[unsafe(link_section = ".data.entry")]
     static mut CENTINELA_SYSCALL_KERNEL_RSP: u64 = 0;
     /// Scratch slot for the user RSP during the stack switch (single CPU, IF=0).
     #[unsafe(no_mangle)]
+    #[unsafe(link_section = ".data.entry")]
     static mut CENTINELA_SYSCALL_USER_RSP: u64 = 0;
+    /// Page-table root the kernel runs on (loaded on every entry from Ring 3).
+    #[unsafe(no_mangle)]
+    #[unsafe(link_section = ".data.entry")]
+    static mut CENTINELA_KERNEL_CR3: u64 = 0;
+    /// Page-table root of the task being entered/resumed.
+    #[unsafe(no_mangle)]
+    #[unsafe(link_section = ".data.entry")]
+    static mut CENTINELA_USER_CR3: u64 = 0;
+    /// Scratch register slot used before the CR3 switch on SYSCALL entry.
+    #[unsafe(no_mangle)]
+    #[unsafe(link_section = ".data.entry")]
+    static mut CENTINELA_ENTRY_SCRATCH: u64 = 0;
+    /// Registers of the task being resumed (read after CR3 already points at
+    /// the task's tables, so it must live in the trampoline).
+    #[unsafe(no_mangle)]
+    #[unsafe(link_section = ".data.entry")]
+    static mut CENTINELA_ENTRY_CONTEXT: UserContext = UserContext {
+        rax: 0,
+        rbx: 0,
+        rcx: 0,
+        rdx: 0,
+        rsi: 0,
+        rdi: 0,
+        rbp: 0,
+        r8: 0,
+        r9: 0,
+        r10: 0,
+        r11: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+        rip: 0,
+        rsp: 0,
+    };
 
     core::arch::global_asm!(
+        ".pushsection .text.entry, \"ax\"",
         ".global centinela_syscall_entry",
         "centinela_syscall_entry:",
-        // IF is already clear (SFMASK). Switch to the kernel stack first.
+        // IF is already clear (SFMASK). KPTI: switch to the kernel page
+        // tables first, then to the kernel stack.
+        "    mov [rip + CENTINELA_ENTRY_SCRATCH], rax",
+        "    mov rax, [rip + CENTINELA_KERNEL_CR3]",
+        "    mov cr3, rax",
+        "    mov rax, [rip + CENTINELA_ENTRY_SCRATCH]",
         "    mov [rip + CENTINELA_SYSCALL_USER_RSP], rsp",
         "    mov rsp, [rip + CENTINELA_SYSCALL_KERNEL_RSP]",
         "    push qword ptr [rip + CENTINELA_SYSCALL_USER_RSP]",
@@ -216,7 +261,10 @@ mod runtime {
         "    push rax",
         "    mov rdi, rsp",
         "    cld",
-        "    call {entry}",
+                "    call {entry}",
+        // Back to the task's page tables; the trap stack stays mapped.
+        "    mov rax, [rip + CENTINELA_USER_CR3]",
+        "    mov cr3, rax",
         "    pop rax",
         "    pop r9",
         "    pop r8",
@@ -237,9 +285,10 @@ mod runtime {
         "    pop rsp",
         "    sysretq",
         "",
-        // u64 centinela_resume_user(u64 *saved_rsp, const UserContext *ctx)
-        // Builds an IRETQ frame (user SS/RSP, fixed RFLAGS, user CS/RIP),
-        // loads every general-purpose register from `ctx` and enters Ring 3.
+        // u64 centinela_resume_user(u64 *saved_rsp)
+        // Builds the IRETQ frame on the trap stack (mapped in task tables),
+        // switches CR3 to the task, loads every register from
+        // CENTINELA_ENTRY_CONTEXT (also in the trampoline) and enters Ring 3.
         ".global centinela_resume_user",
         "centinela_resume_user:",
         "    push rbx",
@@ -249,11 +298,15 @@ mod runtime {
         "    push r14",
         "    push r15",
         "    mov [rdi], rsp",
+        "    mov rsp, [rip + CENTINELA_SYSCALL_KERNEL_RSP]",
+        "    lea rsi, [rip + CENTINELA_ENTRY_CONTEXT]",
         "    push {user_ss}",
         "    push qword ptr [rsi + {c_rsp}]",
         "    push {user_rflags}",
         "    push {user_cs}",
         "    push qword ptr [rsi + {c_rip}]",
+        "    mov rax, [rip + CENTINELA_USER_CR3]",
+        "    mov cr3, rax",
         "    mov rax, [rsi + {c_rax}]",
         "    mov rbx, [rsi + {c_rbx}]",
         "    mov rcx, [rsi + {c_rcx}]",
@@ -281,8 +334,9 @@ mod runtime {
         "    pop r13",
         "    pop r12",
         "    pop rbp",
-        "    pop rbx",
+                "    pop rbx",
         "    ret",
+        ".popsection",
         entry = sym syscall_entry,
         user_rflags = const USER_RFLAGS,
         user_ss = const crate::gdt::USER_DATA_SELECTOR as u64,
@@ -308,7 +362,7 @@ mod runtime {
 
     unsafe extern "C" {
         fn centinela_syscall_entry();
-        fn centinela_resume_user(saved_rsp: *mut u64, context: *const UserContext) -> u64;
+        fn centinela_resume_user(saved_rsp: *mut u64) -> u64;
         fn centinela_resume_kernel(saved_rsp: u64, result: u64) -> !;
     }
 
@@ -381,15 +435,29 @@ mod runtime {
         saved_rsp: *mut u64,
         context: &UserContext,
         kernel_stack_top: u64,
+        user_root: u64,
     ) -> Result<u64, ReturnFrameError> {
         if !context.is_resumable() {
             return Err(ReturnFrameError::NonUserReturnAddress);
         }
-        // SAFETY: Guaranteed by the caller; single CPU with IF=0.
+        // SAFETY: Guaranteed by the caller; single CPU with IF=0. The
+        // trampoline variables are only read by the stubs after these writes.
         unsafe {
             core::ptr::addr_of_mut!(CENTINELA_SYSCALL_KERNEL_RSP).write(kernel_stack_top);
-            Ok(centinela_resume_user(saved_rsp, context))
+            core::ptr::addr_of_mut!(CENTINELA_ENTRY_CONTEXT).write(*context);
+            core::ptr::addr_of_mut!(CENTINELA_USER_CR3).write(user_root);
+            Ok(centinela_resume_user(saved_rsp))
         }
+    }
+
+    /// Records the page-table root every entry from Ring 3 switches to.
+    ///
+    /// # Safety
+    /// `root` must map the whole kernel (it becomes the active root on every
+    /// trap or syscall from user mode).
+    pub unsafe fn set_kernel_root(root: u64) {
+        // SAFETY: Guaranteed by the caller; single CPU with IF=0.
+        unsafe { core::ptr::addr_of_mut!(CENTINELA_KERNEL_CR3).write(root) };
     }
 
     /// Abandons the current trap/syscall stack and returns `result` from the
@@ -405,7 +473,7 @@ mod runtime {
 }
 
 #[cfg(target_os = "none")]
-pub use runtime::{init, resume_kernel, resume_user};
+pub use runtime::{init, resume_kernel, resume_user, set_kernel_root};
 
 #[cfg(test)]
 mod tests {

@@ -79,6 +79,28 @@ pub fn create_user_address_space<M: PageTableMutationMemory>(
     Ok((root, report))
 }
 
+/// Creates a task root whose kernel half holds only `shared` top-level
+/// entries (the KPTI entry trampoline), with USER stripped, and an empty
+/// user half. The shared subtrees are never freed by task teardown.
+pub fn create_task_root<M: PageTableMutationMemory>(
+    memory: &mut M,
+    shared: &[(u16, u64)],
+) -> Result<PhysAddr, AddressSpaceError> {
+    let root = memory.allocate_zeroed_table_frame()?;
+    for &(index, entry) in shared {
+        let written = if (KERNEL_HALF_FIRST_INDEX..ENTRIES_PER_TABLE).contains(&index) {
+            memory.write_entry(root, index, entry & !USER)
+        } else {
+            Err(MutationBackendError::WriteFailed)
+        };
+        if let Err(error) = written {
+            let _ = memory.release_table_frame(root);
+            return Err(error.into());
+        }
+    }
+    Ok(root)
+}
+
 /// Frees every lower-half table and mapped frame, then the root itself.
 ///
 /// The caller must have switched CR3 away from `root` (which also flushes its
@@ -266,6 +288,27 @@ mod tests {
         assert_eq!(
             memory.read_entry(kernel, 256),
             Ok(0x2000 | PRESENT | WRITABLE)
+        );
+    }
+
+    #[test]
+    fn task_root_holds_only_the_shared_trampoline() {
+        use super::create_task_root;
+        let mut memory = MockMemory::new();
+        let shared = [(511u16, 0x7000 | PRESENT | WRITABLE | USER)];
+        let root = create_task_root(&mut memory, &shared).unwrap();
+        assert_eq!(
+            memory.read_entry(root, 511),
+            Ok(0x7000 | PRESENT | WRITABLE)
+        );
+        assert_eq!(
+            memory.read_entry(root, 256),
+            Ok(0),
+            "no HHDM in task tables"
+        );
+        assert!(
+            create_task_root(&mut memory, &[(0, 0x8000 | PRESENT)]).is_err(),
+            "user half refused"
         );
     }
 

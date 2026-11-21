@@ -24,6 +24,13 @@ SECTIONS
         /* Section-relative (not absolute) so it is relocated under KASLR. */
         __kernel_virt_start = .;
         KEEP(*(.text._start))
+        /* KPTI entry trampoline: the only kernel code mapped in task page
+           tables (trap/syscall stubs that switch CR3). */
+        . = ALIGN(4K);
+        __entry_text_start = .;
+        KEEP(*(.text.entry .text.entry.*))
+        . = ALIGN(4K);
+        __entry_text_end = .;
         *(.text .text.*)
     } :text
 
@@ -44,6 +51,11 @@ SECTIONS
 
     .data ALIGN(4K) : AT(ALIGN(LOADADDR(.hash) + SIZEOF(.hash), 4K))
     {
+        /* KPTI entry data: GDT, IDT, TSS and CR3-switch variables. */
+        __entry_data_start = .;
+        KEEP(*(.data.entry .data.entry.*))
+        . = ALIGN(4K);
+        __entry_data_end = .;
         *(.data .data.*)
         *(.data.rel.ro .data.rel.ro.*)
         *(.got .got.*)
@@ -56,6 +68,11 @@ SECTIONS
 
     .bss ALIGN(4K) (NOLOAD) : AT(ALIGN(LOADADDR(.dynamic) + SIZEOF(.dynamic), 4K))
     {
+        /* KPTI entry stacks: trap and IST stacks (guard pages stay unmapped). */
+        __entry_bss_start = .;
+        *(.bss.entry .bss.entry.*)
+        . = ALIGN(4K);
+        __entry_bss_end = .;
         *(COMMON)
         *(.bss .bss.*)
         __kernel_virt_end = .;
