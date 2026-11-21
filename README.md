@@ -53,6 +53,7 @@ The PMM is an initial single-core implementation. It is not yet a complete virtu
 - [ADR-0001: x86_64, BIOS/UEFI, and boot strategy](docs/decisions/0001-platform-and-boot.md)
 - [ADR-0002: capability-based hybrid microkernel](docs/decisions/0002-hybrid-microkernel.md)
 - [ADR-0003: zero-trust layer isolation](docs/decisions/0003-layer-isolation-zero-trust.md)
+- [ADR-0004: SMP, IOMMU, Ring 3 drivers and first services](docs/decisions/0004-smp-iommu-drivers-services.md)
 - [Layered security hardening implementation plan](docs/security/hardening-implementation-plan.md)
 
 ## Current status
@@ -65,4 +66,6 @@ Bootstrap, PMM and hardening milestones passed under BIOS and UEFI in QEMU, with
 
 **Service manager:** restart policy moved out of the kernel into `init`, a Ring 3 task. Clients start with only a capability to init and receive attenuated service capabilities from it (capability transfer requires GRANT and can never add rights). The kernel notifies init of service deaths with a kernel-origin flag no task can forge, and performs restarts only for holders of a process capability, within a quota.
 
-Not yet implemented: dynamic service registration, capability revocation trees, preemptive scheduler, SMP, ELF loading, KASLR, KPTI, heap hardening and IOMMU.
+**Phases 3–5:** preemptive scheduling, ELF64 loading from BLAKE2b-pinned boot modules, KPTI, KASLR and UEFI Secure Boot (positive and wrong-key tests). Application processors boot confined and parked with verified hardening; VT-d DMA remapping is enabled deny-by-default; the I/O APIC routes IRQs only to Ring 3 drivers (UART, keyboard) as kernel-origin IPC notices, with port access mediated per call. A Ring 3 shell on the serial console drives a RAM filesystem and a loopback network service, and runs an IPC benchmark. See ADR-0004.
+
+Not yet implemented: tasks on application processors, per-device IOMMU mappings, interrupt remapping, badged endpoints, capability revocation trees, a physical NIC or disk driver, heap hardening, and testing on physical hardware.
