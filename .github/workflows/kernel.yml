@@ -26,7 +26,7 @@ jobs:
       - name: Install system build and emulation tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes build-essential xorriso mtools qemu-system-x86 ovmf
+          sudo apt-get install --yes build-essential xorriso mtools qemu-system-x86 ovmf sbsigntool python3-virt-firmware
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
@@ -47,10 +47,18 @@ jobs:
       - name: Build kernel
         run: cargo build --workspace --target x86_64-unknown-none --release
 
-      - name: Build hybrid BIOS and UEFI ISO
+      - name: Generate ephemeral TEST Secure Boot keys
+        run: bash scripts/secure-boot-keys.sh
+
+      - name: Build hybrid BIOS and UEFI ISO (Secure Boot signed)
+        env:
+          SB_SIGNING_KEY: build/sb-keys/db.key
+          SB_SIGNING_CERT: build/sb-keys/db.crt
         run: bash scripts/build-iso.sh
 
-      - name: Boot test in BIOS and UEFI
+      - name: Boot test in BIOS, UEFI and UEFI Secure Boot
+        env:
+          SECURE_BOOT_TEST: "1"
         run: bash scripts/test-qemu.sh
 
       - name: Upload boot diagnostics
@@ -58,5 +66,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: centinela-boot-diagnostics
-          path: build/
+          path: |
+            build/logs/
+            build/centinela-os.iso
           if-no-files-found: ignore

@@ -61,6 +61,18 @@ install -m 0644 "$LIMINE_DIR/BOOTX64.EFI" "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI"
 "$LIMINE_DIR/limine" enroll-config --quiet "$ISO_ROOT/boot/limine/limine-bios.sys" "$CONFIG_B2SUM"
 "$LIMINE_DIR/limine" enroll-config --quiet "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI" "$CONFIG_B2SUM"
 
+# Optional UEFI Secure Boot signing (after enrollment, which edits the binary).
+# With Secure Boot active and a config hash enrolled, Limine panics on any
+# config change or unhashed file, completing the chain of trust.
+if [[ -n "${SB_SIGNING_KEY:-}" && -n "${SB_SIGNING_CERT:-}" ]]; then
+    command -v sbsign >/dev/null || { echo "sbsign is required for Secure Boot signing" >&2; exit 1; }
+    sbsign --key "$SB_SIGNING_KEY" --cert "$SB_SIGNING_CERT" \
+        --output "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI.signed" "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI" >/dev/null
+    mv "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI.signed" "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI"
+    sbverify --cert "$SB_SIGNING_CERT" "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI" >/dev/null
+    echo "Signed BOOTX64.EFI for UEFI Secure Boot"
+fi
+
 # UEFI CD boot runs the BOOTX64.EFI inside the El Torito FAT image, so the
 # enrolled executable must also replace the copy in that image.
 install -m 0644 "$LIMINE_DIR/limine-uefi-cd.bin" "$EFI_SYSTEM_IMAGE"

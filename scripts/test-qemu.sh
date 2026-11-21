@@ -119,6 +119,41 @@ run_and_check uefi -- \
     -drive "if=pflash,format=raw,file=build/OVMF_VARS.fd" \
     -cdrom "$ISO" -boot d
 
+# UEFI Secure Boot (optional): the signed image must boot with our keys
+# enrolled, and must be refused when the firmware trusts a different db key.
+if [[ "${SECURE_BOOT_TEST:-0}" == "1" ]]; then
+    SB_CODE="${OVMF_SECBOOT_CODE:-/usr/share/OVMF/OVMF_CODE_4M.secboot.fd}"
+    KEYS="${SB_KEY_DIR:-build/sb-keys}"
+    command -v virt-fw-vars >/dev/null || { echo "virt-fw-vars required for SECURE_BOOT_TEST" >&2; exit 1; }
+    test -f "$SB_CODE" || { echo "Secure Boot OVMF not found: $SB_CODE" >&2; exit 1; }
+    OWNER=8be4df61-93ca-11d2-aa0d-00e098032b8c
+    sb_vars() {
+        virt-fw-vars --input "$OVMF_VARS" --output "$2" --set-pk "$OWNER" "$KEYS/PK.crt" \
+            --add-kek "$OWNER" "$KEYS/KEK.crt" --add-db "$OWNER" "$KEYS/$1.crt" --no-microsoft --sb >/dev/null
+    }
+    SB_MACHINE=(-machine q35,smm=on -global driver=cfi.pflash01,property=secure,value=on)
+    sb_vars db build/OVMF_VARS.secboot.fd
+    run_and_check uefi-secureboot -- "${SB_MACHINE[@]}" \
+        -drive "if=pflash,format=raw,readonly=on,file=$SB_CODE" \
+        -drive "if=pflash,format=raw,file=build/OVMF_VARS.secboot.fd" \
+        -cdrom "$ISO" -boot d
+    sb_vars wrong-db build/OVMF_VARS.wrongkey.fd
+    log=build/logs/qemu-uefi-secureboot-wrongkey.log
+    : >"$log"
+    set +e
+    timeout "$TIMEOUT_SECONDS" "$QEMU" "${SB_MACHINE[@]}" -m 512M -display none -monitor none \
+        -serial "file:$log" -no-reboot -no-shutdown \
+        -drive "if=pflash,format=raw,readonly=on,file=$SB_CODE" \
+        -drive "if=pflash,format=raw,file=build/OVMF_VARS.wrongkey.fd" \
+        -cdrom "$ISO" -boot d >/dev/null 2>&1
+    set -e
+    if grep -Fq "Centinela-OS: Rust kernel entry reached." "$log"; then
+        echo "Secure Boot check failed: image signed by an untrusted key was executed" >&2
+        exit 1
+    fi
+    echo "PASS: Secure Boot refused the image under an untrusted db key"
+fi
+
 # KASLR: the three boots must not all share one kernel virtual base.
 bases=$(grep -h -o "KASLR virtual base 0x[0-9a-f]*" build/logs/qemu-bios.log build/logs/qemu-bios-cpu-max.log build/logs/qemu-uefi.log | sort -u | wc -l)
 if [[ "$bases" -lt 2 ]]; then
