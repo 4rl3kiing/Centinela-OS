@@ -44,5 +44,5 @@ describes how to run the same verification on a real machine.
 | Environment | IPC round trip (TSC cycles) | Source |
 |-------------|-----------------------------|--------|
 | QEMU TCG (emulated) | about 30,000–66,000 | local and CI logs |
-| QEMU KVM (hosted CI runner) | see the "measurements" summary of the CI run | CI |
+| QEMU KVM (hosted CI runner) | about 2,700 | CI run 44952478373 (KVM boot log) |
 | Physical hardware | not measured | — |

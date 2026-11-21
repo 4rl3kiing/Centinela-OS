@@ -12,7 +12,7 @@
 #![no_std]
 #![no_main]
 
-use centinela_userland::{Line, dma_alloc, exit, write};
+use centinela_userland::{Line, dma_alloc, exit, sleep, write};
 
 const CTRL: u32 = 0x0000;
 const STATUS: u32 = 0x0008;
@@ -66,34 +66,16 @@ fn put_u64(base: *mut u8, offset: usize, value: u64) {
     put(base, offset, &value.to_le_bytes());
 }
 
-/// Polls `done` for up to ~800 million TSC cycles of wall time, so the
-/// timeout holds on emulated and hardware-virtualized CPUs alike.
-/// Polls `done` until it holds or the wait times out.
-///
-/// The bound is wall-clock (TSC cycles), not a poll count: a poll count
-/// tuned for emulation expires in milliseconds under KVM or on a fast CPU,
-/// before the network answers. Both bounds must pass before giving up, so
-/// a slow emulator still gets at least `MIN_POLLS` attempts.
-fn spin_until(mut done: impl FnMut() -> bool) -> bool {
-    const MIN_POLLS: u32 = 20_000_000;
-    const MAX_CYCLES: u64 = 10_000_000_000;
-    let start = rdtsc();
-    let mut polls = 0u32;
-    loop {
+/// Polls `done`, sleeping one 10 ms tick between polls (no CPU used while
+/// the NIC or the network catches up), for at most `ticks` ticks.
+fn wait_for(ticks: u32, mut done: impl FnMut() -> bool) -> bool {
+    for _ in 0..ticks {
         if done() {
             return true;
         }
-        polls = polls.saturating_add(1);
-        if polls >= MIN_POLLS && rdtsc().wrapping_sub(start) >= MAX_CYCLES {
-            return false;
-        }
-        core::hint::spin_loop();
+        sleep(1);
     }
-}
-
-fn rdtsc() -> u64 {
-    // SAFETY: RDTSC is unprivileged unless CR4.TSD is set; no memory access.
-    unsafe { core::arch::x86_64::_rdtsc() }
+    done()
 }
 
 #[unsafe(no_mangle)]
@@ -102,7 +84,7 @@ pub extern "C" fn _start(_unused: u64, _unused2: u64, _unused3: u64, mmio: u64) 
     // Reset, mask every interrupt (the driver polls), link up.
     nic.write(IMC, 0xffff_ffff);
     nic.write(CTRL, nic.read(CTRL) | 1 << 26);
-    if !spin_until(|| nic.read(CTRL) & (1 << 26) == 0) {
+    if !wait_for(100, || nic.read(CTRL) & (1 << 26) == 0) {
         exit(1)
     }
     nic.write(IMC, 0xffff_ffff);
@@ -167,15 +149,23 @@ pub extern "C" fn _start(_unused: u64, _unused2: u64, _unused3: u64, mmio: u64) 
         put(tx_ring, slot * 16 + 12, &[0]);
         nic.write(TDT, slot as u32 + 1);
     };
+    // Link autonegotiation takes a while after reset; RX is refused until up.
+    if !wait_for(300, || nic.read(STATUS) & 2 != 0) {
+        write("e1000: link never came up");
+        exit(5)
+    }
     send(0, iova(6));
-    if !spin_until(|| get(tx_ring, 12) & 1 != 0) {
+    if !wait_for(300, || get(tx_ring, 12) & 1 != 0) {
         write("e1000: transmit never completed");
         exit(3)
     }
 
     // Wait for the ARP reply from the gateway (any slot).
     let mut gateway = None;
-    let found = spin_until(|| {
+    let found = wait_for(300, || {
+        // Re-arming the tail makes QEMU flush any frame it queued while the
+        // receiver was not ready (harmless on hardware: same value).
+        nic.write(RDT, DESCRIPTORS - 1);
         for index in 0..DESCRIPTORS as usize {
             if get(rx_ring, index * 16 + 12) & 1 == 0 {
                 continue;
@@ -222,7 +212,7 @@ pub extern "C" fn _start(_unused: u64, _unused2: u64, _unused3: u64, mmio: u64) 
     // Hostile descriptor: point the NIC outside its domain. The IOMMU must
     // block the read; the kernel reports the fault when it tears down.
     send(1, 0x7fff_0000);
-    spin_until(|| nic.read(TDH) == 2);
+    wait_for(100, || nic.read(TDH) == 2);
     write("e1000: sent a descriptor outside the DMA domain");
     exit(0)
 }

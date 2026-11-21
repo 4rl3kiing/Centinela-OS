@@ -19,6 +19,15 @@ pub const SYS_PORT_IO: u64 = 15;
 pub const SYS_IRQ_ACK: u64 = 16;
 pub const SYS_REVOKE: u64 = 17;
 pub const SYS_DMA_ALLOC: u64 = 18;
+pub const SYS_SLEEP: u64 = 19;
+
+/// Blocks for `ticks` timer ticks (10 ms each, at most 100) without using CPU.
+pub fn sleep(ticks: u64) {
+    // SAFETY: The kernel clamps the duration.
+    unsafe {
+        syscall2(SYS_SLEEP, ticks, 0);
+    }
+}
 /// Transfer: mint the transferred capability with the badge in word 2.
 pub const FLAG_MINT_BADGE: u64 = 1 << 18;
 /// SEND right bits, for capability transfers (flags bits 8-15).
