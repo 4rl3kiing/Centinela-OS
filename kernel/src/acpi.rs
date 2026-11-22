@@ -285,6 +285,41 @@ pub fn list_tables<R: PhysicalReader>(reader: &R, rsdp: u64, out: &mut [[u8; 4]]
     stored
 }
 
+/// AMD-Vi: parses an IVRS table and stores the MMIO base of each distinct
+/// IOMMU (IVHD types 0x10, 0x11 and 0x40 describe the same units at
+/// different detail levels). Returns how many bases were stored.
+pub fn parse_ivrs(table: &[u8], bases: &mut [u64]) -> Result<usize, AcpiError> {
+    if table.len() < 48 || &table[..4] != b"IVRS" || !checksum_ok(table) {
+        return Err(AcpiError::BadTable);
+    }
+    let mut offset = 48;
+    let mut count = 0;
+    while offset + 4 <= table.len() {
+        let kind = table[offset];
+        let length = usize::from(u16_at(table, offset + 2).ok_or(AcpiError::BadTable)?);
+        let end = offset.checked_add(length).ok_or(AcpiError::BadTable)?;
+        if length < 4 || end > table.len() {
+            return Err(AcpiError::BadTable);
+        }
+        if matches!(kind, 0x10 | 0x11 | 0x40) {
+            if length < 24 {
+                return Err(AcpiError::BadTable);
+            }
+            let base = u64_at(table, offset + 8).ok_or(AcpiError::BadTable)?;
+            if base == 0 || base & 0x3fff != 0 {
+                return Err(AcpiError::BadTable);
+            }
+            if !bases[..count].contains(&base) {
+                let slot = bases.get_mut(count).ok_or(AcpiError::TooManyUnits)?;
+                *slot = base;
+                count += 1;
+            }
+        }
+        offset = end;
+    }
+    Ok(count)
+}
+
 /// One DMA-remapping hardware unit (DRHD) from the DMAR table.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DrhdUnit {
@@ -679,6 +714,30 @@ mod tests {
         unaligned.extend_from_slice(&0xfec0_0010u32.to_le_bytes());
         unaligned.extend_from_slice(&0u32.to_le_bytes());
         assert_eq!(parse_madt(&madt(&[&unaligned])), Err(AcpiError::BadTable));
+    }
+
+    #[test]
+    fn ivrs_units_are_deduplicated_and_validated() {
+        let ivhd = |kind: u8, length: u16, base: u64| {
+            let mut entry = vec![0u8; usize::from(length)];
+            entry[0] = kind;
+            entry[2..4].copy_from_slice(&length.to_le_bytes());
+            entry[8..16].copy_from_slice(&base.to_le_bytes());
+            entry
+        };
+        let mut body = vec![0u8; 12];
+        body.extend(ivhd(0x10, 24, 0xfeb8_0000));
+        body.extend(ivhd(0x11, 40, 0xfeb8_0000));
+        body.extend(ivhd(0x40, 40, 0xfeb8_4000));
+        let mut bases = [0u64; 4];
+        assert_eq!(parse_ivrs(&table(b"IVRS", &body), &mut bases), Ok(2));
+        assert_eq!(bases[..2], [0xfeb8_0000, 0xfeb8_4000]);
+        let mut bad = vec![0u8; 12];
+        bad.extend(ivhd(0x10, 24, 0xfeb8_0100));
+        assert_eq!(
+            parse_ivrs(&table(b"IVRS", &bad), &mut bases),
+            Err(AcpiError::BadTable)
+        );
     }
 
     #[test]

@@ -169,6 +169,33 @@ run_and_check bios-cpu-max \
     "CPU hardening: SMEP enabled." "CPU hardening: SMAP enabled." "CPU hardening: UMIP enabled." \
     -- -cpu max -cdrom "$ISO" -boot d
 
+# AMD platform: the same machine with QEMU's AMD IOMMU instead of VT-d. Every
+# DMA driver must work through AMD-Vi domains.
+AMD_MESSAGES=(
+    "IOMMU: DMA remapping enabled on 1 unit(s), deny-by-default (AMD-Vi"
+    "[task e1000-driver] e1000: link up; ARP reply from 10.0.2.2"
+    "Persistence: 3/3 storage service checks passed."
+    "Microkernel milestone:"
+)
+amd_log="build/logs/qemu-${P}bios-amd-iommu.log"
+: >"$amd_log"
+set +e
+timeout "$TIMEOUT_SECONDS" "$QEMU" -machine q35 -m 512M -smp 4 "${ACCEL[@]}" -device amd-iommu \
+    -device e1000,netdev=n0 -netdev user,id=n0 \
+    -drive "file=$NVME_IMAGE,if=none,id=nvm,format=raw" -device nvme,serial=centinela,drive=nvm \
+    -display none -monitor none -serial "file:$amd_log" -serial null \
+    -chardev "file,id=shellin-amd,path=/dev/null,input-path=$SHELL_INPUT" -serial chardev:shellin-amd \
+    -fw_cfg name=opt/centinela/poweroff,string=1 -no-reboot -cdrom "$ISO" -boot d >/dev/null 2>&1
+set -e
+for message in "${AMD_MESSAGES[@]}"; do
+    grep -Fq -- "$message" "$amd_log" || fail "$amd_log" /dev/null "Missing for AMD-Vi boot: $message"
+done
+if grep -E "PANIC|KERNEL TRAP|UNEXPECTED|LEAKED" "$amd_log" >/dev/null; then
+    fail "$amd_log" /dev/null "Kernel reported a failure during the AMD-Vi boot"
+fi
+BOOTS_WITH_STORAGE=$((BOOTS_WITH_STORAGE + 1))
+echo "PASS: AMD platform boot: every DMA driver works through AMD-Vi domains"
+
 # Screen console: boot once more with a monitor socket, wait for the final
 # milestone, take a screendump and decode the framebuffer text cells.
 screen_check() {

@@ -8,6 +8,8 @@ extern crate alloc;
 // The isolation runtime drives real hardware; it only exists for the kernel
 // target (host builds of this binary are used solely for linting).
 #[cfg(target_os = "none")]
+mod amdvi;
+#[cfg(target_os = "none")]
 mod clock;
 #[cfg(target_os = "none")]
 mod hwreport;

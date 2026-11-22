@@ -165,6 +165,29 @@ impl<'a> Pmm<'a> {
         Ok(unsafe { entry_pointer.read() })
     }
 
+    /// Allocates `count` physically contiguous frames aligned to `align`
+    /// frames (a power of two). Each frame stays individually freeable.
+    pub fn allocate_contiguous(&mut self, count: usize, align: usize) -> Option<u64> {
+        if count == 0 || !align.is_power_of_two() || (self.free_frames as usize) < count {
+            return None;
+        }
+        let frame_count = self.frame_count();
+        let mut start = align.max(1);
+        while start + count <= frame_count {
+            match (start..start + count).find(|&frame| !self.is_free(frame)) {
+                None => {
+                    for frame in start..start + count {
+                        self.set_allocated(frame);
+                    }
+                    self.free_frames -= count as u64;
+                    return Some(start as u64 * PAGE_SIZE);
+                }
+                Some(busy) => start = (busy + 1).next_multiple_of(align),
+            }
+        }
+        None
+    }
+
     pub fn allocate_frame(&mut self) -> Option<u64> {
         if self.free_frames == 0 {
             return None;
@@ -328,6 +351,24 @@ mod tests {
         pmm.free_frame(first)
             .expect("allocated frame should be releasable");
         assert_eq!(pmm.free_frames(), 127);
+    }
+
+    #[test]
+    fn contiguous_runs_are_aligned_and_skip_busy_frames() {
+        let mut bitmap = [u64::MAX; 2];
+        let mut allocated = [0_u64; 2];
+        let mut pmm = Pmm::new(&mut bitmap, &mut allocated).expect("bitmaps should be accepted");
+        pmm.mark_free_range(1, 128);
+        let busy = pmm.allocate_frame().expect("frame");
+        assert_eq!(busy, PAGE_SIZE);
+        let run = pmm.allocate_contiguous(16, 16).expect("aligned run");
+        assert_eq!(run, 16 * PAGE_SIZE);
+        assert_eq!(pmm.free_frames(), 127 - 1 - 16);
+        assert_eq!(pmm.allocate_contiguous(200, 1), None);
+        for frame in 0..16 {
+            pmm.free_frame(run + frame * PAGE_SIZE)
+                .expect("each frame frees");
+        }
     }
 
     #[test]

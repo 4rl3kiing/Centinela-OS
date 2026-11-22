@@ -317,8 +317,16 @@ pub(crate) fn init<R: PhysicalReader>(
     let table = match acpi::find_table(reader, rsdp, b"DMAR") {
         Ok(table) => table,
         Err(AcpiError::NotFound) => {
-            serial_write("IOMMU: no DMAR table; DMA is not remapped on this machine.\r\n");
-            return true;
+            // No Intel VT-d: try AMD-Vi.
+            return match crate::amdvi::init(memory, kernel_root, hhdm, reader, rsdp) {
+                Some(ok) => ok,
+                None => {
+                    serial_write(
+                        "IOMMU: no DMAR or IVRS table; DMA is not remapped on this machine.\r\n",
+                    );
+                    true
+                }
+            };
         }
         Err(error) => {
             let _ = write!(writer, "Centinela-OS: ACPI tables rejected: {error:?}.\r\n");
@@ -537,6 +545,13 @@ pub(crate) fn attach(
     domain: u16,
 ) -> Option<PhysAddr> {
     HHDM.store(hhdm, Ordering::Relaxed);
+    if crate::amdvi::active() {
+        return if domain == 0 {
+            None
+        } else {
+            crate::amdvi::attach(memory, device, domain)
+        };
+    }
     let levels = LEVELS.load(Ordering::Relaxed) as u64;
     if UNIT_COUNT.load(Ordering::Relaxed) == 0 || levels == 0 || domain == 0 {
         return None;
@@ -562,6 +577,9 @@ pub(crate) fn map(
     iova: u64,
     physical: PhysAddr,
 ) -> bool {
+    if crate::amdvi::active() {
+        return crate::amdvi::map(memory, domain_root, iova, physical);
+    }
     let levels = LEVELS.load(Ordering::Relaxed) as u64;
     let mut table = domain_root;
     for level in (1..levels).rev() {
@@ -609,7 +627,16 @@ fn free_tables(memory: &mut HhdmFrameMemory<'_, '_>, table: PhysAddr, level: u64
 
 /// Removes the device's domain: afterwards every DMA it issues is blocked
 /// and faulted. Must run before the driver's DMA frames are freed.
-pub(crate) fn detach(memory: &mut HhdmFrameMemory<'_, '_>, device: crate::pci::Device) -> u64 {
+pub(crate) fn detach(
+    memory: &mut HhdmFrameMemory<'_, '_>,
+    device: crate::pci::Device,
+    root: Option<PhysAddr>,
+) -> u64 {
+    if crate::amdvi::active() {
+        let faults = crate::amdvi::detach(memory, device, root);
+        FAULTS_SEEN.fetch_add(faults, Ordering::Relaxed);
+        return faults;
+    }
     let Some(context) = context_table(memory, device.bus) else {
         return 0;
     };

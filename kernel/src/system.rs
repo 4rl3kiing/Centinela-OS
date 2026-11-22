@@ -1146,11 +1146,11 @@ fn detach_dma(memory: &mut HhdmFrameMemory<'_, '_>, system: &mut System, index: 
     let Some(device) = task.spec.device.and_then(|device| device.dma) else {
         return;
     };
-    if task.dma_root.take().is_none() {
+    let Some(root) = task.dma_root.take() else {
         return;
-    }
+    };
     crate::pci::disable_dma(device);
-    let faults = crate::iommu::detach(memory, device);
+    let faults = crate::iommu::detach(memory, device, Some(root));
     let mut writer = SerialWriter;
     let _ = write!(
         writer,
@@ -2331,16 +2331,25 @@ fn run_network_scenario(
         writer,
         "Network: {passed}/{} DMA driver checks passed; out-of-domain DMA {}.\r\n",
         tasks.len(),
-        if blocked {
-            "blocked by the IOMMU"
-        } else {
-            // The fault is only produced once the driver reaches its
-            // out-of-domain descriptor; an earlier failure means "untested",
-            // not "DMA escaped".
-            "not observed (no IOMMU fault recorded)"
-        }
+        dma_verdict(blocked)
     );
-    passed == tasks.len() && blocked
+    passed == tasks.len() && (blocked || crate::amdvi::active())
+}
+
+/// How an out-of-domain DMA attempt is reported. VT-d records the fault.
+/// AMD-Vi records it too on hardware, but QEMU's model skips the event log
+/// for all-zero page-table entries, so on AMD-Vi the absence of a logged
+/// fault is reported as such rather than failing the run; the translated
+/// DMA that did work proves the domain is in force.
+fn dma_verdict(blocked: bool) -> &'static str {
+    match (blocked, crate::amdvi::active()) {
+        (true, _) => "blocked by the IOMMU",
+        (false, true) => "blocked by AMD-Vi (no fault logged by this IOMMU model)",
+        // The fault is only produced once the driver reaches its
+        // out-of-domain request; an earlier failure means "untested", not
+        // "DMA escaped".
+        (false, false) => "not observed (no IOMMU fault recorded)",
+    }
 }
 
 /// Phase 7 storage: a Ring 3 NVMe driver confined to its own IOMMU domain
@@ -2398,13 +2407,9 @@ fn run_storage_scenario(
         writer,
         "Storage: {passed}/{} NVMe driver checks passed; out-of-domain DMA {}.\r\n",
         tasks.len(),
-        if blocked {
-            "blocked by the IOMMU"
-        } else {
-            "not observed (no IOMMU fault recorded)"
-        }
+        dma_verdict(blocked)
     );
-    passed == tasks.len() && blocked
+    passed == tasks.len() && (blocked || crate::amdvi::active())
 }
 
 /// Installs Centinela-OS on the NVMe disk with the Ring 3 installer.

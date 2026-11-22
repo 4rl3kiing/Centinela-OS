@@ -70,6 +70,21 @@ impl<'p, 'b> HhdmFrameMemory<'p, 'b> {
         Self { hhdm, pmm, net: 0 }
     }
 
+    /// Allocates `count` zeroed, physically contiguous frames aligned to
+    /// `count` frames (hardware tables such as an AMD-Vi device table).
+    pub fn allocate_contiguous_zeroed(&mut self, count: usize) -> Option<PhysAddr> {
+        let physical = self
+            .pmm
+            .with(|pmm| pmm.allocate_contiguous(count, count.next_power_of_two()))?;
+        for index in 0..count as u64 {
+            let alias = self.alias(physical + index * PAGE_SIZE).ok()?;
+            // SAFETY: The PMM transferred exclusive ownership; HHDM-mapped.
+            unsafe { core::ptr::write_bytes(alias, 0, PAGE_SIZE as usize) };
+        }
+        self.net += count as i64;
+        PhysAddr::new(physical).ok()
+    }
+
     /// Frames allocated minus frames released through this instance.
     pub fn net_allocated(&self) -> i64 {
         self.net
