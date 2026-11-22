@@ -62,10 +62,14 @@ pub(crate) fn print<R: PhysicalReader>(rsdp: Option<(&R, u64)>) {
             .trim(),
         core::str::from_utf8(&brand_text).unwrap_or("?").trim()
     );
+    let mut remapping = false;
     match rsdp {
         Some((reader, root)) => {
             let mut tables = [[0u8; 4]; 32];
             let count = acpi::list_tables(reader, root, &mut tables);
+            remapping = tables[..count]
+                .iter()
+                .any(|signature| signature == b"DMAR" || signature == b"IVRS");
             let _ = write!(out, "HWREPORT acpi: {count} tables:");
             for signature in &tables[..count] {
                 let text = printable(signature);
@@ -81,6 +85,17 @@ pub(crate) fn print<R: PhysicalReader>(rsdp: Option<(&R, u64)>) {
             let _ = writeln!(out, "HWREPORT acpi: none\r");
         }
     }
+    // DMA policy of this boot (see `pci`): Bus Master was cleared on every
+    // function and comes back only for a device inside an IOMMU domain.
+    let _ = writeln!(
+        out,
+        "HWREPORT dma: {}\r",
+        if remapping {
+            "IOMMU table present; bus mastering only for devices inside an IOMMU domain"
+        } else {
+            "no DMAR/IVRS table; no DMA remapping, so bus mastering stays off for every device (fail-closed: DMA drivers do not run)"
+        }
+    );
     let mut devices = 0;
     crate::pci::for_each(|device, vendor, id, class, subclass, interface| {
         devices += 1;

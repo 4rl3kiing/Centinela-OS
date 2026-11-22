@@ -223,6 +223,9 @@ fn corruption_is_detected_never_returned() {
             match Volume::mount(&mut copy, &mut bitmap) {
                 Err(_) => {}
                 Ok(mut volume) => match volume.lookup(0, b"file") {
+                    // A damaged newest superblock (generation 2, slot 0)
+                    // falls back to the previous, intact generation.
+                    None if block == 0 && volume.superblock().generation == 1 => {}
                     None => panic!("block {block}: file vanished without an error"),
                     Some(_) => {
                         let mut out = vec![0u8; 6000];
@@ -310,7 +313,7 @@ fn random_images_never_panic() {
 #[test]
 fn damaged_superblocks_are_corrupt_not_blank() {
     let mut disk = fresh(16);
-    disk.blocks[0][20] ^= 1; // break the only valid superblock's checksum
+    disk.blocks[1][20] ^= 1; // break the only valid superblock's checksum
     let mut bitmap = [0u64; 1];
     assert_eq!(
         Volume::mount(&mut disk, &mut bitmap).err(),
@@ -320,5 +323,131 @@ fn damaged_superblocks_are_corrupt_not_blank() {
     assert_eq!(
         Volume::mount(&mut blank, &mut bitmap).err(),
         Some(Error::NotFormatted)
+    );
+}
+
+/// Re-seals the superblock in `slot` with a forged generation.
+fn forge_generation(disk: &mut Memory, slot: usize, generation: u64) {
+    let mut sb = Superblock::decode(&disk.blocks[slot], disk.blocks.len() as u64).unwrap();
+    sb.generation = generation;
+    disk.blocks[slot] = sb.encode();
+}
+
+#[test]
+fn impossible_generations_are_mount_errors_not_panics() {
+    for forged in [0, u64::MAX] {
+        let mut disk = fresh(16);
+        forge_generation(&mut disk, 1, forged);
+        let mut bitmap = [0u64; 1];
+        assert_eq!(
+            Volume::mount(&mut disk, &mut bitmap).err(),
+            Some(Error::Corrupt),
+            "generation {forged}"
+        );
+    }
+    // A forged u64::MAX copy is ignored when the other copy is valid.
+    let mut disk = fresh(16);
+    {
+        let mut bitmap = [0u64; 1];
+        let mut volume = Volume::mount(&mut disk, &mut bitmap).unwrap();
+        volume.write_file(0, b"f", b"data").unwrap(); // generation 2, slot 0
+    }
+    forge_generation(&mut disk, 1, u64::MAX);
+    let mut bitmap = [0u64; 1];
+    let volume = Volume::mount(&mut disk, &mut bitmap).unwrap();
+    assert_eq!(volume.superblock().generation, 2);
+}
+
+#[test]
+fn generation_at_the_limit_refuses_updates_without_panicking() {
+    let mut disk = fresh(16);
+    forge_generation(&mut disk, 1, MAX_GENERATION);
+    let before = disk.clone();
+    let mut bitmap = [0u64; 1];
+    {
+        let mut volume = Volume::mount(&mut disk, &mut bitmap).unwrap();
+        assert_eq!(volume.write_file(0, b"f", b"x"), Err(Error::Corrupt));
+        assert_eq!(volume.delete(0, b"f"), Err(Error::NotFound));
+        assert_eq!(volume.free_blocks(), 16 - 3, "staged blocks were released");
+    }
+    // Nothing reachable changed: both superblocks are untouched.
+    assert!(disk.blocks[..2] == before.blocks[..2]);
+    let volume = Volume::mount(&mut disk, &mut bitmap).unwrap();
+    assert_eq!(volume.superblock().generation, MAX_GENERATION);
+    // One below the limit still commits, reaching exactly the limit.
+    let mut disk = fresh(16);
+    forge_generation(&mut disk, 1, MAX_GENERATION - 1);
+    let mut volume = Volume::mount(&mut disk, &mut bitmap).unwrap();
+    volume.write_file(0, b"f", b"x").unwrap();
+    assert_eq!(volume.superblock().generation, MAX_GENERATION);
+}
+
+#[test]
+fn commits_never_overwrite_the_current_superblock() {
+    // New format: generation 1 in slot 1, the first commit goes to slot 0.
+    let mut disk = fresh(16);
+    let current = disk.blocks[1];
+    {
+        let mut bitmap = [0u64; 1];
+        let mut volume = Volume::mount(&mut disk, &mut bitmap).unwrap();
+        volume.write_file(0, b"f", b"x").unwrap();
+    }
+    assert!(disk.blocks[1] == current);
+    // Legacy layout (generation 1 in slot 0, slot 1 blank): the first commit
+    // must go to slot 1, not over the only valid superblock.
+    let mut legacy = fresh(16);
+    legacy.blocks[0] = legacy.blocks[1];
+    legacy.blocks[1] = [0; BLOCK_SIZE];
+    let current = legacy.blocks[0];
+    let mut bitmap = [0u64; 1];
+    {
+        let mut volume = Volume::mount(&mut legacy, &mut bitmap).unwrap();
+        volume.write_file(0, b"f", b"x").unwrap();
+        volume.write_file(0, b"g", b"y").unwrap();
+    }
+    let sb1 = Superblock::decode(&legacy.blocks[1], 16).unwrap();
+    let sb0 = Superblock::decode(&legacy.blocks[0], 16).unwrap();
+    assert_eq!((sb0.generation, sb1.generation), (3, 2));
+    assert!(legacy.blocks[0] != current);
+    let mut volume = Volume::mount(&mut legacy, &mut bitmap).unwrap();
+    assert_eq!(read_all(&mut volume, 0, b"g"), b"y");
+}
+
+#[test]
+fn extreme_superblock_and_inode_values_are_rejected() {
+    let mut disk = fresh(16);
+    let mut sb = Superblock::decode(&disk.blocks[1], 16).unwrap();
+    sb.block_count = MAX_BLOCKS + 1;
+    assert_eq!(Superblock::decode(&sb.encode(), u64::MAX), None);
+    sb.block_count = MAX_BLOCKS;
+    assert!(Superblock::decode(&sb.encode(), u64::MAX).is_some());
+    sb.block_count = u64::MAX;
+    sb.root = u64::MAX - 1;
+    assert_eq!(Superblock::decode(&sb.encode(), u64::MAX), None);
+    // Inode sizes that would overflow or truncate in a cast.
+    for size in [u64::MAX, u64::MAX - 4095, MAX_FILE_SIZE as u64 + 1, 1 << 32] {
+        let mut block = [0u8; BLOCK_SIZE];
+        block[..4].copy_from_slice(INODE_MAGIC);
+        put_u32(&mut block, 4, MAX_FILE_BLOCKS as u32);
+        put_u64(&mut block, 8, size);
+        seal(&mut block);
+        assert!(Inode::decode(&block, size).is_none(), "size {size}");
+    }
+    // A directory entry claiming a huge size is a mount error.
+    let mut bitmap = [0u64; 1];
+    {
+        let mut volume = Volume::mount(&mut disk, &mut bitmap).unwrap();
+        volume.write_file(0, b"f", b"abc").unwrap();
+    }
+    let mut sb = Superblock::decode(&disk.blocks[0], 16).unwrap();
+    let mut directory = disk.blocks[sb.root as usize];
+    put_u64(&mut directory, 16 + 48, u64::MAX);
+    seal(&mut directory);
+    disk.blocks[sb.root as usize] = directory;
+    sb.root_crc = get_u32(&directory, CRC_OFFSET);
+    disk.blocks[0] = sb.encode();
+    assert_eq!(
+        Volume::mount(&mut disk, &mut bitmap).err(),
+        Some(Error::Corrupt)
     );
 }

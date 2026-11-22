@@ -178,7 +178,10 @@ fn boot_count<D: BlockDevice>(volume: &mut Volume<'_, D>) -> Result<u64, Error> 
         Err(Error::NotFound) => 0,
         Err(error) => return Err(error),
     };
-    let next = previous + 1;
+    // The value comes from the disk (CRC32C does not authenticate it): a
+    // forged u64::MAX must not panic or wrap to 0. Policy: saturate, so the
+    // counter stays pinned at u64::MAX and the service keeps running.
+    let next = previous.saturating_add(1);
     let mut text = Line::new();
     text.number(next);
     volume.write_file(0, b"boot-count", text.as_str().as_bytes())?;
@@ -198,14 +201,46 @@ pub extern "C" fn _start(endpoint: u64, _unused: u64, _unused2: u64, kind: u64) 
     // its last 4 KiB.
     let mut partitions = [Partition::default(); MAX_PARTITIONS];
     let system = if nvme.block_size() == 512 {
-        gpt::read(&mut Sectors(&mut nvme), &mut partitions)
-            .ok()
-            .and_then(|count| {
-                partitions[..count]
-                    .iter()
-                    .find(|p| p.type_guid == CFS_TYPE)
-                    .copied()
-            })
+        match gpt::read_with_health(&mut Sectors(&mut nvme), &mut partitions) {
+            Ok((count, health)) => {
+                // One valid copy is accepted (gpt::Health policy), but say so.
+                let note: &[u8] = match health {
+                    gpt::Health::Intact => b"",
+                    gpt::Health::BackupInvalid => b"backup copy invalid",
+                    gpt::Health::PrimaryInvalid => b"primary copy invalid",
+                    gpt::Health::Relocated => b"backup not at the end of the disk",
+                };
+                if !note.is_empty() {
+                    Line::new()
+                        .push(b"storage: warning: GPT degraded (")
+                        .push(note)
+                        .push(b"); using the valid copy")
+                        .print();
+                }
+                Some(count)
+            }
+            Err(centinela_disk::Error::NotFound) => None,
+            Err(error) => {
+                Line::new()
+                    .push(b"storage: GPT rejected: ")
+                    .push(match error {
+                        centinela_disk::Error::Invalid => {
+                            b"invalid or inconsistent headers" as &[u8]
+                        }
+                        centinela_disk::Error::Full => b"too many partitions",
+                        centinela_disk::Error::Io => b"I/O error",
+                        _ => b"unusable",
+                    })
+                    .print();
+                None
+            }
+        }
+        .and_then(|count| {
+            partitions[..count]
+                .iter()
+                .find(|p| p.type_guid == CFS_TYPE)
+                .copied()
+        })
     } else {
         None
     };
