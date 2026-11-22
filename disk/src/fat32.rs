@@ -552,7 +552,9 @@ mod tests {
                 .output()
                 .is_ok_and(|o| o.status.success())
         };
-        if !has("fsck.fat") || !has("mcopy") {
+        // Miri isolates the host (no files or processes): the in-memory checks
+        // above still run under Miri; the cross-check with real tools does not.
+        if cfg!(miri) || !has("fsck.fat") || !has("mcopy") {
             std::eprintln!("dosfstools/mtools missing: host check skipped");
             return;
         }
