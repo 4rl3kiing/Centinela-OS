@@ -238,6 +238,21 @@ pub fn format_with_files<D: SectorDevice>(
     label: &[u8; 11],
     files: &[FileSpec<'_>],
 ) -> Result<(), Error> {
+    format_with_files_located(device, first_lba, sectors, label, files, &mut [])
+}
+
+/// Like `format_with_files`, and also reports in `starts[k]` the first LBA
+/// of file `k`'s data (0 when empty). File data is one contiguous run, so
+/// a file can later be rewritten in place sector by sector without
+/// touching the FAT (used for the boot log readable from any system).
+pub fn format_with_files_located<D: SectorDevice>(
+    device: &mut D,
+    first_lba: u64,
+    sectors: u64,
+    label: &[u8; 11],
+    files: &[FileSpec<'_>],
+    starts: &mut [u64],
+) -> Result<(), Error> {
     if first_lba
         .checked_add(sectors)
         .is_none_or(|end| end > device.sectors())
@@ -257,7 +272,8 @@ pub fn format_with_files<D: SectorDevice>(
     };
     let mut nodes = [empty; MAX_NODES];
     let mut count = 1; // node 0 = root
-    for file in files {
+    let mut file_nodes = [0usize; MAX_NODES];
+    for (file_index, file) in files.iter().enumerate() {
         let mut parent = 0;
         let mut parts = file.path.split(|&b| b == b'/').peekable();
         while let Some(part) = parts.next() {
@@ -288,6 +304,9 @@ pub fn format_with_files<D: SectorDevice>(
                     count += 1;
                 }
             }
+        }
+        if file_index < MAX_NODES {
+            file_nodes[file_index] = parent;
         }
     }
     // Short names (unique per directory) and cluster runs.
@@ -333,6 +352,14 @@ pub fn format_with_files<D: SectorDevice>(
     }
     if u64::from(next) - 2 > geometry.clusters {
         return Err(Error::Full);
+    }
+    for (index, start) in starts.iter_mut().enumerate().take(files.len()) {
+        let node = &nodes[file_nodes[index]];
+        *start = if node.clusters == 0 {
+            0
+        } else {
+            geometry.cluster_lba(node.first)
+        };
     }
 
     // Boot sector, FSInfo and their backups.
@@ -506,7 +533,18 @@ mod tests {
                 data: b"",
             },
         ];
-        format_with_files(&mut disk, 64, sectors, b"CENTINELA  ", &files).unwrap();
+        let mut starts = [0u64; 8];
+        format_with_files_located(&mut disk, 64, sectors, b"CENTINELA  ", &files, &mut starts)
+            .unwrap();
+        for (index, file) in files.iter().enumerate() {
+            if !file.data.is_empty() {
+                let start = starts[index] as usize * SECTOR;
+                assert_eq!(
+                    &disk.0[start..start + file.data.len().min(SECTOR)],
+                    &file.data[..file.data.len().min(SECTOR)]
+                );
+            }
+        }
         let has = |tool: &str| {
             Command::new("sh")
                 .arg("-c")

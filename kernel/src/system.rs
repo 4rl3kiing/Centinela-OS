@@ -281,6 +281,8 @@ struct TaskSpec {
     badge: u64,
     /// Boot module lent read-only at MODULE_BASE; its length arrives in RSI.
     module: Option<&'static [u8]>,
+    /// Grants ReadLog (copy the boot log to disk for diagnosis).
+    read_log: bool,
     expect: Expect,
 }
 
@@ -533,6 +535,20 @@ pub fn syscall_handler(frame: &mut SyscallFrame) {
         Ok(Syscall::PortIo) => port_io(system, frame),
         Ok(Syscall::IrqAck) => irq_ack(system, frame),
         Ok(Syscall::Revoke) => revoke(system, frame),
+        Ok(Syscall::LogRead) => {
+            let mut chunk = [0u8; 32];
+            let count = centinela_hal::serial::log_read(frame.rdi as usize, &mut chunk);
+            let word = |index: usize| {
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&chunk[index * 8..index * 8 + 8]);
+                u64::from_le_bytes(bytes)
+            };
+            frame.rdx = word(0);
+            frame.r10 = word(1);
+            frame.r8 = word(2);
+            frame.r9 = word(3);
+            frame.rax = count as u64;
+        }
         Ok(Syscall::Sleep) => {
             let ticks = frame.rdi.clamp(1, MAX_SLEEP_TICKS) as u32;
             frame.rax = 0;
@@ -1324,6 +1340,9 @@ fn spawn(
     if spec.manage_memory {
         capabilities.grant(Capability::ManageMemory);
     }
+    if spec.read_log {
+        capabilities.grant(Capability::ReadLog);
+    }
     if let Some(device) = spec.device {
         if device.overlaps_kernel_ports() {
             let _ = destroy_user_address_space(memory, root);
@@ -1823,6 +1842,7 @@ const fn isolated(
         arg: 0,
         badge: 0,
         module: None,
+        read_log: false,
         expect,
     }
 }
@@ -1851,6 +1871,7 @@ const fn init_client(
         arg: 0,
         badge: 0,
         module: None,
+        read_log: false,
         expect,
     }
 }
@@ -2024,6 +2045,7 @@ pub fn run_self_test(
                 arg: 0,
                 badge: 0,
                 module: None,
+                read_log: false,
                 expect,
             };
             let elf_tasks = [
@@ -2085,6 +2107,7 @@ pub fn run_self_test(
             arg: 0,
             badge: 0,
             module: None,
+            read_log: false,
             expect: Expect::Service { restarts: 0 },
         },
         TaskSpec {
@@ -2102,6 +2125,7 @@ pub fn run_self_test(
             arg: 0,
             badge: 0,
             module: None,
+            read_log: false,
             expect: Expect::Service { restarts: 1 },
         },
         init_client(
@@ -2295,6 +2319,7 @@ fn run_network_scenario(
             arg: MMIO_BASE,
             badge: 0,
             module: None,
+            read_log: false,
             expect: Expect::Exit(0),
         },
         TaskSpec {
@@ -2317,6 +2342,7 @@ fn run_network_scenario(
             arg: 0,
             badge: 0,
             module: None,
+            read_log: false,
             expect: Expect::Device(DeviceViolation::NoDmaDomain),
         },
     ];
@@ -2394,6 +2420,7 @@ fn run_storage_scenario(
         arg: MMIO_BASE,
         badge: 0,
         module: None,
+        read_log: false,
         expect: Expect::Exit(0),
     }];
     let outcomes = run_system(memory, kernel_root, hhdm, &tasks);
@@ -2451,7 +2478,9 @@ pub fn run_installer(
         name: "installer",
         role: "Ring 3 installer: GPT, FAT32 ESP and CFS on NVMe or SATA",
         program: Image::Elf(installer),
-        extra_syscalls: (1 << Syscall::DmaAlloc as u8) | (1 << Syscall::Sleep as u8),
+        extra_syscalls: (1 << Syscall::DmaAlloc as u8)
+            | (1 << Syscall::Sleep as u8)
+            | (1 << Syscall::LogRead as u8),
         endpoints: [None, None, None],
         process: None,
         manage_processes: false,
@@ -2467,6 +2496,7 @@ pub fn run_installer(
         arg: u64::from(wipe) | kind << 1,
         badge: 0,
         module: Some(payload),
+        read_log: true,
         expect: Expect::Exit(0),
     }];
     let outcomes = run_system(memory, kernel_root, hhdm, &tasks);
@@ -2510,6 +2540,7 @@ fn run_persistence_scenario(
         arg,
         badge,
         module: None,
+        read_log: false,
         expect: Expect::Exit(0),
     };
     let tasks = [
@@ -2519,7 +2550,8 @@ fn run_persistence_scenario(
             program: Image::Elf(storage),
             extra_syscalls: IPC_SYSCALLS
                 | (1 << Syscall::DmaAlloc as u8)
-                | (1 << Syscall::Sleep as u8),
+                | (1 << Syscall::Sleep as u8)
+                | (1 << Syscall::LogRead as u8),
             endpoints: [Some((ENDPOINT_STORAGE, RECEIVE)), None, None],
             process: None,
             manage_processes: false,
@@ -2535,6 +2567,7 @@ fn run_persistence_scenario(
             arg: kind,
             badge: 0,
             module: None,
+            read_log: true,
             expect: Expect::Service { restarts: 0 },
         },
         client_task("storage-client", "saves and reads back a note", 1, 0x501),
@@ -2589,6 +2622,7 @@ fn run_badge_scenario(
         arg,
         badge: 0,
         module: None,
+        read_log: false,
         expect,
     };
     let tenant = |name, role, arg, expect| {
@@ -2692,6 +2726,7 @@ fn run_services_scenario(
         arg: 0,
         badge: 0,
         module: None,
+        read_log: false,
         expect,
     };
     let device_syscalls = (1 << Syscall::PortIo as u8) | (1 << Syscall::IrqAck as u8);
@@ -2793,6 +2828,7 @@ fn run_driver_scenario(
         arg: 0,
         badge: 0,
         module: None,
+        read_log: false,
         expect,
     };
     let tasks = [

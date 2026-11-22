@@ -18,10 +18,12 @@
 #![no_main]
 
 use centinela_cfs::{BLOCK_SIZE, Block, BlockDevice, Error, Volume, format};
-use centinela_disk::gpt::{self, CFS_TYPE, MAX_PARTITIONS, Partition};
+use centinela_disk::gpt::{self, CFS_TYPE, ESP_TYPE, MAX_PARTITIONS, Partition};
 use centinela_disk::{Sector, SectorDevice};
 use centinela_userland::drive::Drive;
-use centinela_userland::{FLAG_KERNEL_ORIGIN, Line, exit, pack, reply_and_wait, reply_wait, write};
+use centinela_userland::{
+    FLAG_KERNEL_ORIGIN, Line, exit, log_read, pack, reply_and_wait, reply_wait, write,
+};
 
 /// Kernel convention: where the disk controller's registers are mapped.
 const MMIO_BASE: u64 = 0x0000_5000_0000_0000;
@@ -37,6 +39,41 @@ const ECORRUPT: u64 = 74;
 
 static mut BITMAP: [u64; 1024] = [0; 1024];
 static mut STAGED: [u8; STAGING] = [0; STAGING];
+/// Largest boot log written to the ESP (the kernel keeps 64 KiB).
+const BOOT_LOG: usize = 64 * 1024;
+static mut LOG: [u8; BOOT_LOG] = [0; BOOT_LOG];
+
+/// Validates the boot-log location recorded by the installer against the
+/// ESP in the partition table: the log is only ever written inside it.
+fn boot_log_range(location: &[u8], partitions: &[Partition]) -> Option<(u64, u64)> {
+    let start = u64::from_le_bytes(location.get(..8)?.try_into().ok()?);
+    let sectors = u64::from_le_bytes(location.get(8..16)?.try_into().ok()?);
+    let esp = partitions.iter().find(|p| p.type_guid == ESP_TYPE)?;
+    let fits = sectors > 0
+        && sectors <= (BOOT_LOG / 512) as u64
+        && sectors.is_multiple_of(8)
+        && start >= esp.first_lba
+        && start.checked_add(sectors)? <= esp.last_lba + 1;
+    fits.then_some((start, sectors))
+}
+
+/// Copies the kernel boot log into CENTINELA/BOOTLOG.TXT on the ESP (a
+/// preallocated contiguous file), padded with spaces.
+fn save_boot_log(disk: &mut Disk, start: u64, sectors: u64) -> bool {
+    // SAFETY: Single-threaded task; the buffer is not otherwise borrowed.
+    let log = unsafe { &mut *core::ptr::addr_of_mut!(LOG) };
+    let size = sectors as usize * 512;
+    let length = log_read(0, &mut log[..size]);
+    log[length..size].fill(b' ');
+    log[size - 1] = b'\n';
+    for (index, chunk) in log[..size].chunks(BLOCK_SIZE).enumerate() {
+        let lba = start + index as u64 * 8;
+        if !disk.nvme.write_page(6, 0, chunk) || !disk.nvme.transfer(true, lba, 8, 6) {
+            return false;
+        }
+    }
+    disk.nvme.flush()
+}
 
 struct Disk {
     nvme: Drive,
@@ -256,6 +293,25 @@ pub extern "C" fn _start(endpoint: u64, _unused: u64, _unused2: u64, kind: u64) 
             .push(b"storage: welcome.txt written by the host tool: ")
             .push(shown)
             .print();
+    }
+
+    // Installed system: save this boot's log where any OS can read it.
+    let mut location = [0u8; 16];
+    let log_range = match volume.read(0, b"boot-log-lba", 0, &mut location) {
+        Ok(16) if system.is_some() => boot_log_range(&location, &partitions),
+        _ => None,
+    };
+    if let Some((start, sectors)) = log_range {
+        write("storage: saving this boot's log to CENTINELA/BOOTLOG.TXT on the EFI partition");
+        if !save_boot_log(&mut disk, start, sectors) {
+            write("storage: could not save the boot log (continuing)");
+        }
+        // SAFETY: As above; the previous volume released its borrow.
+        let bitmap = unsafe { &mut *core::ptr::addr_of_mut!(BITMAP) };
+        volume = match Volume::mount(&mut disk, bitmap) {
+            Ok(volume) => volume,
+            Err(_) => fail("storage: volume does not remount", 26),
+        };
     }
 
     // Client service loop.

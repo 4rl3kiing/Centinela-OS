@@ -34,9 +34,11 @@ pub enum Syscall {
     DmaAlloc = 18,
     /// Blocks the caller for a bounded number of timer ticks (no CPU used).
     Sleep = 19,
+    /// Reads 32 bytes of the kernel boot log per call (ReadLog capability).
+    LogRead = 20,
 }
 
-const VALID_SYSCALL_BITS: u64 = (1 << 20) - 1;
+const VALID_SYSCALL_BITS: u64 = (1 << 21) - 1;
 
 impl Syscall {
     /// Decodes a raw syscall number from Ring 3. Unknown numbers are `None`.
@@ -62,6 +64,7 @@ impl Syscall {
             17 => Self::Revoke,
             18 => Self::DmaAlloc,
             19 => Self::Sleep,
+            20 => Self::LogRead,
             _ => return None,
         })
     }
@@ -82,6 +85,7 @@ impl Syscall {
             // Which ports and which line are object grants checked by the
             // kernel per call; the capability gates the whole surface.
             Self::PortIo | Self::IrqAck | Self::DmaAlloc => Some(Capability::DeviceAccess),
+            Self::LogRead => Some(Capability::ReadLog),
             // IPC authority comes from the endpoint handle's rights
             // (object capability), checked by the IPC layer.
             // Revocation authority is the unbadged GRANT capability itself.
@@ -227,11 +231,11 @@ mod tests {
 
     #[test]
     fn every_syscall_number_round_trips() {
-        for number in 0..20 {
+        for number in 0..21 {
             let syscall = Syscall::from_number(number).expect("defined syscall");
             assert_eq!(syscall as u64, number);
         }
-        assert_eq!(Syscall::from_number(20), None);
+        assert_eq!(Syscall::from_number(21), None);
     }
 
     #[test]

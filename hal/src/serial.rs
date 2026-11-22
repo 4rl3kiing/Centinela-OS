@@ -101,7 +101,42 @@ pub fn write(message: &str) {
             }
         }
         crate::framebuffer::write(message);
+        record(message.as_bytes());
     });
+}
+
+/// The first 64 KiB of the boot log, kept in memory so a task holding the
+/// ReadLog capability can save it to disk for hardware diagnosis.
+const LOG_CAPACITY: usize = 64 * 1024;
+static mut LOG: [u8; LOG_CAPACITY] = [0; LOG_CAPACITY];
+static LOG_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Appends to the in-memory log (the caller holds the console).
+fn record(bytes: &[u8]) {
+    let start = LOG_LEN.load(Ordering::Relaxed);
+    let take = bytes.len().min(LOG_CAPACITY - start);
+    // SAFETY: Writers are serialized by the console hold; bytes below
+    // LOG_LEN are never rewritten, so readers never see a torn byte.
+    unsafe {
+        let log = &mut *core::ptr::addr_of_mut!(LOG);
+        log[start..start + take].copy_from_slice(&bytes[..take]);
+    }
+    LOG_LEN.store(start + take, Ordering::Release);
+}
+
+/// Copies log bytes starting at `offset` into `out`; returns the count.
+pub fn log_read(offset: usize, out: &mut [u8]) -> usize {
+    let length = LOG_LEN.load(Ordering::Acquire);
+    if offset >= length {
+        return 0;
+    }
+    let take = out.len().min(length - offset);
+    // SAFETY: Bytes below LOG_LEN are append-only and fully written.
+    unsafe {
+        let log = &*core::ptr::addr_of!(LOG);
+        out[..take].copy_from_slice(&log[offset..offset + take]);
+    }
+    take
 }
 
 use core::sync::atomic::AtomicUsize;

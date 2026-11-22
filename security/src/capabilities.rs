@@ -13,9 +13,11 @@ pub enum Capability {
     LoadDrivers = 6,
     /// Ring 3 driver: mediated port I/O and interrupt acknowledgement.
     DeviceAccess = 7,
+    /// Read the kernel's boot log (to save it for hardware diagnosis).
+    ReadLog = 8,
 }
 
-const VALID_CAPABILITY_BITS: u64 = (1 << 8) - 1;
+const VALID_CAPABILITY_BITS: u64 = (1 << 9) - 1;
 
 /// A compact set of granted capabilities.
 ///

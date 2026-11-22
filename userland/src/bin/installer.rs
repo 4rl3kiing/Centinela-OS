@@ -18,7 +18,7 @@ use centinela_disk::gpt::{self, CFS_TYPE, ESP_TYPE, Partition};
 use centinela_disk::payload::Payload;
 use centinela_disk::{SECTOR, Sector, SectorDevice};
 use centinela_userland::drive::Drive;
-use centinela_userland::{Line, exit, write};
+use centinela_userland::{Line, exit, log_read, write};
 
 /// Kernel convention: MMIO window and lent module locations.
 const MMIO_BASE: u64 = 0x0000_5000_0000_0000;
@@ -27,6 +27,30 @@ const ESP_FIRST: u64 = 2048;
 const ESP_SECTORS: u64 = 160 * 1024 * 1024 / SECTOR as u64;
 
 static mut BITMAP: [u64; 4096] = [0; 4096];
+/// Size of each diagnostic text file on the ESP (the kernel keeps 64 KiB).
+const LOG_FILE: usize = 64 * 1024;
+/// Spaces: initial content of the two diagnostic files.
+static mut BLANK_TEXT: [u8; LOG_FILE] = [0; LOG_FILE];
+/// The kernel log, copied for writing.
+static mut LOG: [u8; LOG_FILE] = [0; LOG_FILE];
+
+/// Writes the kernel log so far into a preallocated text file on the ESP
+/// (contiguous sectors from `start`), padded with spaces.
+fn write_log_file(disk: &mut Disk, start: u64) -> bool {
+    // SAFETY: Single-threaded task; the buffer is not otherwise borrowed.
+    let log = unsafe { &mut *core::ptr::addr_of_mut!(LOG) };
+    let length = log_read(0, log);
+    log[length..].fill(b' ');
+    log[LOG_FILE - 1] = b'\n';
+    let mut sector = [0u8; SECTOR];
+    for (index, chunk) in log.chunks(SECTOR).enumerate() {
+        sector.copy_from_slice(chunk);
+        if disk.write(start + index as u64, &sector).is_err() {
+            return false;
+        }
+    }
+    disk.nvme.flush()
+}
 
 struct Disk {
     nvme: Drive,
@@ -201,10 +225,20 @@ pub extern "C" fn _start(_unused: u64, payload_len: u64, _unused2: u64, flags: u
         .push(b" MiB)")
         .print();
 
+    // SAFETY: Single-threaded task; filled once, then only read.
+    let blank_text = unsafe {
+        let text = &mut *core::ptr::addr_of_mut!(BLANK_TEXT);
+        text.fill(b' ');
+        text[LOG_FILE - 1] = b'\n';
+        &*text
+    };
     let mut files = [FileSpec {
         path: b"",
         data: b"",
     }; 64];
+    if payload.len() + 2 > files.len() {
+        fail("installer: install payload has too many files", 13);
+    }
     for (index, slot) in files.iter_mut().enumerate().take(payload.len()) {
         if let Some(file) = payload.file(index) {
             *slot = FileSpec {
@@ -213,12 +247,26 @@ pub extern "C" fn _start(_unused: u64, payload_len: u64, _unused2: u64, flags: u
             };
         }
     }
-    if fat32::format_with_files(
+    // Diagnostic files readable from any system: the installation log and
+    // the log of the latest boot of the installed system.
+    let install_log = payload.len();
+    let boot_log = install_log + 1;
+    files[install_log] = FileSpec {
+        path: b"CENTINELA/INSTALL.TXT",
+        data: blank_text,
+    };
+    files[boot_log] = FileSpec {
+        path: b"CENTINELA/BOOTLOG.TXT",
+        data: blank_text,
+    };
+    let mut starts = [0u64; 64];
+    if fat32::format_with_files_located(
         &mut disk,
         ESP_FIRST,
         ESP_SECTORS,
         b"CENTINELA  ",
-        &files[..payload.len()],
+        &files[..boot_log + 1],
+        &mut starts,
     )
     .is_err()
     {
@@ -227,7 +275,7 @@ pub extern "C" fn _start(_unused: u64, payload_len: u64, _unused2: u64, flags: u
     Line::new()
         .push(b"installer: EFI system partition (FAT32) holds ")
         .number(payload.len() as u64)
-        .push(b" files: loader, config, kernel and programs")
+        .push(b" files: loader, config, kernel, programs; diagnostic logs in CENTINELA/")
         .print();
 
     let blocks = (cfs_last + 1 - cfs_first) / 8;
@@ -255,8 +303,21 @@ pub extern "C" fn _start(_unused: u64, payload_len: u64, _unused2: u64, flags: u
     if volume.write_file(0, b"install-info", note).is_err() {
         fail("installer: writing install-info failed", 12);
     }
+    // Where the storage service writes each boot's log (absolute LBA and
+    // sector count inside the ESP; it re-checks the range against the GPT).
+    let mut location = [0u8; 16];
+    location[..8].copy_from_slice(&starts[boot_log].to_le_bytes());
+    location[8..].copy_from_slice(&((LOG_FILE / SECTOR) as u64).to_le_bytes());
+    if volume.write_file(0, b"boot-log-lba", &location).is_err() {
+        fail("installer: recording the boot log location failed", 14);
+    }
     let _ = BLOCK_SIZE;
     write("installer: CFS system volume formatted; install-info recorded");
-    write("installer: installation complete");
+    write(
+        "installer: installation complete; log saved to CENTINELA/INSTALL.TXT on the EFI partition",
+    );
+    if !write_log_file(&mut disk, starts[install_log]) {
+        fail("installer: saving the installation log failed", 15);
+    }
     exit(0)
 }

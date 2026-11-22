@@ -41,6 +41,48 @@ pub const FLAG_KERNEL_ORIGIN: u64 = 1 << 16;
 /// Label of the kernel notice sent when a bound IRQ fires.
 pub const NOTICE_IRQ: u64 = 0x1A0_0001;
 
+pub const SYS_LOG_READ: u64 = 20;
+
+/// Copies the kernel boot log starting at `offset` into `out` (needs the
+/// ReadLog capability). Returns the number of bytes copied; 0 at the end.
+pub fn log_read(offset: usize, out: &mut [u8]) -> usize {
+    let mut done = 0;
+    while done < out.len() {
+        let count: u64;
+        let (a, b, c, d): (u64, u64, u64, u64);
+        // SAFETY: SYSCALL clobbers RCX and R11 (declared); the kernel
+        // returns the data in RDX, R10, R8 and R9 (declared as outputs).
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") SYS_LOG_READ => count,
+                in("rdi") (offset + done) as u64,
+                lateout("rdx") a,
+                lateout("r10") b,
+                lateout("r8") c,
+                lateout("r9") d,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack)
+            );
+        }
+        if count == 0 || count > 32 {
+            break;
+        }
+        let mut chunk = [0u8; 32];
+        for (index, word) in [a, b, c, d].iter().enumerate() {
+            chunk[index * 8..index * 8 + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        let take = (count as usize).min(out.len() - done);
+        out[done..done + take].copy_from_slice(&chunk[..take]);
+        done += take;
+        if count < 32 {
+            break;
+        }
+    }
+    done
+}
+
 /// Raw 2-argument syscall.
 ///
 /// # Safety

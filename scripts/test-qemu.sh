@@ -367,6 +367,8 @@ CFS_IMAGE=build/install-cfs.img
 dd if="$INSTALL_DISK" of="$CFS_IMAGE" bs=512 skip=$((2048 + 160 * 2048)) status=none
 "$CFS_TOOL" fsck "$CFS_IMAGE" >/dev/null || { echo "installed CFS volume failed fsck" >&2; exit 1; }
 "$CFS_TOOL" get "$CFS_IMAGE" install-info | grep -q "Instalado" || { echo "install-info missing" >&2; exit 1; }
+mtype -i "$ESP_IMAGE" ::/CENTINELA/INSTALL.TXT | grep -q "installer: GPT written" \
+    || { echo "installation log missing from the ESP" >&2; exit 1; }
 echo "PASS: host tools verify the installed disk (sgdisk, fsck.fat, mtype, cfs-tool)"
 
 install_boot installed
@@ -374,8 +376,15 @@ expect_in "build/logs/qemu-${P}installed.log" \
     "Centinela-OS: Rust kernel entry reached." \
     "files on GPT partition 'Centinela system'; boot count now 1" \
     "storage: install-info: Instalado por el instalador de Centinela-OS." \
+    "storage: saving this boot's log to CENTINELA/BOOTLOG.TXT" \
     "Microkernel milestone:"
-echo "PASS: the installed system boots from its own disk (UEFI) and mounts its CFS volume"
+dd if="$INSTALL_DISK" of="$ESP_IMAGE" bs=512 skip=2048 count=$((160 * 2048)) status=none
+fsck.fat -n "$ESP_IMAGE" >/dev/null || { echo "fsck.fat found errors after the boot log was saved" >&2; exit 1; }
+for message in "HWREPORT" "Centinela-OS: Rust kernel entry reached." "boot count now 1"; do
+    mtype -i "$ESP_IMAGE" ::/CENTINELA/BOOTLOG.TXT | grep -Fq "$message" \
+        || { echo "boot log on the ESP lacks: $message" >&2; exit 1; }
+done
+echo "PASS: the installed system boots from its own disk (UEFI), mounts CFS and saves its boot log to the ESP"
 
 # The same installation on a SATA disk (AHCI controller, no NVMe).
 SATA_DISK=build/install-sata.img
