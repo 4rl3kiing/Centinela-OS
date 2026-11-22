@@ -43,6 +43,11 @@ Sketch of option A (to be refined before code):
   generation numbers; the newest one with a valid checksum wins.
 - Every tree node and data extent carries a checksum (BLAKE2b-128 or
   CRC32C for data, BLAKE2b for metadata).
+  - Implementation note (2026-11-22): the v1 code uses CRC32C for both
+    data and metadata. CRC32C only detects accidental corruption; anyone
+    with write access to the disk can recompute it. CFS v1 is therefore
+    not tamper-resistant offline. Authenticated metadata (keyed MAC per
+    volume), encryption at rest and rollback protection remain pending.
 - Updates write new blocks and switch the superblock last; freed blocks
   are reclaimed only after the switch is durable (NVMe FLUSH).
 - Hooks for per-volume encryption keys (full-disk encryption after 1.0).

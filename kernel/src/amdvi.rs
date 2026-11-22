@@ -14,6 +14,8 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use centinela_hal::serial::{SerialWriter, write as serial_write};
 use centinela_kernel::acpi::{self, AcpiError, PhysicalReader};
+use centinela_kernel::dma::amdvi as encode;
+use centinela_kernel::dma::{CommandRing, RING_ENTRIES, RingState, SpinLock, submit};
 use centinela_kernel::memory::hhdm_backend::HhdmFrameMemory;
 use centinela_kernel::memory::vmm::{
     PAGE_SIZE, PageMapping, PageTableMapper, PageTableMutationMemory, PhysAddr,
@@ -44,6 +46,14 @@ const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
 static WINDOWS: [AtomicU64; MAX_UNITS] = [const { AtomicU64::new(0) }; MAX_UNITS];
 static COMMANDS: [AtomicU64; MAX_UNITS] = [const { AtomicU64::new(0) }; MAX_UNITS];
 static EVENTS: [AtomicU64; MAX_UNITS] = [const { AtomicU64::new(0) }; MAX_UNITS];
+/// Frame holding one COMPLETION_WAIT store word per unit.
+static WAIT: AtomicU64 = AtomicU64::new(0);
+/// Per-unit command-ring lock: tail, token and the ring itself are shared by
+/// every CPU, so a batch is queued and confirmed under its unit's lock.
+static RINGS: [SpinLock<RingState>; MAX_UNITS] =
+    [const { SpinLock::new(RingState::new()) }; MAX_UNITS];
+/// Bound on each wait for ring space and for a completion.
+const POLL_LIMIT: u32 = 10_000_000;
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 static DEVICE_TABLE: AtomicU64 = AtomicU64::new(0);
 static EMPTY_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -70,39 +80,77 @@ fn hhdm(physical: u64) -> *mut u64 {
     (HHDM.load(Ordering::Relaxed) + physical) as *mut u64
 }
 
-/// Issues commands on every unit and waits until each has consumed them.
-fn command(words: [u64; 2]) -> bool {
-    (0..COUNT.load(Ordering::Relaxed)).all(|unit| {
-        let tail = read(unit, REG_COMMAND_TAIL) & 0xff0;
-        let base = COMMANDS[unit].load(Ordering::Relaxed);
-        // SAFETY: The command ring page belongs to the kernel (HHDM alias).
+/// One unit's command ring, as the hardware sees it. Used only while the
+/// unit's `RINGS` lock is held.
+struct UnitRing(usize);
+
+impl UnitRing {
+    fn wait_word(&self) -> *mut u64 {
+        hhdm(WAIT.load(Ordering::Relaxed) + self.0 as u64 * 8)
+    }
+}
+
+impl CommandRing for UnitRing {
+    fn head(&mut self) -> u64 {
+        (read(self.0, REG_COMMAND_HEAD) & 0xff0) >> 4
+    }
+
+    fn store(&mut self, index: u64, entry: [u64; 2]) {
+        let base = COMMANDS[self.0].load(Ordering::Relaxed);
+        let slot = hhdm(base + (index % RING_ENTRIES) * 16);
+        // SAFETY: The slot lies inside the command ring page, which belongs
+        // to the kernel (HHDM alias); the unit reads only up to its tail.
         unsafe {
-            core::ptr::write_volatile(hhdm(base + tail), words[0]);
-            core::ptr::write_volatile(hhdm(base + tail + 8), words[1]);
+            slot.write_volatile(entry[0]);
+            slot.add(1).write_volatile(entry[1]);
         }
-        let next = (tail + 16) % PAGE_SIZE;
-        write_register(unit, REG_COMMAND_TAIL, next);
-        (0..10_000_000).any(|_| {
-            let done = read(unit, REG_COMMAND_HEAD) & 0xff0 == next;
-            if !done {
-                core::hint::spin_loop();
-            }
-            done
-        })
-    })
+    }
+
+    fn publish(&mut self, tail: u64) {
+        // The ring stores must be globally visible before the doorbell.
+        core::sync::atomic::fence(Ordering::SeqCst);
+        write_register(self.0, REG_COMMAND_TAIL, tail << 4);
+    }
+
+    fn wait_command(&mut self, token: u32) -> [u64; 2] {
+        // SAFETY: Kernel-owned wait frame, HHDM-mapped; one word per unit.
+        unsafe { self.wait_word().write_volatile(0) };
+        encode::completion_wait(
+            WAIT.load(Ordering::Relaxed) + self.0 as u64 * 8,
+            u64::from(token),
+        )
+    }
+
+    fn completion(&mut self) -> u32 {
+        // SAFETY: As in `wait_command`.
+        unsafe { self.wait_word().read_volatile() as u32 }
+    }
+
+    fn faulted(&mut self) -> bool {
+        // A unit that stops on an illegal command never stores the token:
+        // the bounded wait reports it.
+        false
+    }
 }
 
-fn invalidate_device(device_id: u16) -> bool {
-    // Opcode in bits 63:60 of the first quadword; the second is reserved.
-    command([u64::from(device_id) | 0x2 << 60, 0])
-}
-
-fn invalidate_domain(domain: u16) -> bool {
-    // All pages of the domain: address 0x7FFF_FFFF_FFFF_F000 with S=1, PDE=1.
-    command([
-        u64::from(domain) << 32 | 0x3 << 60,
-        0x7fff_ffff_ffff_f000 | 0b11,
-    ])
+/// Queues `batch` on every unit, each followed by a COMPLETION_WAIT, and
+/// returns true only when every unit stored its wait token: the commands
+/// have completed, not merely been fetched. Every unit is tried even after
+/// one fails.
+fn commands(batch: &[[u64; 2]]) -> bool {
+    let mut confirmed = true;
+    let count = COUNT.load(Ordering::Relaxed);
+    for (unit, ring) in RINGS.iter().enumerate().take(count) {
+        let result = ring.with(|state| submit(&mut UnitRing(unit), state, batch, POLL_LIMIT));
+        if let Err(error) = result {
+            let _ = write!(
+                SerialWriter,
+                "Centinela-OS: AMD-Vi unit {unit} did not confirm its commands: {error:?}.\r\n"
+            );
+        }
+        confirmed &= result.is_ok();
+    }
+    confirmed
 }
 
 fn blocked_entry() -> [u64; 4] {
@@ -157,8 +205,9 @@ pub(crate) fn init<R: PhysicalReader>(
             return Some(false);
         }
     };
-    let (Some(table), Ok(empty)) = (
+    let (Some(table), Ok(empty), Ok(wait)) = (
         memory.allocate_contiguous_zeroed(DEVICE_TABLE_PAGES),
+        memory.allocate_zeroed_table_frame(),
         memory.allocate_zeroed_table_frame(),
     ) else {
         serial_write("Centinela-OS: no memory for the AMD-Vi device table.\r\n");
@@ -166,6 +215,7 @@ pub(crate) fn init<R: PhysicalReader>(
     };
     DEVICE_TABLE.store(table.get(), Ordering::Relaxed);
     EMPTY_ROOT.store(empty.get(), Ordering::Relaxed);
+    WAIT.store(wait.get(), Ordering::Relaxed);
     let blocked = blocked_entry();
     for device_id in 0..=u16::MAX {
         set_entry(device_id, blocked);
@@ -212,6 +262,7 @@ pub(crate) fn init<R: PhysicalReader>(
         write_register(unit, REG_EVENT_BASE, events.get() | RING_LENGTH_EXP << 56);
         write_register(unit, REG_COMMAND_HEAD, 0);
         write_register(unit, REG_COMMAND_TAIL, 0);
+        RINGS[unit].with(RingState::reset);
         write_register(unit, REG_EVENT_HEAD, 0);
         write_register(unit, REG_EVENT_TAIL, 0);
         write_register(
@@ -244,11 +295,20 @@ fn device_id(device: crate::pci::Device) -> u16 {
 }
 
 /// Gives `device` its own empty domain; returns the domain's page-table root.
+/// The caller (`iommu::attach`) holds the topology lock.
 pub(crate) fn attach(
     memory: &mut HhdmFrameMemory<'_, '_>,
     device: crate::pci::Device,
     domain: u16,
 ) -> Option<PhysAddr> {
+    // A domain ID still held by a slot is either in use or was retired
+    // without a confirmed invalidation (stale IOTLB entries may carry it):
+    // it is never handed out again.
+    if DOMAINS.iter().any(|(root, id)| {
+        root.load(Ordering::Relaxed) != 0 && id.load(Ordering::Relaxed) == u64::from(domain)
+    }) {
+        return None;
+    }
     let slot = DOMAINS
         .iter()
         .find(|(root, _)| root.load(Ordering::Relaxed) == 0)?;
@@ -265,7 +325,17 @@ pub(crate) fn attach(
             0,
         ],
     );
-    (invalidate_device(id) && invalidate_domain(domain)).then_some(root)
+    if commands(&[
+        encode::invalidate_device(id),
+        encode::invalidate_domain(domain),
+    ]) {
+        return Some(root);
+    }
+    // Not confirmed: the device goes back to the blocked entry. The unit may
+    // have cached the new root under this domain ID, so the frame is
+    // quarantined (left allocated) and the slot keeps the ID retired.
+    set_entry(id, blocked_entry());
+    None
 }
 
 fn domain_of(root: PhysAddr) -> Option<u16> {
@@ -308,7 +378,28 @@ pub(crate) fn map(
     let index = (iova >> 12) & 0x1ff;
     let leaf = PRESENT | physical.get() | READ | WRITE;
     PageTableMutationMemory::write_entry(memory, table, index as u16, leaf).is_ok()
-        && invalidate_domain(domain)
+        && commands(&[encode::invalidate_domain(domain)])
+}
+
+/// Removes the 4 KiB mapping at `iova`, if any. Returns true only when the
+/// invalidation was confirmed: only then may the frame behind it be reused.
+pub(crate) fn unmap(memory: &mut HhdmFrameMemory<'_, '_>, root: PhysAddr, iova: u64) -> bool {
+    let Some(domain) = domain_of(root) else {
+        return false;
+    };
+    let mut table = root;
+    for level in (2..=LEVELS).rev() {
+        let index = (iova >> (12 + 9 * (level - 1))) & 0x1ff;
+        let entry = PageTableMutationMemory::read_entry(memory, table, index as u16).unwrap_or(0);
+        match PhysAddr::new(entry & ADDRESS) {
+            Ok(next) if entry & PRESENT != 0 => table = next,
+            // No table on the path: nothing was ever mapped here.
+            _ => return commands(&[encode::invalidate_domain(domain)]),
+        }
+    }
+    let index = (iova >> 12) & 0x1ff;
+    PageTableMutationMemory::write_entry(memory, table, index as u16, 0).is_ok()
+        && commands(&[encode::invalidate_domain(domain)])
 }
 
 fn free_tables(memory: &mut HhdmFrameMemory<'_, '_>, table: PhysAddr, level: u64) {
@@ -357,20 +448,34 @@ fn report_event(unit: usize, head: u64) {
     );
 }
 
-/// Blocks the device again, frees its tables and returns the I/O page
-/// faults logged since the last call.
+/// Blocks the device again and returns the I/O page faults logged since the
+/// last call, plus whether isolation was confirmed. The domain's tables are
+/// freed only in that case: if any unit failed to confirm the invalidation
+/// (COMPLETION_WAIT), it may still walk them, so they stay allocated
+/// (quarantined) and the caller must not reuse the frames mapped in them.
+/// The caller (`iommu::detach`) holds the topology lock and has already
+/// cleared the device's Bus Master bit.
 pub(crate) fn detach(
     memory: &mut HhdmFrameMemory<'_, '_>,
     device: crate::pci::Device,
     root: Option<PhysAddr>,
-) -> u64 {
+) -> (u64, bool) {
     let id = device_id(device);
     set_entry(id, blocked_entry());
-    let _ = invalidate_device(id);
+    let domain = root.and_then(domain_of);
+    let isolated = match domain {
+        Some(domain) => commands(&[
+            encode::invalidate_device(id),
+            encode::invalidate_domain(domain),
+        ]),
+        None => commands(&[encode::invalidate_device(id)]),
+    };
+    // Without confirmation the slot stays occupied: its tables are
+    // quarantined and its domain ID is never recycled (see `attach`).
     if let Some(root) = root
-        && let Some(domain) = domain_of(root)
+        && isolated
+        && domain.is_some()
     {
-        let _ = invalidate_domain(domain);
         if let Some(slot) = DOMAINS
             .iter()
             .find(|(r, _)| r.load(Ordering::Relaxed) == root.get())
@@ -392,5 +497,5 @@ pub(crate) fn detach(
         }
         write_register(unit, REG_EVENT_HEAD, tail);
     }
-    faults
+    (faults, isolated && (root.is_none() || domain.is_some()))
 }

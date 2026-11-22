@@ -1000,6 +1000,17 @@ fn init_platform(
             .checked_sub(base)
             .map(|physical| (&reader, physical))
     };
+    // Before the IOMMU is programmed and before any driver starts: nothing
+    // the firmware left behind may keep mastering the bus (see `pci`).
+    let quiesced = pci::quiesce_bus_masters(memory, kernel_root);
+    {
+        use core::fmt::Write;
+        let _ = write!(
+            SerialWriter,
+            "PCI: Bus Master cleared on {} of {} function(s) before IOMMU and drivers start ({} hard-wired); DMA is re-enabled only per device with an IOMMU domain.\r\n",
+            quiesced.cleared, quiesced.functions, quiesced.stuck
+        );
+    }
     hwreport::print(rsdp);
     power::init(rsdp);
     clock::init(rsdp);

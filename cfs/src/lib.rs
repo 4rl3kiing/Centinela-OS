@@ -31,9 +31,17 @@
 //! Every byte read from the device is untrusted: magic, version, bounds,
 //! checksums, names, sizes and block references are validated, and a block
 //! referenced twice (shared or cyclic structure) rejects the volume.
-//! Checksums detect corruption, not tampering: an attacker who can write the
-//! disk can recompute them (integrity against tampering needs the planned
-//! per-volume keys).
+//! Checksums (CRC32C, unkeyed) detect accidental corruption only, not
+//! tampering: an attacker who can write the disk offline can forge any
+//! structure and recompute its checksum. CFS v1 is therefore NOT resistant
+//! to offline manipulation; its guarantee against hostile images is limited
+//! to "never panic, loop or touch blocks outside the volume". Integrity
+//! against tampering needs the planned keyed per-volume MACs/encryption.
+//!
+//! Counters taken from the disk are bounded: a superblock generation must be
+//! in `1..=MAX_GENERATION` (a forged `u64::MAX` is rejected at mount, and a
+//! commit that would exceed the limit fails with [`Error::Corrupt`] instead
+//! of overflowing), and `block_count` must fit the u32 block references.
 
 pub mod crc32c;
 
@@ -48,6 +56,11 @@ pub const MAX_FILE_BLOCKS: usize = 509;
 pub const MAX_FILE_SIZE: usize = MAX_FILE_BLOCKS * BLOCK_SIZE;
 /// Smallest volume: two superblocks, a directory and room to update it.
 pub const MIN_BLOCKS: u64 = 8;
+/// Largest volume: block references are stored as u32.
+pub const MAX_BLOCKS: u64 = 1 << 32;
+/// Largest valid superblock generation (0 is never written; `u64::MAX` is
+/// reserved so `generation + 1` can never overflow).
+pub const MAX_GENERATION: u64 = u64::MAX - 1;
 const DIR_MAGIC: &[u8; 4] = b"CDIR";
 const INODE_MAGIC: &[u8; 4] = b"CINO";
 const CRC_OFFSET: usize = BLOCK_SIZE - 4;
@@ -163,6 +176,8 @@ impl Superblock {
         };
         let sane = sb.block_count >= MIN_BLOCKS
             && sb.block_count <= device_blocks
+            && sb.block_count <= MAX_BLOCKS
+            && (1..=MAX_GENERATION).contains(&sb.generation)
             && sb.root >= 2
             && sb.root < sb.block_count;
         sane.then_some(sb)
@@ -296,12 +311,11 @@ impl Inode {
         let count = get_u32(block, 4) as usize;
         let size = get_u64(block, 8);
         // The block count must match the size exactly.
-        let needed = (size as usize).div_ceil(BLOCK_SIZE);
-        if count > MAX_FILE_BLOCKS
-            || size != expected_size
-            || size as usize > MAX_FILE_SIZE
-            || count != needed
-        {
+        // Compare in u64 first so no cast can truncate a hostile size.
+        if count > MAX_FILE_BLOCKS || size != expected_size || size > MAX_FILE_SIZE as u64 {
+            return None;
+        }
+        if count != (size as usize).div_ceil(BLOCK_SIZE) {
             return None;
         }
         let mut inode = Self {
@@ -344,6 +358,9 @@ pub struct Volume<'a, D: BlockDevice> {
     bitmap: Bitmap<'a>,
     /// Allocation cursor (spreads writes, avoids immediate reuse).
     cursor: u64,
+    /// Superblock slot (0 or 1) holding the current generation; commits
+    /// always write the other one.
+    slot: u64,
 }
 
 /// Writes an empty filesystem. Any previous content becomes unreachable.
@@ -362,16 +379,18 @@ pub fn format<D: BlockDevice>(device: &mut D, label: &[u8]) -> Result<(), Error>
     let length = label.len().min(32);
     name[..length].copy_from_slice(&label[..length]);
     let superblock = Superblock {
-        block_count: blocks,
+        block_count: blocks.min(MAX_BLOCKS),
         generation: 1,
         root: 2,
         root_crc: get_u32(&root, CRC_OFFSET),
         label: name,
     };
     device.flush()?;
-    device.write(0, &superblock.encode())?;
+    // Generation g lives in slot g % 2, so the first commit (generation 2)
+    // goes to slot 0 and never overwrites the current superblock.
+    device.write(1, &superblock.encode())?;
     // Invalidate the other slot so an older filesystem cannot win.
-    device.write(1, &[0u8; BLOCK_SIZE])?;
+    device.write(0, &[0u8; BLOCK_SIZE])?;
     device.flush()
 }
 
@@ -390,20 +409,20 @@ impl<'a, D: BlockDevice> Volume<'a, D> {
             return Err(Error::TooLarge);
         }
         let mut block = [0u8; BLOCK_SIZE];
-        let mut best: Option<Superblock> = None;
+        let mut best: Option<(Superblock, u64)> = None;
         let mut magic_seen = false;
         for slot in 0..2 {
             device.read(slot, &mut block)?;
             magic_seen |= &block[..8] == MAGIC;
             if let Some(sb) = Superblock::decode(&block, device_blocks)
-                && best.is_none_or(|b| sb.generation > b.generation)
+                && best.is_none_or(|(b, _)| sb.generation > b.generation)
             {
-                best = Some(sb);
+                best = Some((sb, slot));
             }
         }
         // A CFS signature without a valid superblock is a damaged (or
         // mismatched) volume, never a blank disk: callers must not reformat.
-        let superblock = best.ok_or(if magic_seen {
+        let (superblock, slot) = best.ok_or(if magic_seen {
             Error::Corrupt
         } else {
             Error::NotFormatted
@@ -417,6 +436,7 @@ impl<'a, D: BlockDevice> Volume<'a, D> {
             },
             bitmap: Bitmap { words: bitmap },
             cursor: 3,
+            slot,
         };
         volume.load_tree()?;
         Ok(volume)
@@ -584,11 +604,13 @@ impl<'a, D: BlockDevice> Volume<'a, D> {
             block.fill(0);
             block[..chunk.len()].copy_from_slice(chunk);
             let target = self.allocate()?;
+            let reference = u32::try_from(target).map_err(|_| Error::TooLarge)?;
             self.device.write(target, &block)?;
-            inode.blocks[slot] = (target as u32, crc32c(&block));
+            inode.blocks[slot] = (reference, crc32c(&block));
         }
         let encoded = inode.encode();
         let inode_block = self.allocate()?;
+        let inode_reference = u32::try_from(inode_block).map_err(|_| Error::TooLarge)?;
         self.device.write(inode_block, &encoded)?;
         let mut stored = [0u8; MAX_NAME];
         stored[..name.len()].copy_from_slice(name);
@@ -597,7 +619,7 @@ impl<'a, D: BlockDevice> Volume<'a, D> {
             name_len: name.len() as u8,
             owner,
             size: data.len() as u64,
-            inode: inode_block as u32,
+            inode: inode_reference,
             inode_crc: get_u32(&encoded, CRC_OFFSET),
         };
         Ok(())
@@ -617,6 +639,17 @@ impl<'a, D: BlockDevice> Volume<'a, D> {
 
     /// Writes the new directory, then the superblock in the other slot.
     fn commit(&mut self, directory: Directory) -> Result<(), Error> {
+        // Mount only accepts generations up to MAX_GENERATION, so this fails
+        // (never overflows) on a forged near-limit generation.
+        let Some(generation) = self
+            .superblock
+            .generation
+            .checked_add(1)
+            .filter(|&next| next <= MAX_GENERATION)
+        else {
+            self.load_tree()?;
+            return Err(Error::Corrupt);
+        };
         let encoded = directory.encode();
         let root = match self.allocate() {
             Ok(root) => root,
@@ -628,15 +661,18 @@ impl<'a, D: BlockDevice> Volume<'a, D> {
         self.device.write(root, &encoded)?;
         self.device.flush()?;
         let superblock = Superblock {
-            generation: self.superblock.generation + 1,
+            generation,
             root,
             root_crc: get_u32(&encoded, CRC_OFFSET),
             ..self.superblock
         };
-        let slot = superblock.generation % 2;
+        // Always the slot NOT holding the current generation (volumes
+        // formatted before generation 1 moved to slot 1 keep it in slot 0).
+        let slot = 1 - self.slot;
         self.device.write(slot, &superblock.encode())?;
         self.device.flush()?;
         self.superblock = superblock;
+        self.slot = slot;
         // The old tree's blocks become free only now that the switch is durable.
         self.load_tree()
     }

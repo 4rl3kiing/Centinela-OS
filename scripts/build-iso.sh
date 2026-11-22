@@ -4,6 +4,45 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Build profile: dev (default, signing optional), test (signing required, test
+# keys allowed) or production (signing and verification required, test keys
+# rejected). See docs/security/secure-boot-keys.md.
+PROFILE="${CENTINELA_PROFILE:-dev}"
+case "$PROFILE" in
+    dev|test|production) ;;
+    *) echo "Invalid CENTINELA_PROFILE '$PROFILE' (use dev, test or production)" >&2; exit 1 ;;
+esac
+SIGN=0
+[[ -n "${SB_SIGNING_KEY:-}" && -n "${SB_SIGNING_CERT:-}" ]] && SIGN=1
+if [[ "$PROFILE" != dev ]]; then
+    [[ "$SIGN" == 1 ]] || { echo "Profile '$PROFILE' requires SB_SIGNING_KEY and SB_SIGNING_CERT" >&2; exit 1; }
+    test -f "$SB_SIGNING_KEY" && test -f "$SB_SIGNING_CERT" || { echo "Secure Boot key or certificate file not found" >&2; exit 1; }
+    command -v sbsign >/dev/null || { echo "sbsign is required in profile '$PROFILE'" >&2; exit 1; }
+fi
+if [[ "$PROFILE" == production ]]; then
+    command -v sbverify >/dev/null || { echo "sbverify is required in profile production" >&2; exit 1; }
+    command -v openssl >/dev/null || { echo "openssl is required in profile production" >&2; exit 1; }
+    CERT_SUBJECT="$(openssl x509 -in "$SB_SIGNING_CERT" -noout -subject 2>/dev/null)" \
+        || { echo "Cannot read subject of $SB_SIGNING_CERT" >&2; exit 1; }
+    [[ -n "$CERT_SUBJECT" ]] || { echo "Empty certificate subject" >&2; exit 1; }
+    # scripts/secure-boot-keys.sh marks test certificates with this exact CN text.
+    if [[ "$CERT_SUBJECT" == *"Centinela-OS TEST "* || "$CERT_SUBJECT" == *"(not for production)"* ]]; then
+        echo "Refusing to sign a production image with a TEST certificate" >&2; exit 1
+    fi
+fi
+echo "Build profile: $PROFILE (Secure Boot signing: $([[ "$SIGN" == 1 ]] && echo yes || echo no))"
+
+# Signs an EFI binary in place and verifies it (sbverify is mandatory in production).
+sign_efi() {
+    sbsign --key "$SB_SIGNING_KEY" --cert "$SB_SIGNING_CERT" --output "$1.signed" "$1" >/dev/null
+    mv "$1.signed" "$1"
+    if command -v sbverify >/dev/null; then
+        sbverify --cert "$SB_SIGNING_CERT" "$1" >/dev/null || { echo "Signature verification failed: $1" >&2; exit 1; }
+    elif [[ "$PROFILE" == production ]]; then
+        echo "sbverify missing; cannot verify $1" >&2; exit 1
+    fi
+}
+
 LIMINE_VERSION="v12.9.6"
 LIMINE_ARCHIVE="limine-binary.tar.gz"
 LIMINE_URL="https://github.com/Limine-Bootloader/Limine/releases/download/$LIMINE_VERSION/$LIMINE_ARCHIVE"
@@ -59,9 +98,8 @@ INSTALLED_CONFIG="$ROOT/build/installed-limine.conf"
 INSTALLED_EFI="$ROOT/build/installed-BOOTX64.EFI"
 install -m 0644 "$LIMINE_DIR/BOOTX64.EFI" "$INSTALLED_EFI"
 "$LIMINE_DIR/limine" enroll-config --quiet "$INSTALLED_EFI" "$(b2sum "$INSTALLED_CONFIG" | cut -d' ' -f1)"
-if [[ -n "${SB_SIGNING_KEY:-}" && -n "${SB_SIGNING_CERT:-}" ]]; then
-    sbsign --key "$SB_SIGNING_KEY" --cert "$SB_SIGNING_CERT" --output "$INSTALLED_EFI.signed" "$INSTALLED_EFI" >/dev/null
-    mv "$INSTALLED_EFI.signed" "$INSTALLED_EFI"
+if [[ "$SIGN" == 1 ]]; then
+    sign_efi "$INSTALLED_EFI"
 fi
 PAYLOAD_ARGS=("EFI/BOOT/BOOTX64.EFI=$INSTALLED_EFI" "boot/limine/limine.conf=$INSTALLED_CONFIG" \
     "boot/centinela-kernel=$ISO_ROOT/boot/centinela-kernel")
@@ -98,12 +136,8 @@ install -m 0644 "$LIMINE_DIR/BOOTX64.EFI" "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI"
 # Optional UEFI Secure Boot signing (after enrollment, which edits the binary).
 # With Secure Boot active and a config hash enrolled, Limine panics on any
 # config change or unhashed file, completing the chain of trust.
-if [[ -n "${SB_SIGNING_KEY:-}" && -n "${SB_SIGNING_CERT:-}" ]]; then
-    command -v sbsign >/dev/null || { echo "sbsign is required for Secure Boot signing" >&2; exit 1; }
-    sbsign --key "$SB_SIGNING_KEY" --cert "$SB_SIGNING_CERT" \
-        --output "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI.signed" "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI" >/dev/null
-    mv "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI.signed" "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI"
-    sbverify --cert "$SB_SIGNING_CERT" "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI" >/dev/null
+if [[ "$SIGN" == 1 ]]; then
+    sign_efi "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI"
     echo "Signed BOOTX64.EFI for UEFI Secure Boot"
 fi
 
@@ -111,6 +145,11 @@ fi
 # enrolled executable must also replace the copy in that image.
 install -m 0644 "$LIMINE_DIR/limine-uefi-cd.bin" "$EFI_SYSTEM_IMAGE"
 mcopy -o -i "$EFI_SYSTEM_IMAGE" "$ISO_ROOT/EFI/BOOT/BOOTX64.EFI" ::/EFI/BOOT/BOOTX64.EFI
+if [[ "$PROFILE" == production ]]; then
+    mcopy -n -i "$EFI_SYSTEM_IMAGE" ::/EFI/BOOT/BOOTX64.EFI "$ROOT/build/verify-BOOTX64.EFI"
+    sbverify --cert "$SB_SIGNING_CERT" "$ROOT/build/verify-BOOTX64.EFI" >/dev/null || { echo "ESP image EFI is not signed" >&2; exit 1; }
+    rm -f "$ROOT/build/verify-BOOTX64.EFI"
+fi
 install -m 0644 "$EFI_SYSTEM_IMAGE" "$ISO_ROOT/boot/limine/limine-uefi-cd.bin"
 
 # Pass the EFI FAT image as an explicit on-disk source for the appended GPT

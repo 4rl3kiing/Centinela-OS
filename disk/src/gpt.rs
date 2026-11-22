@@ -219,29 +219,112 @@ pub fn write<D: SectorDevice>(
     device.write(sectors - 1, &header(sectors, disk_guid, false, array_crc))
 }
 
-/// Reads and validates the GPT (primary, falling back to the backup).
-/// Returns the non-empty partitions.
+/// Which GPT copies were usable when the table was read.
+///
+/// Policy: both headers are always read and validated on their own
+/// (signature, revision, CRCs, position, usable range, array placement,
+/// entries). Then:
+/// - both valid: they must agree on everything (cross-referenced my/alternate
+///   LBA, usable range, disk GUID, entry count/size, array CRC and the decoded
+///   partitions), otherwise the table is ambiguous and rejected
+///   ([`Error::Invalid`]); we never guess which copy is right;
+/// - one valid: its table is used and the result is marked degraded, so the
+///   caller can warn and the other copy can be rewritten;
+/// - none valid: error.
+///
+/// CRC32 detects accidental damage only; anyone who can write the disk can
+/// forge a consistent GPT, so this is robustness, not authentication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Health {
+    /// Both copies valid and identical.
+    Intact,
+    /// Primary valid; the backup is missing, unreadable or invalid.
+    BackupInvalid,
+    /// Backup valid; the primary is missing, unreadable or invalid.
+    PrimaryInvalid,
+    /// Primary valid but its alternate LBA lies before the last sector (the
+    /// disk grew, or an image was copied to a larger disk). The backup is
+    /// looked for at that alternate LBA, then at the last LBA; if found it
+    /// must agree with the primary, but it may also be missing. The backup
+    /// should be rewritten at the end of the disk. (An alternate LBA past the
+    /// end, i.e. a shrunk disk, invalidates the primary.)
+    Relocated,
+}
+
+/// Header fields that both copies must share.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct Header {
+    first: u64,
+    last: u64,
+    disk_guid: Guid,
+    count: u64,
+    array_crc: u32,
+}
+
+/// Reads and validates the GPT (see [`Health`] for the policy). Returns the
+/// non-empty partitions.
 pub fn read<D: SectorDevice>(
     device: &mut D,
     out: &mut [Partition; MAX_PARTITIONS],
 ) -> Result<usize, Error> {
-    let sectors = device.sectors();
-    let mut last_error = Error::NotFound;
-    for lba in [1, sectors.saturating_sub(1)] {
-        match read_at(device, lba, sectors, out) {
-            Ok(count) => return Ok(count),
-            Err(error) => last_error = error,
-        }
-    }
-    Err(last_error)
+    read_with_health(device, out).map(|(count, _)| count)
 }
 
+/// Like [`read`], also reporting whether a copy was unusable.
+pub fn read_with_health<D: SectorDevice>(
+    device: &mut D,
+    out: &mut [Partition; MAX_PARTITIONS],
+) -> Result<(usize, Health), Error> {
+    let last = device
+        .sectors()
+        .checked_sub(1)
+        .filter(|&lba| lba > 1)
+        .ok_or(Error::NotFound)?;
+    let mut backup = [Partition::default(); MAX_PARTITIONS];
+    let primary = read_at(device, true, last, out);
+    let alternate = primary
+        .as_ref()
+        .map_or(last, |&(_, _, alternate)| alternate);
+    let relocated = alternate < last;
+    let mut secondary = read_at(device, false, alternate, &mut backup);
+    if relocated && secondary.is_err() {
+        secondary = read_at(device, false, last, &mut backup);
+    }
+    match (primary, secondary) {
+        (Ok((p, n, _)), Ok((b, m, _))) => {
+            if p != b || n != m || out[..n] != backup[..m] {
+                return Err(Error::Invalid);
+            }
+            Ok((
+                n,
+                if relocated {
+                    Health::Relocated
+                } else {
+                    Health::Intact
+                },
+            ))
+        }
+        (Ok((_, n, _)), Err(_)) if relocated => Ok((n, Health::Relocated)),
+        (Ok((_, n, _)), Err(_)) => Ok((n, Health::BackupInvalid)),
+        (Err(_), Ok((_, m, _))) => {
+            *out = backup;
+            Ok((m, Health::PrimaryInvalid))
+        }
+        (Err(a), Err(b)) => Err(if a == Error::NotFound { b } else { a }),
+    }
+}
+
+/// Validates one header and its entry array on their own. The primary is at
+/// LBA 1 and its alternate LBA may be any LBA in `2..=backup_lba` (the last
+/// sector, or earlier on a grown disk); a backup must be at `backup_lba` and
+/// point back to LBA 1. Returns the backup LBA the header implies.
 fn read_at<D: SectorDevice>(
     device: &mut D,
-    lba: u64,
-    sectors: u64,
+    primary: bool,
+    backup_lba: u64,
     out: &mut [Partition; MAX_PARTITIONS],
-) -> Result<usize, Error> {
+) -> Result<(Header, usize, u64), Error> {
+    let lba = if primary { 1 } else { backup_lba };
     let mut h = [0u8; SECTOR];
     device.read(lba, &mut h)?;
     if &h[..8] != b"EFI PART" {
@@ -254,24 +337,60 @@ fn read_at<D: SectorDevice>(
     }
     let mut copy = h;
     put_u32(&mut copy, 16, 0);
-    if crc32(&copy[..size]) != stored || get_u64(&h, 24) != lba {
+    if crc32(&copy[..size]) != stored
+        || get_u32(&h, 8) != 0x0001_0000
+        || get_u32(&h, 20) != 0
+        || get_u64(&h, 24) != lba
+    {
         return Err(Error::Invalid);
     }
+    let alternate = get_u64(&h, 32);
+    let backup_lba = if primary {
+        if !(2..=backup_lba).contains(&alternate) {
+            return Err(Error::Invalid);
+        }
+        alternate
+    } else if alternate != 1 {
+        return Err(Error::Invalid);
+    } else {
+        backup_lba
+    };
     let first = get_u64(&h, 40);
     let last = get_u64(&h, 48);
     let array = get_u64(&h, 72);
     let count = u64::from(get_u32(&h, 80));
     let entry_size = get_u32(&h, 84) as usize;
-    if entry_size != ENTRY_SIZE || count == 0 || count > 1024 || last >= sectors || first > last {
+    if entry_size != ENTRY_SIZE || count == 0 || count > 1024 {
         return Err(Error::Invalid);
     }
     let array_sectors = (count * ENTRY_SIZE as u64).div_ceil(SECTOR as u64);
-    if array
-        .checked_add(array_sectors)
-        .is_none_or(|end| end > sectors)
-    {
+    // The usable range must exclude every GPT structure: MBR (0), primary
+    // header (1) and array (right after it), backup array (right before the
+    // backup header) and backup header (last LBA). Both arrays have the same
+    // size, so this holds even when only one copy can be read.
+    let max_last = backup_lba.checked_sub(array_sectors + 1);
+    if first < 2 + array_sectors || max_last.is_none_or(|max| last > max) || first > last {
         return Err(Error::Invalid);
     }
+    // This copy's array must sit between its header and the usable range.
+    let end = array.checked_add(array_sectors).ok_or(Error::Invalid)?;
+    let placed = if primary {
+        array >= 2 && end <= first
+    } else {
+        array > last && end <= backup_lba
+    };
+    if !placed {
+        return Err(Error::Invalid);
+    }
+    let mut disk_guid = [0u8; 16];
+    disk_guid.copy_from_slice(&h[56..72]);
+    let header = Header {
+        first,
+        last,
+        disk_guid,
+        count,
+        array_crc: get_u32(&h, 88),
+    };
     let mut crc = Crc::new();
     let mut found = 0;
     let mut sector = [0u8; SECTOR];
@@ -308,7 +427,7 @@ fn read_at<D: SectorDevice>(
             found += 1;
         }
     }
-    if crc.finish() != get_u32(&h, 88) {
+    if crc.finish() != header.array_crc {
         return Err(Error::Invalid);
     }
     for i in 0..found {
@@ -318,7 +437,7 @@ fn read_at<D: SectorDevice>(
             }
         }
     }
-    Ok(found)
+    Ok((header, found, backup_lba))
 }
 
 /// Encodes an ASCII name for a partition entry.
@@ -385,5 +504,274 @@ mod tests {
         // A blank disk has no GPT.
         let mut blank = Ram::new(1024);
         assert_eq!(read(&mut blank, &mut out), Err(Error::NotFound));
+    }
+
+    const DISK: u64 = 16384;
+    const BACKUP: u64 = DISK - 1;
+    const BACKUP_ARRAY: u64 = DISK - 1 - ENTRY_SECTORS;
+
+    fn fresh() -> Ram {
+        let mut disk = Ram::new(DISK as usize);
+        write(&mut disk, &[9; 16], &layout(DISK)).unwrap();
+        disk
+    }
+
+    /// Edits a header in place and re-seals its CRC (a forged but
+    /// checksum-valid header).
+    fn patch(disk: &mut Ram, lba: u64, edit: impl FnOnce(&mut Sector)) {
+        let at = lba as usize * SECTOR;
+        let mut h = [0u8; SECTOR];
+        h.copy_from_slice(&disk.0[at..at + SECTOR]);
+        edit(&mut h);
+        put_u32(&mut h, 16, 0);
+        let crc = crc32(&h[..92]);
+        put_u32(&mut h, 16, crc);
+        disk.0[at..at + SECTOR].copy_from_slice(&h);
+    }
+
+    fn patch_both(disk: &mut Ram, edit: impl Fn(&mut Sector)) {
+        patch(disk, 1, &edit);
+        patch(disk, BACKUP, &edit);
+    }
+
+    /// Edits entry `index` in one array and re-seals that header's array CRC.
+    fn patch_entry(
+        disk: &mut Ram,
+        header: u64,
+        array: u64,
+        index: usize,
+        edit: impl Fn(&mut [u8]),
+    ) {
+        let base = array as usize * SECTOR;
+        let at = base + index * ENTRY_SIZE;
+        edit(&mut disk.0[at..at + ENTRY_SIZE]);
+        let crc = crc32(&disk.0[base..base + ENTRY_SECTORS as usize * SECTOR]);
+        patch(disk, header, |h| put_u32(h, 88, crc));
+    }
+
+    fn health(disk: &mut Ram) -> Result<(usize, Health), Error> {
+        let mut out = [Partition::default(); MAX_PARTITIONS];
+        read_with_health(disk, &mut out)
+    }
+
+    #[test]
+    fn degraded_policy_is_explicit() {
+        assert_eq!(health(&mut fresh()), Ok((2, Health::Intact)));
+        // Unreadable / damaged backup: primary accepted, marked degraded.
+        let mut disk = fresh();
+        disk.0[BACKUP as usize * SECTOR + 20] ^= 0xff;
+        assert_eq!(health(&mut disk), Ok((2, Health::BackupInvalid)));
+        // Truncated image: the backup is gone and the primary's alternate LBA
+        // no longer names the last sector, so neither copy is trusted.
+        let mut disk = fresh();
+        disk.0.truncate((DISK as usize - 1) * SECTOR);
+        assert_eq!(health(&mut disk), Err(Error::Invalid));
+        // Damaged primary: backup used, marked degraded, partitions intact.
+        let mut disk = fresh();
+        disk.0[2 * SECTOR + 40] ^= 1;
+        let mut out = [Partition::default(); MAX_PARTITIONS];
+        assert_eq!(
+            read_with_health(&mut disk, &mut out),
+            Ok((2, Health::PrimaryInvalid))
+        );
+        assert_eq!(out[..2], layout(DISK));
+    }
+
+    #[test]
+    fn copies_must_agree() {
+        // Each field differs only in the (checksum-valid) backup.
+        let edits: [&dyn Fn(&mut Sector); 3] = [
+            &|h| h[56] ^= 1, // disk GUID
+            &|h| {
+                let first = get_u64(h, 40);
+                put_u64(h, 40, first + 1); // first usable
+            },
+            &|h| {
+                let last = get_u64(h, 48);
+                put_u64(h, 48, last - 1); // last usable
+            },
+        ];
+        for edit in edits {
+            let mut disk = fresh();
+            // Leave room at the end so a smaller last usable LBA is valid.
+            for (header, array) in [(1, 2), (BACKUP, BACKUP_ARRAY)] {
+                patch_entry(&mut disk, header, array, 1, |e| put_u64(e, 40, 8000));
+            }
+            assert_eq!(health(&mut disk), Ok((2, Health::Intact)));
+            patch(&mut disk, BACKUP, edit);
+            assert_eq!(health(&mut disk), Err(Error::Invalid));
+        }
+        // Same header fields but a different (re-sealed) backup table.
+        let mut disk = fresh();
+        patch_entry(&mut disk, BACKUP, BACKUP_ARRAY, 0, |e| put_u64(e, 40, 3000));
+        assert_eq!(health(&mut disk), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn headers_must_sit_at_their_positions() {
+        // Wrong my_lba or alternate_lba in one copy: that copy is unusable.
+        for (offset, value) in [
+            (24, 2),
+            (24, u64::MAX),
+            (32, 1),
+            (32, BACKUP - 1),
+            (32, u64::MAX),
+        ] {
+            let mut disk = fresh();
+            patch(&mut disk, 1, |h| put_u64(h, offset, value));
+            assert_eq!(
+                health(&mut disk),
+                Ok((2, Health::PrimaryInvalid)),
+                "{offset}={value}"
+            );
+        }
+        // Primary and backup swapped (each claims the other's position).
+        let mut disk = fresh();
+        patch(&mut disk, 1, |h| {
+            put_u64(h, 24, BACKUP);
+            put_u64(h, 32, 1);
+        });
+        patch(&mut disk, BACKUP, |h| {
+            put_u64(h, 24, 1);
+            put_u64(h, 32, BACKUP);
+        });
+        assert_eq!(health(&mut disk), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn gpt_structures_must_stay_out_of_the_usable_range() {
+        let backup_array_end = BACKUP - 1;
+        let cases: [(usize, u64); 9] = [
+            (40, 0), // first usable over the MBR
+            (40, 1), // ... over the primary header
+            (40, 2), // ... over the primary array
+            (40, 2 + ENTRY_SECTORS - 1),
+            (48, BACKUP),           // last usable over the backup header
+            (48, backup_array_end), // ... over the backup array
+            (48, BACKUP_ARRAY),
+            (48, u64::MAX),
+            (40, u64::MAX),
+        ];
+        for (offset, value) in cases {
+            let mut disk = fresh();
+            patch_both(&mut disk, |h| put_u64(h, offset, value));
+            assert_eq!(health(&mut disk), Err(Error::Invalid), "{offset}={value}");
+        }
+        // Arrays relocated inside the usable range (content and CRC intact,
+        // so only the placement check can catch it).
+        let mut disk = fresh();
+        let array = disk.0[2 * SECTOR..(2 + ENTRY_SECTORS as usize) * SECTOR].to_vec();
+        disk.0[100 * SECTOR..100 * SECTOR + array.len()].copy_from_slice(&array);
+        patch_both(&mut disk, |h| put_u64(h, 72, 100));
+        assert_eq!(health(&mut disk), Err(Error::Invalid));
+        // Arrays overlapping their own header or past the end.
+        for array in [
+            0,
+            1,
+            BACKUP - ENTRY_SECTORS + 1,
+            BACKUP,
+            u64::MAX,
+            u64::MAX - 31,
+        ] {
+            let mut disk = fresh();
+            patch_both(&mut disk, |h| put_u64(h, 72, array));
+            assert_eq!(health(&mut disk), Err(Error::Invalid), "array {array}");
+        }
+    }
+
+    #[test]
+    fn partitions_must_lie_inside_the_usable_range() {
+        let (first, last) = usable_range(DISK).unwrap();
+        let ranges = [
+            (first - 1, 4095),
+            (1, 1),
+            (BACKUP, BACKUP),
+            (4096, last + 1),
+            (4096, u64::MAX),
+            (u64::MAX, u64::MAX),
+            (5000, 4096),
+        ];
+        for (start, end) in ranges {
+            let mut disk = fresh();
+            for (header, array) in [(1, 2), (BACKUP, BACKUP_ARRAY)] {
+                patch_entry(&mut disk, header, array, 1, |e| {
+                    put_u64(e, 32, start);
+                    put_u64(e, 40, end);
+                });
+            }
+            assert_eq!(health(&mut disk), Err(Error::Invalid), "{start}..={end}");
+        }
+    }
+
+    /// The image of `fresh()` copied to a disk `extra` sectors larger.
+    fn grown(extra: usize) -> Ram {
+        let mut disk = fresh();
+        disk.0.resize((DISK as usize + extra) * SECTOR, 0);
+        disk
+    }
+
+    #[test]
+    fn grown_disk_is_accepted_as_relocated() {
+        // Backup still at its old position (BACKUP), now before the end.
+        let mut disk = grown(1000);
+        let mut out = [Partition::default(); MAX_PARTITIONS];
+        assert_eq!(
+            read_with_health(&mut disk, &mut out),
+            Ok((2, Health::Relocated))
+        );
+        assert_eq!(out[..2], layout(DISK));
+        // The old backup is there but disagrees: ambiguous, rejected.
+        let mut disk = grown(1000);
+        patch(&mut disk, BACKUP, |h| h[56] ^= 1);
+        assert_eq!(health(&mut disk), Err(Error::Invalid));
+        // No backup anywhere (old copy wiped): primary alone, relocated.
+        let mut disk = grown(1000);
+        disk.0[BACKUP as usize * SECTOR..(BACKUP as usize + 1) * SECTOR].fill(0);
+        assert_eq!(health(&mut disk), Ok((2, Health::Relocated)));
+        // Backup moved to the new last LBA (array just before it).
+        let mut disk = grown(1000);
+        let new_backup = DISK + 999;
+        let from = BACKUP_ARRAY as usize * SECTOR;
+        let to = (new_backup - ENTRY_SECTORS) as usize * SECTOR;
+        let len = (ENTRY_SECTORS as usize + 1) * SECTOR;
+        let moved = disk.0[from..from + len].to_vec();
+        disk.0[from..from + len].fill(0);
+        disk.0[to..to + len].copy_from_slice(&moved);
+        patch(&mut disk, new_backup, |h| {
+            put_u64(h, 24, new_backup);
+            put_u64(h, 72, new_backup - ENTRY_SECTORS);
+        });
+        assert_eq!(health(&mut disk), Ok((2, Health::Relocated)));
+        // A damaged primary on a grown disk: the backup is no longer at the
+        // last LBA, so nothing trustworthy is found.
+        let mut disk = grown(1000);
+        disk.0[SECTOR + 20] ^= 0xff;
+        assert!(health(&mut disk).is_err());
+    }
+
+    #[test]
+    fn extreme_header_values_never_panic() {
+        let edits: [(usize, u32); 8] = [
+            (12, 0), // header size
+            (12, u32::MAX),
+            (8, 0x0002_0000), // revision
+            (20, 1),          // reserved
+            (80, 0),          // entry count
+            (80, u32::MAX),
+            (84, 0), // entry size
+            (84, u32::MAX),
+        ];
+        for (offset, value) in edits {
+            let mut disk = fresh();
+            patch_both(&mut disk, |h| put_u32(h, offset, value));
+            assert!(health(&mut disk).is_err(), "{offset}={value}");
+        }
+        // Disks too small to hold a GPT, blank or not.
+        for sectors in [0, 1, 2, 3, 34, 67, 68] {
+            let mut disk = Ram::new(sectors);
+            assert!(health(&mut disk).is_err(), "{sectors} sectors");
+            disk.0.fill(0xff);
+            assert!(health(&mut disk).is_err(), "{sectors} sectors");
+        }
     }
 }

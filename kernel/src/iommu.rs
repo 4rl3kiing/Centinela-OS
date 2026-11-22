@@ -15,15 +15,28 @@
 //! through the queued-invalidation interface, which interrupt remapping
 //! requires.
 //!
-//! Policy: a machine without a DMAR table boots with a warning (no IOMMU to
-//! program). A DMAR table that is malformed, or a unit that refuses to
-//! enable translation, fails the boot (fail closed).
+//! Policy: a machine without a DMAR or IVRS table boots, but fail closed:
+//! no domain can be created, so no driver is ever granted DMA and Bus Master
+//! stays cleared on every PCI function (see `pci`). A DMAR table that is
+//! malformed, or a unit that refuses to enable translation, fails the boot.
+//!
+//! Teardown: a device is detached by clearing its Bus Master bit, blocking
+//! it in the IOMMU tables and invalidating the caches. Tables and DMA frames
+//! are released only after every unit confirmed the invalidation (VT-d wait
+//! descriptor, AMD-Vi COMPLETION_WAIT, both bounded). If that fails they are
+//! quarantined: left allocated forever, never reused.
+//!
+//! SMP: each unit's invalidation interface (queue, tail, wait word and the
+//! register-based fallback) is used under that unit's lock; the tables
+//! shared by every device (root, context, AMD-Vi device table and domain
+//! slots) change only under the topology lock.
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use centinela_hal::serial::{SerialWriter, write as serial_write};
 use centinela_kernel::acpi::{self, AcpiError, DrhdUnit, PhysicalReader};
+use centinela_kernel::dma::{self, CommandRing, RING_ENTRIES, RingState, SpinLock};
 use centinela_kernel::memory::hhdm_backend::HhdmFrameMemory;
 use centinela_kernel::memory::vmm::{
     PageMapping, PageTableMapper, PageTableMutationMemory, PhysAddr,
@@ -41,6 +54,7 @@ const REG_CCMD: usize = 0x28;
 const REG_CAP: usize = 0x08;
 const REG_FSTS: usize = 0x34;
 const GCMD_WBF: u32 = 1 << 27;
+const REG_IQH: usize = 0x80;
 const REG_IQT: usize = 0x88;
 const REG_IQA: usize = 0x90;
 const REG_IRTA: usize = 0xb8;
@@ -51,17 +65,21 @@ const GSTS_CFIS: u32 = 1 << 23;
 const FSTS_IQE: u32 = 1 << 4;
 const ECAP_QI: u64 = 1 << 1;
 const ECAP_IR: u64 = 1 << 3;
-/// Invalidation queue: one 4 KiB page of 128-bit descriptors.
-const QUEUE_ENTRIES: u64 = 256;
 /// Interrupt remapping table: one 4 KiB page of 128-bit entries.
 pub(crate) const IRT_ENTRIES: u16 = 256;
 
 /// Per-unit invalidation queue (physical address; 0 = register-based).
 static QUEUES: [AtomicU64; MAX_UNITS] = [const { AtomicU64::new(0) }; MAX_UNITS];
-static QUEUE_TAILS: [AtomicU64; MAX_UNITS] = [const { AtomicU64::new(0) }; MAX_UNITS];
+/// Per-unit lock over the invalidation interface: queue tail and wait token
+/// (inside), plus the queue page, the unit's wait word and the registers
+/// used to invalidate, all of which are shared by every CPU.
+static UNITS: [SpinLock<RingState>; MAX_UNITS] =
+    [const { SpinLock::new(RingState::new()) }; MAX_UNITS];
+/// Serialises changes to the tables every device shares (attach, detach).
+/// Lock order: `TOPOLOGY`, then one unit lock at a time.
+static TOPOLOGY: SpinLock<()> = SpinLock::new(());
 /// Frame holding one wait-descriptor status word per unit.
 static WAIT_STATUS: AtomicU64 = AtomicU64::new(0);
-static WAIT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// Interrupt remapping table (physical; 0 = remapping off).
 static IRT: AtomicU64 = AtomicU64::new(0);
 
@@ -180,63 +198,106 @@ fn hhdm_pointer(physical: u64) -> *mut u64 {
     (HHDM.load(Ordering::Relaxed) + physical) as *mut u64
 }
 
-/// Queues `descriptors` plus a wait descriptor on `unit` and spins (bounded)
-/// until the hardware has processed them all.
-fn submit(unit: usize, registers: &Registers, descriptors: &[[u64; 2]]) -> bool {
-    let queue = QUEUES[unit].load(Ordering::Relaxed);
-    let status = WAIT_STATUS.load(Ordering::Relaxed);
-    if queue == 0 || status == 0 || descriptors.len() as u64 >= QUEUE_ENTRIES - 1 {
-        return false;
+/// One unit's invalidation queue, as the hardware sees it. Used only while
+/// the unit's `UNITS` lock is held.
+struct UnitQueue<'a> {
+    unit: usize,
+    registers: &'a Registers,
+}
+
+impl UnitQueue<'_> {
+    fn status_address(&self) -> u64 {
+        WAIT_STATUS.load(Ordering::Relaxed) + self.unit as u64 * 8
     }
-    let sequence = WAIT_SEQUENCE.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff;
-    let status_address = status + unit as u64 * 8;
-    // SAFETY: Kernel-owned status frame, HHDM-mapped.
-    unsafe { hhdm_pointer(status_address).write_volatile(0) };
-    let wait = [5 | 1 << 5 | sequence << 32, status_address];
-    let mut tail = QUEUE_TAILS[unit].load(Ordering::Relaxed);
-    for descriptor in descriptors.iter().chain(core::iter::once(&wait)) {
-        let slot = hhdm_pointer(queue + tail * 16);
-        // SAFETY: `tail` < QUEUE_ENTRIES, so the slot is inside the queue
-        // page the kernel owns; the hardware only reads up to IQT.
+}
+
+impl CommandRing for UnitQueue<'_> {
+    fn head(&mut self) -> u64 {
+        (self.registers.read64(REG_IQH) >> 4) & (RING_ENTRIES - 1)
+    }
+
+    fn store(&mut self, index: u64, entry: [u64; 2]) {
+        let queue = QUEUES[self.unit].load(Ordering::Relaxed);
+        let slot = hhdm_pointer(queue + (index % RING_ENTRIES) * 16);
+        // SAFETY: The slot is inside the queue page the kernel owns; the
+        // hardware only reads up to IQT.
         unsafe {
-            slot.write_volatile(descriptor[0]);
-            slot.add(1).write_volatile(descriptor[1]);
+            slot.write_volatile(entry[0]);
+            slot.add(1).write_volatile(entry[1]);
             core::arch::x86_64::_mm_clflush(slot as *const u8);
         }
-        tail = (tail + 1) % QUEUE_ENTRIES;
     }
-    // SAFETY: Orders the descriptor stores before the tail doorbell.
-    unsafe { core::arch::x86_64::_mm_sfence() };
-    QUEUE_TAILS[unit].store(tail, Ordering::Relaxed);
-    registers.write64(REG_IQT, tail << 4);
-    (0..POLL_LIMIT).any(|_| {
-        // SAFETY: As above.
-        let done =
-            unsafe { hhdm_pointer(status_address).read_volatile() } & 0xffff_ffff == sequence;
-        if !done {
-            core::hint::spin_loop();
+
+    fn publish(&mut self, tail: u64) {
+        // SAFETY: Orders the descriptor stores (and their cache-line
+        // flushes) before the tail doorbell.
+        unsafe { core::arch::x86_64::_mm_sfence() };
+        self.registers.write64(REG_IQT, tail << 4);
+    }
+
+    fn wait_command(&mut self, token: u32) -> [u64; 2] {
+        let address = self.status_address();
+        // SAFETY: Kernel-owned status frame, HHDM-mapped; one word per unit.
+        unsafe { hhdm_pointer(address).write_volatile(0) };
+        dma::vtd::wait(token, address)
+    }
+
+    fn completion(&mut self) -> u32 {
+        // SAFETY: As in `wait_command`.
+        unsafe { hhdm_pointer(self.status_address()).read_volatile() as u32 }
+    }
+
+    fn faulted(&mut self) -> bool {
+        self.registers.read32(REG_FSTS) & FSTS_IQE != 0
+    }
+}
+
+/// Queues `descriptors` plus a wait descriptor on `unit` and spins (bounded)
+/// until the hardware has processed them all. `state` comes from the unit's
+/// lock, which the caller holds.
+fn submit(
+    unit: usize,
+    registers: &Registers,
+    state: &mut RingState,
+    descriptors: &[[u64; 2]],
+) -> bool {
+    if QUEUES[unit].load(Ordering::Relaxed) == 0 || WAIT_STATUS.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let mut queue = UnitQueue { unit, registers };
+    match dma::submit(&mut queue, state, descriptors, POLL_LIMIT) {
+        Ok(()) => true,
+        Err(error) => {
+            let _ = write!(
+                SerialWriter,
+                "Centinela-OS: IOMMU unit {unit} did not confirm an invalidation: {error:?}.\r\n"
+            );
+            false
         }
-        done && registers.read32(REG_FSTS) & FSTS_IQE == 0
-    })
+    }
 }
 
 /// Global context-cache and IOTLB invalidation (and interrupt entry cache
 /// when remapping is on) through the queue, or the registers before the
-/// queue is enabled.
+/// queue is enabled. True only if the unit confirmed it. Runs under the
+/// unit's lock: the queue, the wait word and the invalidation registers are
+/// shared by every CPU.
 fn invalidate_unit(unit: usize, registers: &Registers) -> bool {
-    if QUEUES[unit].load(Ordering::Relaxed) == 0 {
-        return invalidate_all(registers);
-    }
-    flush_write_buffer(registers);
-    // Context cache (type 1) and IOTLB (type 2), global granularity, with
-    // drain-reads/drain-writes for the IOTLB; IEC (type 4), global.
-    let descriptors = [[1 | 1 << 4, 0], [2 | 1 << 4 | 1 << 6 | 1 << 7, 0], [4, 0]];
-    let count = if IRT.load(Ordering::Relaxed) != 0 {
-        3
-    } else {
-        2
-    };
-    submit(unit, registers, &descriptors[..count])
+    UNITS[unit].with(|state| {
+        if QUEUES[unit].load(Ordering::Relaxed) == 0 {
+            return invalidate_all(registers);
+        }
+        flush_write_buffer(registers);
+        // Context cache (type 1) and IOTLB (type 2), global granularity,
+        // with drain-reads/drain-writes for the IOTLB; IEC (type 4), global.
+        let descriptors = [[1 | 1 << 4, 0], [2 | 1 << 4 | 1 << 6 | 1 << 7, 0], [4, 0]];
+        let count = if IRT.load(Ordering::Relaxed) != 0 {
+            3
+        } else {
+            2
+        };
+        submit(unit, registers, state, &descriptors[..count])
+    })
 }
 
 fn enable_unit(
@@ -268,7 +329,7 @@ fn enable_unit(
         registers.write64(REG_IQT, 0);
         // 128-bit descriptors, queue size 2^0 pages.
         registers.write64(REG_IQA, queue.get());
-        QUEUE_TAILS[unit].store(0, Ordering::Relaxed);
+        UNITS[unit].with(RingState::reset);
         registers.command(GCMD_QIE);
         if !registers.wait32(REG_GSTS, GCMD_QIE, true) {
             return Err("queued invalidation not enabled");
@@ -282,7 +343,7 @@ fn enable_unit(
         if !registers.wait32(REG_GSTS, GCMD_SIRTP, true) {
             return Err("interrupt remapping table pointer not latched");
         }
-        if !submit(unit, registers, &[[4, 0]]) {
+        if !UNITS[unit].with(|state| submit(unit, registers, state, &[[4, 0]])) {
             return Err("interrupt entry cache invalidation failed");
         }
         registers.command(GCMD_IRE);
@@ -300,6 +361,14 @@ fn enable_unit(
     Ok(())
 }
 
+const NO_IOMMU_POLICY: &str = "IOMMU: fail-closed DMA policy: without remapping no driver is granted DMA; Bus Master stays cleared on every PCI function.\r\n";
+
+/// True if a DMA-remapping unit (VT-d or AMD-Vi) is translating. Without
+/// one no domain can exist and no device may master the bus.
+pub(crate) fn available() -> bool {
+    UNIT_COUNT.load(Ordering::Relaxed) != 0 || crate::amdvi::active()
+}
+
 /// Discovers and enables every DMA-remapping unit. Returns `false` to fail
 /// the boot.
 pub(crate) fn init<R: PhysicalReader>(
@@ -312,6 +381,7 @@ pub(crate) fn init<R: PhysicalReader>(
     let mut writer = SerialWriter;
     let Some((reader, rsdp)) = reader else {
         serial_write("IOMMU: no ACPI tables; DMA is not remapped on this machine.\r\n");
+        serial_write(NO_IOMMU_POLICY);
         return true;
     };
     let table = match acpi::find_table(reader, rsdp, b"DMAR") {
@@ -324,6 +394,7 @@ pub(crate) fn init<R: PhysicalReader>(
                     serial_write(
                         "IOMMU: no DMAR or IVRS table; DMA is not remapped on this machine.\r\n",
                     );
+                    serial_write(NO_IOMMU_POLICY);
                     true
                 }
             };
@@ -482,9 +553,16 @@ fn read_entry(memory: &HhdmFrameMemory<'_, '_>, table: PhysAddr, index: u64) -> 
     PageTableMutationMemory::read_entry(memory, table, index as u16).unwrap_or(0)
 }
 
+/// Global invalidation on every unit; true only if all of them confirmed
+/// it. Every unit is tried even after one fails.
 fn invalidate() -> bool {
-    (0..UNIT_COUNT.load(Ordering::Relaxed))
-        .all(|unit| invalidate_unit(unit, &Registers(UNIT_WINDOWS[unit].load(Ordering::Relaxed))))
+    let mut confirmed = true;
+    let count = UNIT_COUNT.load(Ordering::Relaxed);
+    for (unit, window) in UNIT_WINDOWS.iter().enumerate().take(count) {
+        let registers = Registers(window.load(Ordering::Relaxed));
+        confirmed &= invalidate_unit(unit, &registers);
+    }
+    confirmed
 }
 
 /// True once interrupt remapping is active on every unit.
@@ -525,14 +603,24 @@ pub(crate) fn program_interrupt(
     invalidate()
 }
 
-/// Present context-table frame for `bus`, created on demand.
-fn context_table(memory: &mut HhdmFrameMemory<'_, '_>, bus: u8) -> Option<PhysAddr> {
+/// Present context-table frame for `bus`, if the root table has one.
+fn present_context_table(memory: &HhdmFrameMemory<'_, '_>, bus: u8) -> Option<PhysAddr> {
     let root = PhysAddr::new(ROOT_TABLE.load(Ordering::Relaxed)).ok()?;
     // Root entries are 128-bit; the low word holds the context-table pointer.
     let low = read_entry(memory, root, u64::from(bus) * 2);
     if low & 1 != 0 {
-        return PhysAddr::new(low & ADDRESS_MASK).ok();
+        PhysAddr::new(low & ADDRESS_MASK).ok()
+    } else {
+        None
     }
+}
+
+/// Present context-table frame for `bus`, created on demand.
+fn context_table(memory: &mut HhdmFrameMemory<'_, '_>, bus: u8) -> Option<PhysAddr> {
+    if let Some(table) = present_context_table(memory, bus) {
+        return Some(table);
+    }
+    let root = PhysAddr::new(ROOT_TABLE.load(Ordering::Relaxed)).ok()?;
     let table = memory.allocate_zeroed_table_frame().ok()?;
     write_entry(memory, root, u64::from(bus) * 2, table.get() | 1).then_some(table)
 }
@@ -545,29 +633,40 @@ pub(crate) fn attach(
     domain: u16,
 ) -> Option<PhysAddr> {
     HHDM.store(hhdm, Ordering::Relaxed);
-    if crate::amdvi::active() {
-        return if domain == 0 {
-            None
-        } else {
-            crate::amdvi::attach(memory, device, domain)
-        };
-    }
-    let levels = LEVELS.load(Ordering::Relaxed) as u64;
-    if UNIT_COUNT.load(Ordering::Relaxed) == 0 || levels == 0 || domain == 0 {
-        return None;
-    }
-    let context = context_table(memory, device.bus)?;
-    let index = u64::from(device.devfn) * 2;
-    if read_entry(memory, context, index) & 1 != 0 {
-        return None; // already attached: one domain per device
-    }
-    let root = memory.allocate_zeroed_table_frame().ok()?;
-    // High word: address width (1 = 3-level, 2 = 4-level) and domain id.
-    let high = (levels - 2) | u64::from(domain) << 8;
-    let ok = write_entry(memory, context, index + 1, high)
-        && write_entry(memory, context, index, root.get() | 1)
-        && invalidate();
-    ok.then_some(root)
+    TOPOLOGY.with(|_| {
+        if crate::amdvi::active() {
+            return if domain == 0 {
+                None
+            } else {
+                crate::amdvi::attach(memory, device, domain)
+            };
+        }
+        let levels = LEVELS.load(Ordering::Relaxed) as u64;
+        if UNIT_COUNT.load(Ordering::Relaxed) == 0 || levels == 0 || domain == 0 {
+            return None;
+        }
+        let context = context_table(memory, device.bus)?;
+        let index = u64::from(device.devfn) * 2;
+        if read_entry(memory, context, index) & 1 != 0 {
+            return None; // already attached: one domain per device
+        }
+        let root = memory.allocate_zeroed_table_frame().ok()?;
+        // High word: address width (1 = 3-level, 2 = 4-level) and domain id.
+        let high = (levels - 2) | u64::from(domain) << 8;
+        let ok = write_entry(memory, context, index + 1, high)
+            && write_entry(memory, context, index, root.get() | 1)
+            && invalidate();
+        if !ok {
+            // Not confirmed: the device goes back to a non-present entry. A
+            // unit may have cached the new root, so that frame is quarantined
+            // (left allocated) instead of being freed for reuse.
+            write_entry(memory, context, index, 0);
+            write_entry(memory, context, index + 1, 0);
+            let _ = invalidate();
+            return None;
+        }
+        Some(root)
+    })
 }
 
 /// Maps one 4 KiB page at `iova` → `physical` (read/write) in a domain.
@@ -609,6 +708,30 @@ pub(crate) fn map(
     ) && invalidate()
 }
 
+/// Removes the 4 KiB mapping at `iova`, if any. Returns true only when the
+/// invalidation was confirmed: only then may the frame behind it be freed
+/// or reused (otherwise the caller quarantines it).
+pub(crate) fn unmap(
+    memory: &mut HhdmFrameMemory<'_, '_>,
+    domain_root: PhysAddr,
+    iova: u64,
+) -> bool {
+    if crate::amdvi::active() {
+        return crate::amdvi::unmap(memory, domain_root, iova);
+    }
+    let levels = LEVELS.load(Ordering::Relaxed) as u64;
+    let mut table = domain_root;
+    for level in (1..levels).rev() {
+        let entry = read_entry(memory, table, (iova >> (12 + 9 * level)) & 0x1ff);
+        match PhysAddr::new(entry & ADDRESS_MASK) {
+            Ok(next) if entry & ENTRY_READ != 0 => table = next,
+            // No table on the path: nothing was ever mapped here.
+            _ => return invalidate(),
+        }
+    }
+    write_entry(memory, table, (iova >> 12) & 0x1ff, 0) && invalidate()
+}
+
 fn free_tables(memory: &mut HhdmFrameMemory<'_, '_>, table: PhysAddr, level: u64) {
     if level > 1 {
         for index in 0..512 {
@@ -625,52 +748,89 @@ fn free_tables(memory: &mut HhdmFrameMemory<'_, '_>, table: PhysAddr, level: u64
     let _ = memory.release_table_frame(table);
 }
 
+/// Outcome of `detach`.
+pub(crate) struct Detached {
+    /// DMA faults found pending (proof that confinement held).
+    pub(crate) faults: u64,
+    /// True only if every unit confirmed that it no longer holds any
+    /// translation of the domain. When false, the domain's tables were
+    /// quarantined and the caller must do the same with its DMA frames.
+    pub(crate) isolated: bool,
+}
+
 /// Removes the device's domain: afterwards every DMA it issues is blocked
-/// and faulted. Must run before the driver's DMA frames are freed.
+/// and faulted. Must run before the driver's DMA frames are freed, and they
+/// may be freed only if the result says `isolated`.
+///
+/// Order: Bus Master off, block the device in the tables, invalidate and
+/// wait for every unit to confirm, and only then release the tables.
 pub(crate) fn detach(
     memory: &mut HhdmFrameMemory<'_, '_>,
     device: crate::pci::Device,
     root: Option<PhysAddr>,
-) -> u64 {
-    if crate::amdvi::active() {
-        let faults = crate::amdvi::detach(memory, device, root);
-        FAULTS_SEEN.fetch_add(faults, Ordering::Relaxed);
-        return faults;
-    }
-    let Some(context) = context_table(memory, device.bus) else {
-        return 0;
-    };
-    let index = u64::from(device.devfn) * 2;
-    let low = read_entry(memory, context, index);
-    write_entry(memory, context, index, 0);
-    write_entry(memory, context, index + 1, 0);
-    // Release the bus's context table once no device uses it any more.
-    if (0..512).all(|entry| read_entry(memory, context, entry) == 0)
-        && let Ok(root) = PhysAddr::new(ROOT_TABLE.load(Ordering::Relaxed))
-    {
-        write_entry(memory, root, u64::from(device.bus) * 2, 0);
-        let _ = invalidate();
-        let _ = memory.release_table_frame(context);
-    } else {
-        let _ = invalidate();
-    }
-    if low & 1 != 0
-        && let Ok(root) = PhysAddr::new(low & ADDRESS_MASK)
-    {
-        free_tables(memory, root, LEVELS.load(Ordering::Relaxed) as u64);
-    }
-    // Primary pending fault (PPF) or overflow: count and clear (RW1C).
-    let mut faults = 0;
-    for window in UNIT_WINDOWS.iter().take(UNIT_COUNT.load(Ordering::Relaxed)) {
-        let registers = Registers(window.load(Ordering::Relaxed));
-        let status = registers.read32(REG_FSTS);
-        if status & 0b11 != 0 {
-            faults += 1;
-            registers.write32(REG_FSTS, status);
+) -> Detached {
+    crate::pci::disable_dma(device);
+    let detached = TOPOLOGY.with(|_| {
+        if crate::amdvi::active() {
+            let (faults, isolated) = crate::amdvi::detach(memory, device, root);
+            return Detached { faults, isolated };
         }
+        let Some(context) = present_context_table(memory, device.bus) else {
+            // Nothing attached on this bus: the device was already blocked.
+            return Detached {
+                faults: 0,
+                isolated: invalidate(),
+            };
+        };
+        let index = u64::from(device.devfn) * 2;
+        let low = read_entry(memory, context, index);
+        // A non-present context entry faults every request of the device.
+        let mut blocked =
+            write_entry(memory, context, index, 0) & write_entry(memory, context, index + 1, 0);
+        // Unlink the bus's context table once no device uses it any more.
+        let mut release_context = false;
+        if (0..512).all(|entry| read_entry(memory, context, entry) == 0)
+            && let Ok(root_table) = PhysAddr::new(ROOT_TABLE.load(Ordering::Relaxed))
+        {
+            release_context = write_entry(memory, root_table, u64::from(device.bus) * 2, 0);
+            blocked &= release_context;
+        }
+        let isolated = blocked && invalidate();
+        // Frames go back to the allocator only when no unit can still walk
+        // or cache them; otherwise they stay allocated (quarantine).
+        if isolated {
+            if release_context {
+                let _ = memory.release_table_frame(context);
+            }
+            if low & 1 != 0
+                && let Ok(domain) = PhysAddr::new(low & ADDRESS_MASK)
+            {
+                free_tables(memory, domain, LEVELS.load(Ordering::Relaxed) as u64);
+            }
+        }
+        // Primary pending fault (PPF) or overflow: count and clear (RW1C).
+        let mut faults = 0;
+        for window in UNIT_WINDOWS.iter().take(UNIT_COUNT.load(Ordering::Relaxed)) {
+            let registers = Registers(window.load(Ordering::Relaxed));
+            let status = registers.read32(REG_FSTS);
+            if status & 0b11 != 0 {
+                faults += 1;
+                registers.write32(REG_FSTS, status);
+            }
+        }
+        Detached { faults, isolated }
+    });
+    FAULTS_SEEN.fetch_add(detached.faults, Ordering::Relaxed);
+    if !detached.isolated {
+        let _ = write!(
+            SerialWriter,
+            "Centinela-OS: IOMMU isolation of {:02x}:{:02x}.{} not confirmed; its translation tables are quarantined (not freed).\r\n",
+            device.bus,
+            device.devfn >> 3,
+            device.devfn & 7
+        );
     }
-    FAULTS_SEEN.fetch_add(faults, Ordering::Relaxed);
-    faults
+    detached
 }
 
 /// DMA faults recorded so far (each detach counts the pending ones).

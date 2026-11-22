@@ -29,7 +29,8 @@ use centinela_kernel::memory::address_space::{create_task_root, destroy_user_add
 use centinela_kernel::memory::hhdm_backend::{HhdmFrameMemory, HhdmReader, PmmLock};
 use centinela_kernel::memory::usercopy::copy_from_user;
 use centinela_kernel::memory::vmm::{
-    HhdmOffset, PAGE_SIZE, PageMapping, PageTableMapper, PageTableWalker, PhysAddr,
+    HhdmOffset, PAGE_SIZE, PageMapping, PageTableMapper, PageTableMutationMemory, PageTableWalker,
+    PhysAddr, VirtAddr,
 };
 use centinela_security::capabilities::{Capability, CapabilitySet};
 use centinela_security::handles::{CapabilityTable, Rights, TableError};
@@ -1061,12 +1062,37 @@ fn map_anonymous(memory: &mut HhdmFrameMemory<'_, '_>, task: &mut Task, pages: u
     let base = task.heap_next;
     for index in 0..pages {
         if map_user_page(memory, task.root, base + index * PAGE_SIZE, rw, None).is_err() {
+            // All or nothing: a failed request leaves no page behind.
+            for undone in 0..index {
+                release_user_page(memory, task.root, base + undone * PAGE_SIZE, true);
+            }
             return ENOMEM;
         }
-        task.heap_next += PAGE_SIZE;
-        task.heap_pages += 1;
     }
+    task.heap_next += pages * PAGE_SIZE;
+    task.heap_pages += pages;
     base
+}
+
+/// Removes one user page mapped by a request that is being rolled back. The
+/// frame returns to the allocator only if `reusable`; otherwise it is
+/// quarantined: mapped nowhere, never handed out again.
+fn release_user_page(
+    memory: &mut HhdmFrameMemory<'_, '_>,
+    root: PhysAddr,
+    address: u64,
+    reusable: bool,
+) {
+    let Ok(address) = VirtAddr::new(address) else {
+        return;
+    };
+    // On a TLB-invalidation error the leaf is already cleared: the frame is
+    // then simply not released.
+    if let Ok(removed) = PageTableMapper::new(&mut *memory, root).unmap_4k(address)
+        && reusable
+    {
+        let _ = memory.release_table_frame(removed.physical_address());
+    }
 }
 
 /// Lends a boot module to a task: its own frames, read-only and NX, at
@@ -1105,16 +1131,29 @@ fn map_dma(memory: &mut HhdmFrameMemory<'_, '_>, task: &mut Task, pages: u64) ->
     let offset = task.dma_pages * PAGE_SIZE;
     for index in 0..pages {
         let page = offset + index * PAGE_SIZE;
-        let Ok(frame) =
-            crate::isolation::map_user_page_frame(memory, task.root, DMA_BASE + page, rw)
-        else {
-            return (ENOMEM, 0);
-        };
-        if !crate::iommu::map(memory, domain, crate::iommu::IOVA_BASE + page, frame) {
+        let mapped = crate::isolation::map_user_page_frame(memory, task.root, DMA_BASE + page, rw)
+            .is_ok_and(|frame| {
+                crate::iommu::map(memory, domain, crate::iommu::IOVA_BASE + page, frame)
+            });
+        if !mapped {
+            // All or nothing: undo every page of this request, including the
+            // one that failed half-way (mapped in the task, maybe in the
+            // domain). The device loses the translation first; the frame is
+            // freed only if the IOMMU confirmed that, else it is quarantined.
+            for undone in 0..=index {
+                let page = offset + undone * PAGE_SIZE;
+                let isolated = crate::iommu::unmap(memory, domain, crate::iommu::IOVA_BASE + page);
+                if !isolated {
+                    serial_write(
+                        "Centinela-OS: IOMMU unmap not confirmed; DMA frame quarantined.\r\n",
+                    );
+                }
+                release_user_page(memory, task.root, DMA_BASE + page, isolated);
+            }
             return (ENOMEM, 0);
         }
-        task.dma_pages += 1;
     }
+    task.dma_pages += pages;
     (DMA_BASE + offset, crate::iommu::IOVA_BASE + offset)
 }
 
@@ -1148,7 +1187,24 @@ fn attach_dma(memory: &mut HhdmFrameMemory<'_, '_>, system: &mut System) {
             });
         if task.dma_root.is_some() && mmio_ok {
             crate::pci::enable_memory(device, true);
+        } else if !crate::iommu::available() {
+            // Fail closed: without DMA remapping the device never gets Bus
+            // Master, so the driver cannot do DMA. Memory decoding is left
+            // as the firmware set it: MMIO alone cannot reach other memory.
+            let _ = write!(
+                SerialWriter,
+                "IOMMU: no DMA remapping; DMA denied to driver {} at {:02x}:{:02x}.{} (fail-closed).\r\n",
+                task.spec.name,
+                device.bus,
+                device.devfn >> 3,
+                device.devfn & 7
+            );
         } else {
+            // No half-built grant: a domain without its MMIO window is torn
+            // down again, and the device stays without Bus Master.
+            if let Some(root) = task.dma_root.take() {
+                let _ = crate::iommu::detach(memory, device, Some(root));
+            }
             serial_write("Centinela-OS: could not create an IOMMU domain.\r\n");
         }
     }
@@ -1165,9 +1221,28 @@ fn detach_dma(memory: &mut HhdmFrameMemory<'_, '_>, system: &mut System, index: 
     let Some(root) = task.dma_root.take() else {
         return;
     };
-    crate::pci::disable_dma(device);
-    let faults = crate::iommu::detach(memory, device, Some(root));
+    // Bus Master off, device blocked, invalidation confirmed: in that order,
+    // inside `detach`.
+    let detached = crate::iommu::detach(memory, device, Some(root));
     let mut writer = SerialWriter;
+    if !detached.isolated {
+        // A unit may still translate to the DMA frames: take them out of the
+        // address space so its teardown cannot free them. They stay
+        // allocated forever (quarantine) instead of being reused.
+        for page in 0..task.dma_pages {
+            release_user_page(memory, task.root, DMA_BASE + page * PAGE_SIZE, false);
+        }
+        let _ = write!(
+            writer,
+            "Centinela-OS: {} DMA frame(s) of {:02x}:{:02x}.{} quarantined: IOMMU invalidation not confirmed.\r\n",
+            task.dma_pages,
+            device.bus,
+            device.devfn >> 3,
+            device.devfn & 7
+        );
+    }
+    task.dma_pages = 0;
+    let faults = detached.faults;
     let _ = write!(
         writer,
         "IOMMU: domain of {:02x}:{:02x}.{} torn down; {faults} blocked DMA fault(s) recorded.\r\n",

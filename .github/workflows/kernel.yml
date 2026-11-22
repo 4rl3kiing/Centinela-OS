@@ -52,6 +52,7 @@ jobs:
 
       - name: Build hybrid BIOS and UEFI ISO (Secure Boot signed)
         env:
+          CENTINELA_PROFILE: test
           SB_SIGNING_KEY: build/sb-keys/db.key
           SB_SIGNING_CERT: build/sb-keys/db.crt
         run: bash scripts/build-iso.sh

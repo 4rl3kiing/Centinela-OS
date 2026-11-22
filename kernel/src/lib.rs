@@ -5,6 +5,7 @@
 extern crate std;
 
 pub mod acpi;
+pub mod dma;
 pub mod elf;
 pub mod ipc;
 pub mod memory;
