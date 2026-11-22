@@ -6,6 +6,8 @@
 
 use centinela_userland::{Line, call, exit, pack, write};
 
+const EBUSY: u64 = 16;
+
 fn request(storage: u64, words: [u64; 4]) -> [u64; 4] {
     call(storage, words).map_or([u64::MAX, 0, 0, 0], |reply| reply.words)
 }
@@ -42,7 +44,16 @@ pub extern "C" fn _start(storage: u64, _unused: u64, _unused2: u64, role: u64) -
     }
 
     let note = b"Centinela-OS guarda esta nota en NVMe con CFS.";
-    if request(storage, [1, pack(b"nota.txt"), 0, 0])[0] != 0 {
+    // Another client may be staging a file (one staging at a time): retry
+    // while the service answers EBUSY. Each call blocks, so others progress.
+    let mut begin = request(storage, [1, pack(b"nota.txt"), 0, 0])[0];
+    for _ in 0..10_000 {
+        if begin != EBUSY {
+            break;
+        }
+        begin = request(storage, [1, pack(b"nota.txt"), 0, 0])[0];
+    }
+    if begin != 0 {
         exit(2)
     }
     for chunk in note.chunks(16) {
