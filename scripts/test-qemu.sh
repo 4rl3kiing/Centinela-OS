@@ -178,9 +178,15 @@ AMD_MESSAGES=(
     "Microkernel milestone:"
 )
 amd_log="build/logs/qemu-${P}bios-amd-iommu.log"
+# QEMU >= 10 leaves emulated devices in passthrough (IOVA = guest physical)
+# unless dma-remap=on; older QEMU always translates and lacks the property.
+AMD_IOMMU=amd-iommu
+if "$QEMU" -device amd-iommu,help 2>/dev/null | grep -q "dma-remap"; then
+    AMD_IOMMU=amd-iommu,dma-remap=on
+fi
 : >"$amd_log"
 set +e
-timeout "$TIMEOUT_SECONDS" "$QEMU" -machine q35 -m 512M -smp 4 "${ACCEL[@]}" -device amd-iommu \
+timeout "$TIMEOUT_SECONDS" "$QEMU" -machine q35 -m 512M -smp 4 "${ACCEL[@]}" -device "$AMD_IOMMU" \
     -device e1000,netdev=n0 -netdev user,id=n0 \
     -drive "file=$NVME_IMAGE,if=none,id=nvm,format=raw" -device nvme,serial=centinela,drive=nvm \
     -display none -monitor none -serial "file:$amd_log" -serial null \
