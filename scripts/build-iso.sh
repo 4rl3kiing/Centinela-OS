@@ -79,7 +79,7 @@ BODY="$(sed '1,/^\//d' "$CONFIG")"
 {
     printf '%s\n' "$HEADER"
     printf '/Centinela-OS (probar sin instalar)\n%s\n%s%s\n%s\n\n' "$BODY" "$MODULE_LINES" "$INSTALLER_LINE" "$PAYLOAD_LINE"
-    printf '/Instalar Centinela-OS en el disco NVMe (BORRA TODO EL DISCO)\n%s\ncmdline: centinela.install=nvme-wipe\n%s%s\n%s\n' \
+    printf '/Instalar Centinela-OS en el disco interno NVMe o SATA (BORRA TODO EL DISCO)\n%s\ncmdline: centinela.install=nvme-wipe\n%s%s\n%s\n' \
         "$BODY" "$MODULE_LINES" "$INSTALLER_LINE" "$PAYLOAD_LINE"
 } >"$CONFIG.new"
 mv "$CONFIG.new" "$CONFIG"

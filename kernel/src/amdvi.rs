@@ -43,6 +43,7 @@ const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
 
 static WINDOWS: [AtomicU64; MAX_UNITS] = [const { AtomicU64::new(0) }; MAX_UNITS];
 static COMMANDS: [AtomicU64; MAX_UNITS] = [const { AtomicU64::new(0) }; MAX_UNITS];
+static EVENTS: [AtomicU64; MAX_UNITS] = [const { AtomicU64::new(0) }; MAX_UNITS];
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 static DEVICE_TABLE: AtomicU64 = AtomicU64::new(0);
 static EMPTY_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -194,6 +195,7 @@ pub(crate) fn init<R: PhysicalReader>(
         };
         WINDOWS[unit].store(window, Ordering::Relaxed);
         COMMANDS[unit].store(commands.get(), Ordering::Relaxed);
+        EVENTS[unit].store(events.get(), Ordering::Relaxed);
         COUNT.store(unit + 1, Ordering::Relaxed);
         write_register(unit, REG_CONTROL, 0);
         write_register(
@@ -322,6 +324,38 @@ fn free_tables(memory: &mut HhdmFrameMemory<'_, '_>, table: PhysAddr, level: u64
     let _ = memory.release_table_frame(table);
 }
 
+/// Prints the first logged event of a domain (type, device, address): the
+/// detail needed to diagnose a DMA failure from a photo of the screen.
+fn report_event(unit: usize, head: u64) {
+    let base = EVENTS[unit].load(Ordering::Relaxed);
+    // SAFETY: The event ring page belongs to the kernel (HHDM alias).
+    let (low, address) = unsafe {
+        (
+            core::ptr::read_volatile(hhdm(base + head)),
+            core::ptr::read_volatile(hhdm(base + head + 8)),
+        )
+    };
+    let code = (low >> 60) & 0xf;
+    let kind = match code {
+        1 => "illegal device table entry",
+        2 => "I/O page fault",
+        3 => "device table hardware error",
+        4 => "page table hardware error",
+        5 => "illegal command",
+        6 => "command hardware error",
+        _ => "other",
+    };
+    let device = low & 0xffff;
+    let _ = write!(
+        SerialWriter,
+        "IOMMU: AMD-Vi event {code} ({kind}) device {:02x}:{:02x}.{} address {address:#x} flags {:#x}\r\n",
+        device >> 8,
+        (device >> 3) & 0x1f,
+        device & 7,
+        (low >> 48) & 0xfff,
+    );
+}
+
 /// Blocks the device again, frees its tables and returns the I/O page
 /// faults logged since the last call.
 pub(crate) fn detach(
@@ -349,6 +383,9 @@ pub(crate) fn detach(
         let tail = read(unit, REG_EVENT_TAIL) & 0xff0;
         let mut head = read(unit, REG_EVENT_HEAD) & 0xff0;
         while head != tail {
+            if faults == 0 {
+                report_event(unit, head);
+            }
             faults += 1;
             head = (head + 16) % PAGE_SIZE;
         }
