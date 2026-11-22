@@ -22,7 +22,7 @@ use centinela_disk::gpt::{self, CFS_TYPE, ESP_TYPE, MAX_PARTITIONS, Partition};
 use centinela_disk::{Sector, SectorDevice};
 use centinela_userland::drive::Drive;
 use centinela_userland::{
-    FLAG_KERNEL_ORIGIN, Line, exit, log_read, pack, reply_and_wait, reply_wait, write,
+    FLAG_KERNEL_ORIGIN, Line, exit, log_read, pack, reply_and_wait, reply_wait, sleep, write,
 };
 
 /// Kernel convention: where the disk controller's registers are mapped.
@@ -71,6 +71,9 @@ fn save_boot_log(disk: &mut Disk, start: u64, sectors: u64) -> bool {
         if !disk.nvme.write_page(6, 0, chunk) || !disk.nvme.transfer(true, lba, 8, 6) {
             return false;
         }
+        // This service has priority and polls the disk: give the CPU to
+        // other services between chunks so their clients are not starved.
+        sleep(1);
     }
     disk.nvme.flush()
 }

@@ -44,11 +44,12 @@ pub extern "C" fn _start(storage: u64, _unused: u64, _unused2: u64, role: u64) -
     }
 
     let note = b"Centinela-OS guarda esta nota en NVMe con CFS.";
-    // Another client may be staging a file (one staging at a time): retry
-    // while the service answers EBUSY. Each call blocks, so others progress.
+    // Retry while another client is staging a file (EBUSY: one staging at
+    // a time) or the service is not receiving yet (it saves the boot log
+    // before serving). Bounded; each call blocks or spins, so others progress.
     let mut begin = request(storage, [1, pack(b"nota.txt"), 0, 0])[0];
     for _ in 0..10_000 {
-        if begin != EBUSY {
+        if begin != EBUSY && begin != u64::MAX {
             break;
         }
         begin = request(storage, [1, pack(b"nota.txt"), 0, 0])[0];
