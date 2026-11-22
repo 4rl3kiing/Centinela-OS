@@ -93,7 +93,8 @@ fn command(words: [u64; 2]) -> bool {
 }
 
 fn invalidate_device(device_id: u16) -> bool {
-    command([u64::from(device_id), 0x2 << 60])
+    // Opcode in bits 63:60 of the first quadword; the second is reserved.
+    command([u64::from(device_id) | 0x2 << 60, 0])
 }
 
 fn invalidate_domain(domain: u16) -> bool {
