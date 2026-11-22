@@ -17,7 +17,7 @@ use centinela_disk::fat32::{self, FileSpec};
 use centinela_disk::gpt::{self, CFS_TYPE, ESP_TYPE, Partition};
 use centinela_disk::payload::Payload;
 use centinela_disk::{SECTOR, Sector, SectorDevice};
-use centinela_userland::nvme::Nvme;
+use centinela_userland::drive::Drive;
 use centinela_userland::{Line, exit, write};
 
 /// Kernel convention: MMIO window and lent module locations.
@@ -29,7 +29,7 @@ const ESP_SECTORS: u64 = 160 * 1024 * 1024 / SECTOR as u64;
 static mut BITMAP: [u64; 4096] = [0; 4096];
 
 struct Disk {
-    nvme: Nvme,
+    nvme: Drive,
     sectors: u64,
 }
 
@@ -119,7 +119,8 @@ fn guid(seed: u64) -> gpt::Guid {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_unused: u64, payload_len: u64, _unused2: u64, wipe: u64) -> ! {
+pub extern "C" fn _start(_unused: u64, payload_len: u64, _unused2: u64, flags: u64) -> ! {
+    let wipe = flags & 1;
     // SAFETY: The kernel lent the payload module read-only at MODULE_BASE,
     // `payload_len` bytes long.
     let bytes =
@@ -131,17 +132,18 @@ pub extern "C" fn _start(_unused: u64, payload_len: u64, _unused2: u64, wipe: u6
         )
     };
     let mut model = Line::new();
-    let nvme = match Nvme::bring_up(MMIO_BASE, &mut model) {
+    // Start argument: bit 0 = erase allowed, bit 1 = AHCI (else NVMe).
+    let nvme = match Drive::bring_up(flags >> 1 & 1, MMIO_BASE, &mut model) {
         Ok(nvme) => nvme,
         Err((message, code)) => fail(message, code),
     };
-    if nvme.block_size != SECTOR {
+    if nvme.block_size() != SECTOR {
         fail(
             "installer: only 512-byte-sector NVMe disks are supported for now",
             3,
         );
     }
-    let sectors = nvme.blocks;
+    let sectors = nvme.blocks();
     let mut disk = Disk { nvme, sectors };
     model
         .push(b"; ")

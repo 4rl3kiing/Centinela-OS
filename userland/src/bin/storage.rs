@@ -20,9 +20,11 @@
 use centinela_cfs::{BLOCK_SIZE, Block, BlockDevice, Error, Volume, format};
 use centinela_disk::gpt::{self, CFS_TYPE, MAX_PARTITIONS, Partition};
 use centinela_disk::{Sector, SectorDevice};
-use centinela_userland::nvme::Nvme;
+use centinela_userland::drive::Drive;
 use centinela_userland::{FLAG_KERNEL_ORIGIN, Line, exit, pack, reply_and_wait, reply_wait, write};
 
+/// Kernel convention: where the disk controller's registers are mapped.
+const MMIO_BASE: u64 = 0x0000_5000_0000_0000;
 /// Largest volume served (bitmap of 1024 words = 65536 blocks = 256 MiB).
 const MAX_VOLUME_BLOCKS: u64 = 65536;
 const STAGING: usize = 64 * 1024;
@@ -37,7 +39,7 @@ static mut BITMAP: [u64; 1024] = [0; 1024];
 static mut STAGED: [u8; STAGING] = [0; STAGING];
 
 struct Disk {
-    nvme: Nvme,
+    nvme: Drive,
     /// First LBA of the volume (the CFS partition on an installed disk).
     first: u64,
     blocks: u64,
@@ -45,11 +47,11 @@ struct Disk {
 }
 
 /// Raw 512-byte sector access for reading the partition table.
-struct Sectors<'a>(&'a mut Nvme);
+struct Sectors<'a>(&'a mut Drive);
 
 impl SectorDevice for Sectors<'_> {
     fn sectors(&self) -> u64 {
-        self.0.blocks
+        self.0.blocks()
     }
     fn read(&mut self, lba: u64, buffer: &mut Sector) -> Result<(), centinela_disk::Error> {
         if self.0.transfer(false, lba, 1, 6) && self.0.read_page(6, 0, buffer) {
@@ -144,18 +146,18 @@ fn boot_count<D: BlockDevice>(volume: &mut Volume<'_, D>) -> Result<u64, Error> 
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(endpoint: u64, _unused: u64, _unused2: u64, mmio: u64) -> ! {
+pub extern "C" fn _start(endpoint: u64, _unused: u64, _unused2: u64, kind: u64) -> ! {
     let mut model = Line::new();
-    let mut nvme = match Nvme::bring_up(mmio, &mut model) {
+    let mut nvme = match Drive::bring_up(kind, MMIO_BASE, &mut model) {
         Ok(nvme) => nvme,
         Err((message, code)) => fail(message, code),
     };
-    let sectors_per_block = (BLOCK_SIZE / nvme.block_size) as u64;
+    let sectors_per_block = (BLOCK_SIZE / nvme.block_size()) as u64;
     // An installed disk carries a GPT with a CFS partition; a bare disk (the
     // test harness, or a disk prepared with cfs-tool) is used whole, minus
     // its last 4 KiB.
     let mut partitions = [Partition::default(); MAX_PARTITIONS];
-    let system = if nvme.block_size == 512 {
+    let system = if nvme.block_size() == 512 {
         gpt::read(&mut Sectors(&mut nvme), &mut partitions)
             .ok()
             .and_then(|count| {
@@ -169,9 +171,10 @@ pub extern "C" fn _start(endpoint: u64, _unused: u64, _unused2: u64, mmio: u64) 
     };
     let (first, blocks) = match system {
         Some(partition) => (partition.first_lba, partition.sectors() / sectors_per_block),
-        None => (0, nvme.blocks / sectors_per_block - 1),
+        None => (0, nvme.blocks() / sectors_per_block - 1),
     };
     let blocks = blocks.min(MAX_VOLUME_BLOCKS);
+    let drive_name = nvme.name();
     let mut disk = Disk {
         nvme,
         first,
@@ -217,7 +220,9 @@ pub extern "C" fn _start(endpoint: u64, _unused: u64, _unused2: u64, mmio: u64) 
     };
     let sb = volume.superblock();
     let mut line = Line::new();
-    line.push(b"storage: CFS volume of ")
+    line.push(b"storage: ")
+        .push(drive_name)
+        .push(b" disk; CFS volume of ")
         .number(sb.block_count)
         .push(b" blocks")
         .push(if formatted {

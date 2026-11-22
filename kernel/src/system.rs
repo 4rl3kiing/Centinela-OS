@@ -2412,6 +2412,16 @@ fn run_storage_scenario(
     passed == tasks.len() && (blocked || crate::amdvi::active())
 }
 
+/// The system disk controller: NVMe first, else AHCI (SATA). Returns the
+/// device, its register BAR and the kind passed to drivers (0 NVMe, 1 AHCI).
+fn disk_controller() -> Option<(crate::pci::Device, (u64, u64), u64)> {
+    if let Some(device) = crate::pci::find_class(0x01, 0x08, 0x02) {
+        return crate::pci::mem_bar(device, 0).map(|bar| (device, bar, 0));
+    }
+    let device = crate::pci::find_class(0x01, 0x06, 0x01)?;
+    crate::pci::mem_bar(device, 5).map(|bar| (device, bar, 1))
+}
+
 /// Installs Centinela-OS on the NVMe disk with the Ring 3 installer.
 /// `wipe` allows overwriting a disk that is not blank (explicit boot entry).
 pub fn run_installer(
@@ -2433,16 +2443,13 @@ pub fn run_installer(
         serial_write("Centinela-OS: installer or install payload missing from the boot media.\r\n");
         return false;
     };
-    let Some(controller) = crate::pci::find_class(0x01, 0x08, 0x02) else {
-        serial_write("Centinela-OS: no NVMe disk to install on.\r\n");
-        return false;
-    };
-    let Some(mmio) = crate::pci::mem_bar0(controller) else {
+    let Some((controller, mmio, kind)) = disk_controller() else {
+        serial_write("Centinela-OS: no NVMe or SATA disk controller to install on.\r\n");
         return false;
     };
     let tasks = [TaskSpec {
         name: "installer",
-        role: "Ring 3 installer: GPT, FAT32 ESP and CFS on NVMe",
+        role: "Ring 3 installer: GPT, FAT32 ESP and CFS on NVMe or SATA",
         program: Image::Elf(installer),
         extra_syscalls: (1 << Syscall::DmaAlloc as u8) | (1 << Syscall::Sleep as u8),
         endpoints: [None, None, None],
@@ -2457,7 +2464,7 @@ pub fn run_installer(
             dma: Some(controller),
             mmio: Some((mmio.0, mmio.1.min(MMIO_LIMIT))),
         }),
-        arg: u64::from(wipe),
+        arg: u64::from(wipe) | kind << 1,
         badge: 0,
         module: Some(payload),
         expect: Expect::Exit(0),
@@ -2484,12 +2491,9 @@ fn run_persistence_scenario(
         serial_write("Centinela-OS: storage modules missing.\r\n");
         return false;
     };
-    let Some(controller) = crate::pci::find_class(0x01, 0x08, 0x02) else {
-        serial_write("Persistence: no NVMe controller present; scenario skipped.\r\n");
+    let Some((controller, mmio, kind)) = disk_controller() else {
+        serial_write("Persistence: no disk controller present; scenario skipped.\r\n");
         return true;
-    };
-    let Some(mmio) = crate::pci::mem_bar0(controller) else {
-        return false;
     };
     let client_task = |name, role, arg, badge| TaskSpec {
         name,
@@ -2511,7 +2515,7 @@ fn run_persistence_scenario(
     let tasks = [
         TaskSpec {
             name: "storage",
-            role: "Ring 3 storage: NVMe driver + CFS, files owned by badge",
+            role: "Ring 3 storage: NVMe or SATA driver + CFS, files owned by badge",
             program: Image::Elf(storage),
             extra_syscalls: IPC_SYSCALLS
                 | (1 << Syscall::DmaAlloc as u8)
@@ -2528,7 +2532,7 @@ fn run_persistence_scenario(
                 dma: Some(controller),
                 mmio: Some((mmio.0, mmio.1.min(MMIO_LIMIT))),
             }),
-            arg: MMIO_BASE,
+            arg: kind,
             badge: 0,
             module: None,
             expect: Expect::Service { restarts: 0 },

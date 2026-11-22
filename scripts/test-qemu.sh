@@ -327,7 +327,7 @@ install_boot() {
     timeout "$TIMEOUT_SECONDS" "$QEMU" -machine q35 -m 512M -smp 2 "${ACCEL[@]}" -device intel-iommu,intremap=on \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
         -drive "if=pflash,format=raw,file=build/OVMF_VARS.$mode.fd" \
-        -drive "file=$INSTALL_DISK,if=none,id=inst,format=raw" -device nvme,serial=install,drive=inst \
+        "${DISK_ARGS[@]}" \
         -display none -monitor none -serial "file:$log" -serial null \
         -chardev "file,id=shellin-$mode,path=/dev/null,input-path=$SHELL_INPUT" -serial chardev:shellin-$mode \
         -fw_cfg name=opt/centinela/poweroff,string=1 -no-reboot "$@" >/dev/null 2>&1
@@ -344,6 +344,7 @@ expect_in() {
         fail "$log" /dev/null "Kernel reported a failure in $(basename "$log")"
     fi
 }
+DISK_ARGS=(-drive "file=$INSTALL_DISK,if=none,id=inst,format=raw" -device nvme,serial=install,drive=inst)
 install_boot install -cdrom "$ISO" -boot d -fw_cfg name=opt/centinela/install,string=1
 expect_in "build/logs/qemu-${P}install.log" \
     "Installer: requested (blank target disk only)." \
@@ -375,3 +376,19 @@ expect_in "build/logs/qemu-${P}installed.log" \
     "storage: install-info: Instalado por el instalador de Centinela-OS." \
     "Microkernel milestone:"
 echo "PASS: the installed system boots from its own disk (UEFI) and mounts its CFS volume"
+
+# The same installation on a SATA disk (AHCI controller, no NVMe).
+SATA_DISK=build/install-sata.img
+rm -f "$SATA_DISK"
+truncate -s 256M "$SATA_DISK"
+DISK_ARGS=(-drive "file=$SATA_DISK,if=none,id=sata,format=raw" -device ide-hd,drive=sata,bus=ide.0)
+install_boot install-sata -cdrom "$ISO" -boot d -fw_cfg name=opt/centinela/install,string=1
+expect_in "build/logs/qemu-${P}install-sata.log" "ahci: port 0 disk" "installer: installation complete"
+sgdisk -v "$SATA_DISK" | grep -q "No problems found" || { echo "GPT verification failed on SATA" >&2; exit 1; }
+install_boot installed-sata
+expect_in "build/logs/qemu-${P}installed-sata.log" \
+    "storage: SATA (AHCI) disk; CFS volume of" \
+    "files on GPT partition 'Centinela system'; boot count now 1" \
+    "storage: install-info: Instalado por el instalador de Centinela-OS." \
+    "Microkernel milestone:"
+echo "PASS: install to a SATA disk (AHCI) and boot from it (UEFI)"

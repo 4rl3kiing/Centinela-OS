@@ -66,21 +66,34 @@ pub(crate) fn find_class(class: u8, subclass: u8, interface: u8) -> Option<Devic
 
 /// BAR 0 when it is a memory BAR: (physical base, size in bytes).
 pub(crate) fn mem_bar0(device: Device) -> Option<(u64, u64)> {
-    let original = read32(device, 0x10);
+    mem_bar(device, 0)
+}
+
+/// Memory BAR `index` (0-5): (physical base, size in bytes), 4 KiB aligned.
+pub(crate) fn mem_bar(device: Device, index: u8) -> Option<(u64, u64)> {
+    if index > 5 {
+        return None;
+    }
+    let offset = 0x10 + 4 * index;
+    let original = read32(device, offset);
     if original & 1 != 0 {
         return None;
     }
     let is_64 = (original >> 1) & 3 == 2;
-    let high = if is_64 { read32(device, 0x14) } else { 0 };
+    let high = if is_64 && index < 5 {
+        read32(device, offset + 4)
+    } else {
+        0
+    };
     let command = read32(device, COMMAND);
     write32(device, COMMAND, command & !MEMORY_SPACE);
-    write32(device, 0x10, 0xffff_ffff);
-    let mask = read32(device, 0x10) & 0xffff_fff0;
-    write32(device, 0x10, original);
+    write32(device, offset, 0xffff_ffff);
+    let mask = read32(device, offset) & 0xffff_fff0;
+    write32(device, offset, original);
     write32(device, COMMAND, command);
-    let size = u64::from((!mask).wrapping_add(1));
+    let size = u64::from((!mask).wrapping_add(1)).max(0x1000);
     let base = u64::from(high) << 32 | u64::from(original & 0xffff_fff0);
-    (size >= 0x1000 && base != 0 && base & 0xfff == 0).then_some((base, size))
+    (base != 0 && base & 0xfff == 0).then_some((base, size))
 }
 
 /// Enables memory decoding and, if `dma`, bus mastering.

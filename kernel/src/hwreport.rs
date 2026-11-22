@@ -16,7 +16,7 @@ fn supported(vendor: u16, device: u16, class: u8, subclass: u8, interface: u8) -
         (_, _, 0x03, ..) => "display: framebuffer console",
         (_, _, 0x06, ..) => "bridge",
         (_, _, 0x0c, 0x03, 0x30) => "USB xHCI: no driver yet",
-        (_, _, 0x01, 0x06, _) => "SATA AHCI: no driver yet",
+        (_, _, 0x01, 0x06, 0x01) => "driver: ahci + CFS",
         (_, _, 0x02, ..) => "network: no driver for this model",
         _ => "no driver",
     }
